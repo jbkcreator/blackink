@@ -13,6 +13,7 @@ from src.services.email_suppression import (
     suppress_by_email,
     suppress_by_phone,
     suppress_by_domain,
+    _normalize_phone,
     bulk_suppress,
     import_dnc_list,
 )
@@ -170,6 +171,23 @@ def test_suppress_by_email_lowercases():
 
 
 # ---------------------------------------------------------------------------
+# _normalize_phone
+# ---------------------------------------------------------------------------
+
+def test_normalize_strips_non_digits():
+    assert _normalize_phone("+1 (813) 555-0100") == "8135550100"
+
+def test_normalize_drops_leading_country_code():
+    assert _normalize_phone("18135550100") == "8135550100"
+
+def test_normalize_leaves_10_digit_as_is():
+    assert _normalize_phone("8135550100") == "8135550100"
+
+def test_normalize_empty_string():
+    assert _normalize_phone("") == ""
+
+
+# ---------------------------------------------------------------------------
 # suppress_by_phone
 # ---------------------------------------------------------------------------
 
@@ -262,7 +280,7 @@ def test_import_dnc_list_summary():
 
     with patch(
         "src.services.email_suppression.suppress_by_phone",
-        side_effect=lambda s, ph, reason: suppress_calls.append(ph) or (1 if ph.strip() == "+18135550100" else 0),
+        side_effect=lambda s, ph, reason: suppress_calls.append(ph) or (1 if ph == "8135550100" else 0),
     ):
         session = MagicMock()
         result = import_dnc_list(session, ["+18135550100", "+19999999999"], source="national_dnc")

@@ -90,11 +90,28 @@ def suppress_by_email(session: Session, email: str, reason: str) -> int:
     return len(rows)
 
 
+def _normalize_phone(phone: str) -> str:
+    """Strip to digits only, drop leading country code 1 — matches sms_quiet_hours convention."""
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    if digits.startswith("1") and len(digits) == 11:
+        digits = digits[1:]
+    return digits
+
+
 def suppress_by_phone(session: Session, phone: str, reason: str) -> int:
-    """Suppress all contacts with this phone number. Returns count suppressed."""
+    """Suppress all contacts with this phone number. Returns count suppressed.
+
+    Normalizes both sides of the comparison so +18135550100, 8135550100,
+    and (813) 555-0100 all resolve to the same contact.
+    """
+    normalized = _normalize_phone(phone)
     rows = session.execute(
-        text("SELECT contact_id FROM contacts WHERE phone = :phone"),
-        {"phone": phone},
+        text(
+            "SELECT contact_id FROM contacts "
+            "WHERE regexp_replace(phone, '[^0-9]', '', 'g') = :phone "
+            "   OR regexp_replace(phone, '^1?([0-9]{10})$', '\\1') = :phone"
+        ),
+        {"phone": normalized},
     ).fetchall()
     for row in rows:
         suppress_contact(session, row[0], reason)
@@ -191,7 +208,7 @@ def import_dnc_list(
     matched = 0
     unmatched = 0
     for phone in phones:
-        count = suppress_by_phone(session, phone.strip(), reason=source)
+        count = suppress_by_phone(session, _normalize_phone(phone.strip()), reason=source)
         if count:
             matched += count
         else:
