@@ -6,7 +6,7 @@ see C:\\Users\\HEU-Vishnu\\Forced-action-\\config\\settings.py.
 """
 
 from functools import lru_cache
-from typing import Optional
+from typing import Optional, Tuple
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -82,7 +82,67 @@ class AppSettings(BaseSettings):
 	# ── Slack ────────────────────────────────────────────────────────────────
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
+	# App-Level Token (xapp-...) — Socket Mode connection auth, distinct from
+	# the bot token above. Week 0 runs Socket Mode (no public HTTPS endpoint
+	# yet for DNS/TLS reasons); switching back to HTTP webhooks later drops
+	# this field's use but doesn't require removing it.
+	slack_app_token: Optional[SecretStr] = Field(default=None, env="SLACK_APP_TOKEN")
+
+	# ── Relay halt / resume (Dev 2, src/agents/relay/) ──────────────────────
+	# HMAC-SHA256 signing key for cryptographic resume tokens
+	# (src/agents/relay/resume_auth.py). Must be set before any halt can be
+	# issued or resumed. Recommended: 32+ bytes of entropy.
+	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
+
 	blackink_qa_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_QA_SLACK_CHANNEL")
+	blackink_command_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_COMMAND_SLACK_CHANNEL")
+	blackink_setter_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_SETTER_SLACK_CHANNEL")
+	sales_replies_slack_channel: Optional[str] = Field(default=None, env="SALES_REPLIES_SLACK_CHANNEL")
+	dial_tasks_slack_channel: Optional[str] = Field(default=None, env="DIAL_TASKS_SLACK_CHANNEL")
+	blackink_economics_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_ECONOMICS_SLACK_CHANNEL")
+	# Fail-closed workspace-wide approver allowlist — Slack user IDs,
+	# comma-separated (e.g. "U012ABC,U034DEF"). src.services.slack.auth.
+	# approver_authorized() treats an empty/unset list as "nobody
+	# authorized", never "everybody". Dev 3 plan §7.4 — per-tenant
+	# approvers are Week 1 (need a clients column that doesn't exist yet);
+	# this is global-only for Week 0.
+	#
+	# Typed str, NOT Tuple[str, ...], deliberately: pydantic-settings'
+	# EnvSettingsSource treats any list/tuple/set-typed field as "complex"
+	# and unconditionally json.loads()s its raw env value BEFORE any
+	# field_validator runs — a plain comma-separated string (the natural
+	# .env format, and what this field's own name/docstring implies) is
+	# not valid JSON, so declaring this as Tuple[str, ...] crashes the
+	# entire app at import time (settings = get_settings() runs at module
+	# load) the moment BLACKINK_GLOBAL_APPROVERS is set to anything but a
+	# JSON array. Confirmed by reproducing the SettingsError directly
+	# against this pydantic-settings version before landing this fix —
+	# a field_validator(mode="before") on the tuple field does NOT
+	# intercept it, since the crash happens in the settings SOURCE, before
+	# pydantic's own validation pipeline ever sees the value.
+	#
+	# validation_alias, NOT env= : every other field in this file uses
+	# Field(..., env="X") to name its env var, but pydantic v2 does not
+	# support that kwarg — it is silently accepted as inert "extra"
+	# metadata (Pyright flags this file-wide as PydanticDeprecatedSince20,
+	# "Extra keys: 'env'"). Every pre-existing field here only reads its
+	# intended env var by ACCIDENT: pydantic-settings' default behavior is
+	# to derive the env var name from the FIELD NAME itself
+	# (case-insensitive, per this model's case_sensitive=False), and every
+	# existing `env="..."` value happens to equal its own field name
+	# uppercased. That coincidence breaks the moment a field's Python name
+	# differs from its env var name — exactly this field, since
+	# `blackink_global_approvers_raw` must read `BLACKINK_GLOBAL_APPROVERS`
+	# (no `_raw` suffix) to stay the name callers actually set. Confirmed
+	# empirically: env= silently does nothing here; validation_alias does.
+	# Worth a file-wide fix (every field's binding is one rename away from
+	# breaking the same way), flagged separately — out of scope to change
+	# every other field in this pass.
+	blackink_global_approvers_raw: str = Field(default="", validation_alias="BLACKINK_GLOBAL_APPROVERS")
+
+	@property
+	def blackink_global_approvers(self) -> Tuple[str, ...]:
+		return tuple(v.strip() for v in self.blackink_global_approvers_raw.split(",") if v.strip())
 
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")

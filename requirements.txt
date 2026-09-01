@@ -11,4 +11,13 @@ fastapi>=0.110
 uvicorn>=0.27
 pyjwt>=2.8
 pytest>=8.0
+pytest-asyncio>=0.24
+slack_sdk>=3.38
+slack-bolt>=1.18
+# aiohttp is required by slack_bolt's AsyncSocketModeHandler but is only
+# declared under slack_sdk's "optional" extra, not a hard dependency —
+# confirmed via `importlib.metadata.requires("slack_sdk")`. Without this
+# explicit line, `pip install -r requirements.txt` on a clean environment
+# installs slack-bolt fine but AsyncSocketModeHandler fails to import.
+aiohttp>=3.13
 
