@@ -19,7 +19,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
 	"""
@@ -50,6 +50,10 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_sending_domains_cluster ON sending_domains (cluster_label)",
 	"GRANT SELECT, INSERT, UPDATE ON sending_domains TO blackink_app",
 	"GRANT USAGE ON SEQUENCE sending_domains_id_seq TO blackink_app",
+	# deliverability_sentinel.py runs as blackink_system and quarantines/
+	# swaps domains across every client's cluster.
+	"GRANT SELECT, INSERT, UPDATE ON sending_domains TO blackink_system",
+	"GRANT USAGE ON SEQUENCE sending_domains_id_seq TO blackink_system",
 	"""
 	CREATE TABLE IF NOT EXISTS mailboxes (
 		id                        BIGSERIAL    PRIMARY KEY,
@@ -73,11 +77,13 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_mailboxes_client ON mailboxes (client_id)",
 	"GRANT SELECT, INSERT, UPDATE ON mailboxes TO blackink_app",
 	"GRANT USAGE ON SEQUENCE mailboxes_id_seq TO blackink_app",
+	"GRANT SELECT, INSERT, UPDATE ON mailboxes TO blackink_system",
+	"GRANT USAGE ON SEQUENCE mailboxes_id_seq TO blackink_system",
 ]
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for stmt in DDL:
 			db.execute(text(stmt))
 		db.commit()
