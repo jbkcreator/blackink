@@ -110,6 +110,52 @@ def test_rls_backstop_holds_with_no_client_context_at_all(canary_tenants):
 	assert rows == [], "A session with no tenant context read a tenant-scoped row"
 
 
+def test_only_blackink_app_can_execute_non_poach_function():
+	"""akrash_ingest has INSERT-only grants on the two staging tables and
+	nothing else. Postgres grants EXECUTE on every new function to PUBLIC by
+	default; a prior version of apply_compliance_gate_audit.py never revoked
+	it, so this SECURITY DEFINER function (which bypasses RLS) was callable
+	by a role with zero table-read grants — a restricted ingestion credential
+	could still probe cross-tenant non-poach claims through it. Checked via
+	Postgres's own has_function_privilege() rather than a live connection as
+	akrash_ingest, since pg_hba/firewall network restrictions may legitimately
+	block that role from ever reaching the DB from outside its ingest path —
+	this asserts the grant itself, independent of network topology."""
+	db = Database()
+	with db.session_scope() as session:
+		for role in ("akrash_ingest", "blackink_system"):
+			allowed = session.execute(
+				text(
+					"SELECT has_function_privilege(:role, "
+					"'is_claimed_by_other_client(varchar)', 'EXECUTE')"
+				),
+				{"role": role},
+			).scalar()
+			assert allowed is False, f"{role} can execute is_claimed_by_other_client — should be denied"
+
+		# has_function_privilege() takes a real role name, so PUBLIC (an
+		# implicit grantee, not a row in pg_roles) can't be checked that way —
+		# inspect the ACL array directly for the unnamed-grantee entry
+		# ('=...', no role name before '=') that a PUBLIC grant produces.
+		has_public_grant = session.execute(
+			text(
+				"SELECT EXISTS ("
+				"  SELECT 1 FROM pg_proc p, unnest(p.proacl) AS acl"
+				"  WHERE p.proname = 'is_claimed_by_other_client' AND acl::text LIKE '=%'"
+				")"
+			)
+		).scalar()
+		assert has_public_grant is False, "PUBLIC still holds an EXECUTE grant on is_claimed_by_other_client"
+
+		allowed = session.execute(
+			text(
+				"SELECT has_function_privilege('blackink_app', "
+				"'is_claimed_by_other_client(varchar)', 'EXECUTE')"
+			)
+		).scalar()
+		assert allowed is True, "blackink_app should retain EXECUTE — the app is the only caller"
+
+
 def test_non_poach_function_discloses_no_identity(canary_tenants):
 	"""is_claimed_by_other_client returns a boolean only — the requesting
 	client must never learn WHICH other client owns a claimed company."""
@@ -129,8 +175,8 @@ def test_non_poach_function_discloses_no_identity(canary_tenants):
 	try:
 		with get_db_context(client_id=CANARY_A) as session:
 			claimed = session.execute(
-				text("SELECT is_claimed_by_other_client(:company_id, :client_id) AS claimed"),
-				{"company_id": canary_tenants[CANARY_A]["company_id"], "client_id": CANARY_A},
+				text("SELECT is_claimed_by_other_client(:company_id) AS claimed"),
+				{"company_id": canary_tenants[CANARY_A]["company_id"]},
 			).scalar()
 		assert claimed is True
 	finally:

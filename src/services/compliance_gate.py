@@ -154,11 +154,16 @@ def _check_dnc(contact, dnc_provider: DncProvider) -> GateCheckResult:
 	)
 
 
-def _check_non_poach(session: Session, company_id: str, requesting_client_id: str) -> GateCheckResult:
+def _check_non_poach(session: Session, company_id: str) -> GateCheckResult:
+	"""requesting_client_id is deliberately NOT passed to the SQL function —
+	it reads the requesting client from the session's own SET LOCAL
+	app.current_client_id instead, so the check is tied to the session's
+	actual RLS tenant context rather than a caller-supplied value a shared
+	role could vary to probe another client's claim status."""
 	try:
 		claimed = session.execute(
-			text("SELECT is_claimed_by_other_client(:company_id, :client_id) AS claimed"),
-			{"company_id": company_id, "client_id": requesting_client_id},
+			text("SELECT is_claimed_by_other_client(:company_id) AS claimed"),
+			{"company_id": company_id},
 		).scalar()
 	except Exception as e:
 		# Deliberately NOT reusing Forced Action's fuzzy-matching
@@ -188,7 +193,7 @@ def evaluate_compliance_gate(
 		_check_deterministic_columns(contact),
 		_check_cooldown(contact),
 		_check_dnc(contact, dnc_provider),
-		_check_non_poach(session, contact.company_id, requesting_client_id),
+		_check_non_poach(session, contact.company_id),
 	)
 
 	for check in checks:
