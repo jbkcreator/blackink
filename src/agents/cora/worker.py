@@ -85,6 +85,18 @@ class Worker:
         signal.signal(signal.SIGTERM, self.request_stop)
 
     def _process_one(self, msg: "queue.DraftMessage") -> None:
+        # Per-message CLIENT halt check — the pre-loop check in run_forever()
+        # only evaluates GLOBAL halts because no message has been claimed yet.
+        # Once we hold a message we know its client, so re-check here before
+        # doing any work. Leave unacked so the message is recoverable via
+        # claim_stale() after the halt is lifted.
+        if kill_switch.cora_should_stop(client_id=msg.client_id):
+            logger.warning(
+                "cora.worker: CLIENT halt active for client_id=%s — "
+                "leaving message_id=%s unacked for recovery",
+                msg.client_id, msg.message_id,
+            )
+            return
         try:
             _process_draft(msg)
             queue.ack(msg.message_id)

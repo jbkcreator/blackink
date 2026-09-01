@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE: int = 500
 
 
-def _fetch_batch(sess, limit: int) -> List[CompanyRecord]:
+def _fetch_batch(sess, limit: int, offset: int = 0) -> List[CompanyRecord]:
     rows = sess.execute(
         text("""
             SELECT company_id, company_name, domain, door_count_est
@@ -45,9 +45,9 @@ def _fetch_batch(sess, limit: int) -> List[CompanyRecord]:
             WHERE entity_type = 'llc_portfolio_owner'
               AND owner_entity_id IS NULL
             ORDER BY company_id
-            LIMIT :limit
+            LIMIT :limit OFFSET :offset
         """),
-        {"limit": limit},
+        {"limit": limit, "offset": offset},
     ).fetchall()
     return [
         CompanyRecord(
@@ -114,39 +114,51 @@ def run_sweep() -> int:
     Safe to call repeatedly — already-resolved companies are skipped by the
     WHERE owner_entity_id IS NULL filter. If a Relay GLOBAL halt is active,
     returns 0 immediately without touching the DB.
+
+    Resolution is performed over ALL unresolved records in a single in-memory
+    pass before any writes. This prevents the batch-boundary split bug where
+    two records for the same real owner land in different 500-row batches,
+    causing the same owner to be created as two separate owner_entities that
+    can never be merged by later sweeps.
     """
     if hunter_should_stop():
         return 0
 
     db = Database()
-    total_companies = 0
-    total_clusters = 0
 
+    # Phase 1: load all unresolved records before any write.
+    # OFFSET paginates through the full unresolved set; because no writes
+    # happen during this phase, the WHERE owner_entity_id IS NULL filter
+    # is stable across pages.
+    all_records: List[CompanyRecord] = []
+    offset = 0
     while True:
         with db.system_session_scope() as read_sess:
-            batch = _fetch_batch(read_sess, BATCH_SIZE)
-
+            batch = _fetch_batch(read_sess, BATCH_SIZE, offset=offset)
         if not batch:
             break
-
-        clusters = resolve_batch(batch)
-
-        with db.system_session_scope() as write_sess:
-            for cluster in clusters:
-                _write_cluster(write_sess, cluster)
-
-        total_companies += len(batch)
-        total_clusters += len(clusters)
-        logger.info(
-            "hunter: wrote %d clusters from %d companies (running total: %d)",
-            len(clusters), len(batch), total_companies,
-        )
-
+        all_records.extend(batch)
+        offset += len(batch)
         if len(batch) < BATCH_SIZE:
             break
 
+    if not all_records:
+        logger.info("hunter: sweep complete — 0 companies → 0 entities")
+        return 0
+
+    # Phase 2: resolve all records in one in-memory pass.
+    # Seeing the full set ensures that name variants for the same owner
+    # that span batch boundaries end up in the same cluster.
+    clusters = resolve_batch(all_records)
+
+    # Phase 3: write clusters to DB.
+    total_clusters = len(clusters)
+    with db.system_session_scope() as write_sess:
+        for cluster in clusters:
+            _write_cluster(write_sess, cluster)
+
     logger.info(
         "hunter: sweep complete — %d companies → %d entities",
-        total_companies, total_clusters,
+        len(all_records), total_clusters,
     )
-    return total_companies
+    return len(all_records)
