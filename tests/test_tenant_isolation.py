@@ -30,10 +30,15 @@ from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants 
 def test_rls_enabled_and_forced_on_every_registered_table():
 	db = Database()
 	with db.session_scope() as session:
+		# pg_tables has no forcerowsecurity column — see
+		# migrations/apply_rls_policies.py's verification query for why this
+		# reads from pg_class/pg_namespace instead.
 		rows = session.execute(
 			text(
-				"SELECT tablename, rowsecurity, forcerowsecurity FROM pg_tables "
-				"WHERE schemaname = 'public' AND tablename = ANY(:tables)"
+				"SELECT c.relname AS tablename, c.relrowsecurity AS rowsecurity, "
+				"c.relforcerowsecurity AS forcerowsecurity "
+				"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE n.nspname = 'public' AND c.relname = ANY(:tables)"
 			),
 			{"tables": list(TENANT_POLICIES.keys())},
 		).fetchall()
@@ -108,8 +113,12 @@ def test_rls_backstop_holds_with_no_client_context_at_all(canary_tenants):
 def test_non_poach_function_discloses_no_identity(canary_tenants):
 	"""is_claimed_by_other_client returns a boolean only — the requesting
 	client must never learn WHICH other client owns a claimed company."""
-	# Seed canary A's company into canary B's PM book so it reads as claimed.
-	with get_db_context() as session:
+	# Seed canary A's company into canary B's own PM book (client B legitimately
+	# writing a row it owns) so it reads as claimed. Uses get_db_context(client_id=
+	# CANARY_B), not a bare/unscoped session — an unscoped write is correctly
+	# rejected by RLS's WITH CHECK (client_id must equal the session's tenant
+	# context), which is RLS working as intended, not something to route around.
+	with get_db_context(client_id=CANARY_B) as session:
 		session.execute(
 			text(
 				"INSERT INTO client_pm_books (client_id, owner_domain) VALUES (:cid, :domain)"
@@ -117,14 +126,18 @@ def test_non_poach_function_discloses_no_identity(canary_tenants):
 			{"cid": CANARY_B, "domain": canary_tenants[CANARY_A]["domain"]},
 		)
 
-	with get_db_context(client_id=CANARY_A) as session:
-		claimed = session.execute(
-			text("SELECT is_claimed_by_other_client(:company_id, :client_id) AS claimed"),
-			{"company_id": canary_tenants[CANARY_A]["company_id"], "client_id": CANARY_A},
-		).scalar()
-	assert claimed is True
-
-	with get_db_context() as session:
-		session.execute(
-			text("DELETE FROM client_pm_books WHERE client_id = :cid"), {"cid": CANARY_B}
-		)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			claimed = session.execute(
+				text("SELECT is_claimed_by_other_client(:company_id, :client_id) AS claimed"),
+				{"company_id": canary_tenants[CANARY_A]["company_id"], "client_id": CANARY_A},
+			).scalar()
+		assert claimed is True
+	finally:
+		# Always clean up the seeded row, even if the assert above fails —
+		# otherwise the canary_tenants fixture's own teardown hits a foreign
+		# key violation trying to delete a client still referenced here.
+		with get_db_context(client_id=CANARY_B) as session:
+			session.execute(
+				text("DELETE FROM client_pm_books WHERE client_id = :cid"), {"cid": CANARY_B}
+			)

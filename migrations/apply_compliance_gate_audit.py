@@ -20,7 +20,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
 	"""
@@ -71,11 +71,16 @@ DDL = [
 	$$
 	""",
 	"GRANT EXECUTE ON FUNCTION is_claimed_by_other_client(VARCHAR, VARCHAR) TO blackink_app",
+	# CREATE OR REPLACE FUNCTION does NOT transfer ownership if the function
+	# already exists — only the first CREATE sets the owner. Explicit here so
+	# this migration is self-correcting regardless of who created it first;
+	# SECURITY DEFINER only bypasses RLS if the owner does (postgres/superuser).
+	"ALTER FUNCTION is_claimed_by_other_client(VARCHAR, VARCHAR) OWNER TO postgres",
 ]
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for stmt in DDL:
 			db.execute(text(stmt))
 		db.commit()

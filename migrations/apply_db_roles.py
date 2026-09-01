@@ -41,7 +41,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from sqlalchemy import text
 
 from config.settings import get_settings
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 ROLES = {
 	"blackink_app": {"bypassrls": False, "password_attr": "blackink_app_db_password"},
@@ -68,7 +68,7 @@ def main() -> int:
 
 	settings = get_settings()
 
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		if args.dry_run:
 			for role in ROLES:
 				exists = db.execute(text(ROLE_EXISTS_SQL), {"role": role}).scalar()
