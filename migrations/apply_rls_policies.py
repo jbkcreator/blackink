@@ -13,7 +13,7 @@ docs/adr/0001-tenant-isolation-rls-plus-app-layer.md and the Dev 1 plan's
 Run LAST, after every tenant table exists (migrations 1-10 must already
 be applied). Safely re-runnable: DROP POLICY IF EXISTS then recreate.
 
-The verification step at the end queries pg_tables+pg_class/pg_policies and FAILS
+The verification step at the end queries pg_class/pg_policies and FAILS
 LOUDLY if any table registered in TENANT_POLICIES lacks
 rowsecurity=true AND forcerowsecurity=true — this is what closes the exact
 gap that let Forced Action ship with zero enforcement silently: a new
@@ -31,7 +31,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from sqlalchemy import text
 
 from config.tenant_policies import TENANT_POLICIES
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 
 def _quote_ident(name: str) -> str:
@@ -62,7 +62,7 @@ def _policy_sql(table: str, policy: dict) -> str:
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for table, policy in TENANT_POLICIES.items():
 			t = _quote_ident(table)
 			db.execute(text(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"))
@@ -72,13 +72,14 @@ def main() -> int:
 		db.commit()
 
 		# ── Fail-loud verification ──────────────────────────────────────────
+		# pg_tables has no forcerowsecurity column — that flag lives on
+		# pg_class.relforcerowsecurity, not the pg_tables view.
 		rows = db.execute(
 			text(
-				"SELECT t.tablename, t.rowsecurity, c.relforcerowsecurity AS forcerowsecurity "
-				"FROM pg_tables t "
-				"JOIN pg_class c ON c.relname = t.tablename "
-				"JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = t.schemaname "
-				"WHERE t.schemaname = 'public' AND t.tablename = ANY(:tables) AND c.relkind = 'r'"
+				"SELECT c.relname AS tablename, c.relrowsecurity AS rowsecurity, "
+				"c.relforcerowsecurity AS forcerowsecurity "
+				"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE n.nspname = 'public' AND c.relname = ANY(:tables)"
 			),
 			{"tables": list(TENANT_POLICIES.keys())},
 		).fetchall()
