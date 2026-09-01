@@ -1,0 +1,42 @@
+
+services:
+  api:
+    build: .
+    image: blackink-backend:latest
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+    network_mode: host
+    env_file: .env
+    restart: unless-stopped
+
+  promotion-sweep:
+    build: .
+    image: blackink-backend:latest
+    command: >
+      sh -c "while true; do python -m src.tasks.promotion_sweep; sleep 300; done"
+    network_mode: host
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  deliverability-sentinel:
+    build: .
+    image: blackink-backend:latest
+    command: >
+      sh -c "while true; do python -m src.tasks.deliverability_sentinel; sleep 3600; done"
+    network_mode: host
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  county-allocation:
+    build: .
+    image: blackink-backend:latest
+    command: >
+      sh -c "while true; do python -m src.tasks.county_allocation_reassessment; sleep 86400; done"
+    network_mode: host
+    env_file: .env
+    restart: unless-stopped
+    depends_on:
+      - api
