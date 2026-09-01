@@ -31,26 +31,13 @@ def _row(*vals):
     return m
 
 
-def _session_for_suppress(company_id="co_abc"):
-    """Session that handles suppress_contact's two executes: UPDATE + SELECT."""
+def _session_for_suppress():
+    """Session for suppress_contact's single UPDATE (no events logging)."""
     session = MagicMock()
-    calls = []
-
-    def _exec(stmt, params):
-        calls.append((str(stmt), params))
-        result = MagicMock()
-        sql = str(stmt).upper()
-        if "SELECT" in sql and "company_id" in sql.lower():
-            result.fetchone.return_value = (company_id,)
-        elif "INSERT" in sql:
-            result.fetchone.return_value = None
-        else:
-            result.fetchone.return_value = None
-        result.fetchall.return_value = []
-        return result
-
-    session.execute.side_effect = _exec
-    session._calls = calls
+    result = MagicMock()
+    result.fetchone.return_value = None
+    result.fetchall.return_value = []
+    session.execute.return_value = result
     return session
 
 
@@ -90,19 +77,14 @@ def test_suppress_contact_idempotent_no_error():
     suppress_contact(session, contact_id=5, reason="test")
 
 
-def test_suppress_contact_logs_event_when_company_found():
-    session = _session_for_suppress(company_id="co_xyz")
+def test_suppress_contact_does_not_write_events_ledger():
+    # events.client_id is NOT NULL; suppression must never insert into events
+    # (a NULL insert would abort the transaction). Only the UPDATE runs.
+    session = _session_for_suppress()
     suppress_contact(session, contact_id=10, reason="dnc_import")
-    calls = [str(c[0][0]) for c in session.execute.call_args_list]
-    assert any("INSERT" in c.upper() for c in calls)
-
-
-def test_suppress_contact_no_crash_when_company_missing():
-    session = MagicMock()
-    result = MagicMock()
-    result.fetchone.return_value = None
-    session.execute.return_value = result
-    suppress_contact(session, contact_id=99, reason="test")  # must not raise
+    calls = [str(c[0][0]).upper() for c in session.execute.call_args_list]
+    assert all("INSERT" not in c for c in calls)
+    assert len(calls) == 1  # single UPDATE, no SELECT company_id, no INSERT
 
 
 # ---------------------------------------------------------------------------

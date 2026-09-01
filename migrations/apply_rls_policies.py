@@ -13,7 +13,7 @@ docs/adr/0001-tenant-isolation-rls-plus-app-layer.md and the Dev 1 plan's
 Run LAST, after every tenant table exists (migrations 1-10 must already
 be applied). Safely re-runnable: DROP POLICY IF EXISTS then recreate.
 
-The verification step at the end queries pg_tables/pg_policies and FAILS
+The verification step at the end queries pg_class/pg_policies and FAILS
 LOUDLY if any table registered in TENANT_POLICIES lacks
 rowsecurity=true AND forcerowsecurity=true — this is what closes the exact
 gap that let Forced Action ship with zero enforcement silently: a new
@@ -74,8 +74,12 @@ def main() -> int:
 		# ── Fail-loud verification ──────────────────────────────────────────
 		rows = db.execute(
 			text(
-				"SELECT tablename, rowsecurity, forcerowsecurity FROM pg_tables "
-				"WHERE schemaname = 'public' AND tablename = ANY(:tables)"
+				"SELECT c.relname AS tablename, "
+				"       c.relrowsecurity AS rowsecurity, "
+				"       c.relforcerowsecurity AS forcerowsecurity "
+				"FROM pg_class c "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"WHERE n.nspname = 'public' AND c.relname = ANY(:tables)"
 			),
 			{"tables": list(TENANT_POLICIES.keys())},
 		).fetchall()

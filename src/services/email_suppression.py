@@ -8,13 +8,12 @@ cascade shape) and adapted for Blackink's data model:
   contact IS suppressing all channels for that contact.
 - `suppress_contact` sets both is_opted_out AND suppression_state so every
   path that checks either column is blocked, same as FA's all-or-nothing rule.
-- All suppression writes log an event to the events ledger for audit trail.
+- The contacts row is the suppression record of truth. Suppression is global
+  (cross-tenant); it is not written to the tenant-scoped events ledger.
 - Does not commit — caller's session_scope() owns the transaction.
 """
 
 import logging
-from datetime import datetime, timezone
-from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -27,11 +26,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def suppress_contact(session: Session, contact_id: int, reason: str) -> None:
-    """Deterministic opt-out — sets is_opted_out + suppression_state + logs event.
+    """Deterministic opt-out — sets is_opted_out + suppression_state on the contact.
 
     Zero human touch, zero LLM involvement. Idempotent — safe to call multiple
-    times. Logs a suppression event to the events ledger for audit trail.
-    Does not commit.
+    times. The contacts row is the suppression record of truth; suppression is
+    global (cross-tenant), so it is NOT written to the tenant-scoped events
+    ledger (events.client_id is NOT NULL). Does not commit.
     """
     session.execute(
         text(
@@ -41,21 +41,6 @@ def suppress_contact(session: Session, contact_id: int, reason: str) -> None:
         ),
         {"contact_id": contact_id},
     )
-
-    # Fetch client_id for the events ledger (contacts are global but events are tenant-scoped)
-    row = session.execute(
-        text("SELECT company_id FROM contacts WHERE contact_id = :contact_id"),
-        {"contact_id": contact_id},
-    ).fetchone()
-
-    if row:
-        _log_suppression_event(
-            session=session,
-            contact_id=contact_id,
-            company_id=row[0],
-            reason=reason,
-        )
-
     logger.info("suppression: contact_id=%s reason=%s", contact_id, reason)
 
 
@@ -105,11 +90,17 @@ def suppress_by_phone(session: Session, phone: str, reason: str) -> int:
     and (813) 555-0100 all resolve to the same contact.
     """
     normalized = _normalize_phone(phone)
+    # Normalize the stored value the same way _normalize_phone does: strip all
+    # non-digits, then drop a leading US country code 1. This makes E.164
+    # (+18135550100), 11-digit (18135550100), and formatted ((813) 555-0100)
+    # stored values all compare equal to the 10-digit normalized input.
     rows = session.execute(
         text(
             "SELECT contact_id FROM contacts "
-            "WHERE regexp_replace(phone, '[^0-9]', '', 'g') = :phone "
-            "   OR regexp_replace(phone, '^1?([0-9]{10})$', '\\1') = :phone"
+            "WHERE regexp_replace("
+            "        regexp_replace(phone, '[^0-9]', '', 'g'), "
+            "        '^1([0-9]{10})$', '\\1'"
+            "      ) = :phone"
         ),
         {"phone": normalized},
     ).fetchall()
@@ -159,8 +150,7 @@ def bulk_suppress(
     """Suppress a list of contacts in a single batch. Returns count suppressed.
 
     Used for DNC import lists and compliance scrubs. Batches the UPDATE to
-    avoid N individual round-trips. Still logs one event per contact for
-    full audit trail.
+    avoid N individual round-trips. Does not commit.
     """
     if not contact_ids:
         return 0
@@ -173,19 +163,6 @@ def bulk_suppress(
         ),
         {"ids": contact_ids},
     )
-
-    # Fetch company_ids for event logging
-    rows = session.execute(
-        text(
-            "SELECT contact_id, company_id FROM contacts "
-            "WHERE contact_id = ANY(:ids)"
-        ),
-        {"ids": contact_ids},
-    ).fetchall()
-
-    for contact_id, company_id in rows:
-        _log_suppression_event(session, contact_id, company_id, reason)
-
     logger.info("bulk_suppress: count=%d reason=%s", len(contact_ids), reason)
     return len(contact_ids)
 
@@ -219,43 +196,3 @@ def import_dnc_list(
         "dnc_import: source=%s matched=%d unmatched=%d", source, matched, unmatched
     )
     return {"matched": matched, "unmatched": unmatched}
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _log_suppression_event(
-    session: Session,
-    contact_id: int,
-    company_id: Optional[str],
-    reason: str,
-) -> None:
-    """Append a suppression event to the events ledger.
-
-    client_id is NULL for suppression events — suppression is platform-wide,
-    not tenant-scoped. The events table allows NULL client_id for system-level
-    audit records.
-    """
-    try:
-        session.execute(
-            text(
-                "INSERT INTO events "
-                "(client_id, event_type, entity_type, entity_id, payload, actor, created_at) "
-                "VALUES "
-                "(NULL, 'contact_suppressed', 'contact', :entity_id, "
-                " jsonb_build_object('reason', :reason, 'company_id', :company_id), "
-                " 'suppression_gate', :now)"
-            ),
-            {
-                "entity_id": str(contact_id),
-                "reason": reason,
-                "company_id": company_id,
-                "now": datetime.now(timezone.utc),
-            },
-        )
-    except Exception:
-        # Best-effort — suppression write must never be blocked by event log failure
-        logger.warning(
-            "suppression event log failed for contact_id=%s", contact_id, exc_info=True
-        )

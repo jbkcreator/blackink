@@ -37,7 +37,7 @@ import requests
 from sqlalchemy import text
 
 from config.settings import get_settings
-from src.core.database import get_db_context
+from src.core.database import get_system_db_context
 from src.services.email_suppression import _normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -143,6 +143,9 @@ def _persist_results(
     stats: dict,
 ) -> None:
     now = datetime.now(timezone.utc)
+    clean_ids: list[int] = []
+    flagged_ids: list[int] = []
+
     for row in csv_rows:
         raw_phone = row.get("phone", "")
         phone = _normalize_phone(str(raw_phone).strip())
@@ -158,25 +161,29 @@ def _persist_results(
 
         national_dnc = str(row.get("national_dnc", "")).strip().upper() in ("Y", "YES", "TRUE", "1")
         litigator = str(row.get("litigator", "")).strip().upper() in ("Y", "YES", "TRUE", "1")
-        dnc_clean = not (national_dnc or litigator)
 
-        session.execute(
-            text(
-                "UPDATE contacts "
-                "SET dnc_clean = :dnc_clean, dnc_checked_at = :now "
-                "WHERE contact_id = ANY(:ids)"
-            ),
-            {"dnc_clean": dnc_clean, "now": now, "ids": contact_ids},
-        )
-
-        if not dnc_clean:
+        if national_dnc or litigator:
+            flagged_ids.extend(contact_ids)
             stats["dnc_hits"] += 1
             logger.info(
                 "dnc_refresh: national_dnc=%s litigator=%s phone=%s contact_ids=%s",
                 national_dnc, litigator, phone, contact_ids,
             )
         else:
+            clean_ids.extend(contact_ids)
             stats["clean"] += 1
+
+    # Two batched UPDATEs instead of one per CSV row.
+    for dnc_clean, ids in ((True, clean_ids), (False, flagged_ids)):
+        if ids:
+            session.execute(
+                text(
+                    "UPDATE contacts "
+                    "SET dnc_clean = :dnc_clean, dnc_checked_at = :now "
+                    "WHERE contact_id = ANY(:ids)"
+                ),
+                {"dnc_clean": dnc_clean, "now": now, "ids": ids},
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +217,7 @@ def run_dnc_refresh(
 
     stats = {"total": 0, "clean": 0, "dnc_hits": 0, "failed": 0, "unmatched": 0, "skipped": False}
 
-    with get_db_context() as session:
+    with get_system_db_context() as session:
         contacts = _collect_contacts(session, cutoff, limit)
 
     stats["total"] = len(contacts)
@@ -243,7 +250,7 @@ def run_dnc_refresh(
             stats["failed"] += len(batch)
             continue
 
-        with get_db_context() as session:
+        with get_system_db_context() as session:
             _persist_results(session, csv_rows, phone_to_contact_ids, stats)
             session.commit()
 

@@ -127,7 +127,7 @@ def test_run_skips_when_no_api_key():
 
 def test_run_dry_run_no_api_call():
     with patch("src.tasks.dnc_refresh.get_settings") as mock_settings, \
-         patch("src.tasks.dnc_refresh.get_db_context") as mock_ctx, \
+         patch("src.tasks.dnc_refresh.get_system_db_context") as mock_ctx, \
          patch("src.tasks.dnc_refresh._submit_batch") as mock_submit:
 
         mock_key = MagicMock()
@@ -150,7 +150,7 @@ def test_run_dry_run_no_api_call():
 
 def test_run_returns_zero_when_no_contacts():
     with patch("src.tasks.dnc_refresh.get_settings") as mock_settings, \
-         patch("src.tasks.dnc_refresh.get_db_context") as mock_ctx:
+         patch("src.tasks.dnc_refresh.get_system_db_context") as mock_ctx:
 
         mock_key = MagicMock()
         mock_key.get_secret_value.return_value = "fake-key"
