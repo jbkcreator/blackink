@@ -18,7 +18,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
 	"""
@@ -67,11 +67,16 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_contacts_company ON contacts (company_id)",
 	"GRANT SELECT, INSERT, UPDATE ON contacts TO blackink_app",
 	"GRANT USAGE ON SEQUENCE contacts_contact_id_seq TO blackink_app",
+	# promotion_sweep.py runs as blackink_system and promotes contacts
+	# across every tenant's companies. DELETE included for the leakage-test
+	# fixture's canary-row teardown (tests/fixtures/synthetic_tenants.py).
+	"GRANT SELECT, INSERT, UPDATE, DELETE ON contacts TO blackink_system",
+	"GRANT USAGE ON SEQUENCE contacts_contact_id_seq TO blackink_system",
 ]
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for stmt in DDL:
 			db.execute(text(stmt))
 		db.commit()

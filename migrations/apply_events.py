@@ -14,7 +14,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
 	"""
@@ -38,7 +38,7 @@ DDL = [
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for stmt in DDL:
 			db.execute(text(stmt))
 		db.commit()

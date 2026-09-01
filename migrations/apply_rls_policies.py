@@ -73,7 +73,9 @@ def main() -> int:
 
 		# ── Fail-loud verification ──────────────────────────────────────────
 		# pg_tables has no forcerowsecurity column — that flag lives on
-		# pg_class.relforcerowsecurity, not the pg_tables view.
+		# pg_class.relforcerowsecurity, not the pg_tables view. rowsecurity
+		# is available both places; queried from pg_class here too so both
+		# columns come from one consistent source.
 		rows = db.execute(
 			text(
 				"SELECT c.relname AS tablename, c.relrowsecurity AS rowsecurity, "
