@@ -28,6 +28,7 @@ PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
+PYTHONPATH=. python migrations/apply_relay_halts.py     # control-plane, not tenant-bearing
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -35,6 +36,7 @@ PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
+python -m src.tasks.hunter_nightly_sweep
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
