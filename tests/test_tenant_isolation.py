@@ -24,7 +24,22 @@ from sqlalchemy import text
 
 from config.tenant_policies import TENANT_POLICIES
 from src.core.database import Database, get_db_context, get_owner_db_context, get_system_db_context
+from src.services.campaign_readiness_gate import evaluate_full_readiness
+from src.services.compliance_gate import DncProvider
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
+
+
+class _FixedDnc(DncProvider):
+	"""Test double — always returns a fixed listed/clear verdict, and counts
+	calls so cache-hit-avoids-live-call can be asserted."""
+
+	def __init__(self, listed: bool):
+		self.listed = listed
+		self.calls = 0
+
+	def check(self, phone):
+		self.calls += 1
+		return self.listed
 
 
 def test_rls_enabled_and_forced_on_every_registered_table():
@@ -363,3 +378,172 @@ def test_campaign_readiness_requires_tenant_context(canary_tenants):
 		except Exception:
 			raised = True
 	assert raised, "evaluate_campaign_readiness did not raise with no tenant context set"
+
+
+# ── Subtask 1.2.2 — Checks 3+4 (DNC / quiet hours / warm-channel waterfall) ──
+#
+# Per the master blueprint (§3.1.2's waterfall diagram + §3.0.4's CI-enforced
+# predicate), NOT the Week1_Tasks_Dev_Split.md DoD checklist's more ambiguous
+# wording: a DNC hit is a partial channel restriction ("CHANNEL SUPPRESSED"),
+# not a full block like Checks 1/2 — a DNC-listed contact still gets
+# readiness=TRUE and EMAIL_COLD_ELIGIBLE, never BLOCKED.
+
+
+def _cleanup_compliance_events(contact_id):
+	# compliance_gate_evaluated rows are append-only (blackink_app/system
+	# have no DELETE grant on events) — same cleanup pattern as the
+	# non_poach_suppressed tests above, via the owner context, before the
+	# canary_tenants fixture's own teardown deletes the referencing client.
+	with get_owner_db_context() as session:
+		session.execute(
+			text("DELETE FROM events WHERE event_type = 'compliance_gate_evaluated' AND entity_id = :cid"),
+			{"cid": str(contact_id)},
+		)
+		session.commit()
+
+
+def test_full_readiness_florida_dnc_listed_engaged_contact_withholds_sms_not_blocked(canary_tenants):
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"UPDATE contacts SET phone = '+18135550100', booked_appointment_id = 'appt_1' "
+				"WHERE contact_id = :cid"
+			),
+			{"cid": contact_id},
+		)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			result = evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=_FixedDnc(listed=True))
+		assert result.readiness is True
+		assert result.compliance_eligibility == "EMAIL_COLD_ELIGIBLE"
+		assert result.reason_code == "ENGAGED_DNC_SMS_WITHHELD"
+	finally:
+		_cleanup_compliance_events(contact_id)
+
+
+def test_full_readiness_clean_unengaged_contact_gets_email_cold_eligible(canary_tenants):
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			result = evaluate_full_readiness(session, contact_id, CANARY_B, dnc_provider=_FixedDnc(listed=False))
+		assert result.readiness is True
+		assert result.compliance_eligibility == "EMAIL_COLD_ELIGIBLE"
+		assert result.reason_code == "COLD_EMAIL_ONLY"
+	finally:
+		_cleanup_compliance_events(contact_id)
+
+
+def test_full_readiness_booked_contact_daytime_gets_transactional_sms(canary_tenants, monkeypatch):
+	import src.services.campaign_readiness_gate as gate_module
+
+	monkeypatch.setattr(gate_module, "_local_hour", lambda tz_name: 14)  # 2pm — outside quiet hours
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"UPDATE contacts SET phone = '+18135550100', booked_appointment_id = 'appt_2' "
+				"WHERE contact_id = :cid"
+			),
+			{"cid": contact_id},
+		)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			result = evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=_FixedDnc(listed=False))
+		assert result.readiness is True
+		assert result.compliance_eligibility == "TRANSACTIONAL_SMS_ONLY"
+		assert result.reason_code == "ENGAGED_SMS_ELIGIBLE"
+	finally:
+		_cleanup_compliance_events(contact_id)
+
+
+def test_full_readiness_booked_contact_quiet_hours_withholds_sms(canary_tenants, monkeypatch):
+	import src.services.campaign_readiness_gate as gate_module
+
+	monkeypatch.setattr(gate_module, "_local_hour", lambda tz_name: 22)  # 10pm — quiet hours
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"UPDATE contacts SET phone = '+18135550100', booked_appointment_id = 'appt_3' "
+				"WHERE contact_id = :cid"
+			),
+			{"cid": contact_id},
+		)
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			result = evaluate_full_readiness(session, contact_id, CANARY_B, dnc_provider=_FixedDnc(listed=False))
+		assert result.readiness is True
+		assert result.compliance_eligibility == "EMAIL_COLD_ELIGIBLE"
+		assert result.reason_code == "ENGAGED_QUIET_HOURS_SMS_WITHHELD"
+	finally:
+		_cleanup_compliance_events(contact_id)
+
+
+def test_full_readiness_dnc_cache_populated_then_reused(canary_tenants):
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+	provider = _FixedDnc(listed=False)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=provider)
+		assert provider.calls == 1, "first call (cache empty) should query the live provider"
+
+		with get_db_context(client_id=CANARY_A) as session:
+			evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=provider)
+		assert provider.calls == 1, "second call (cache fresh) should reuse the cached value"
+	finally:
+		_cleanup_compliance_events(contact_id)
+
+
+def test_full_readiness_logs_compliance_gate_evaluated_event_with_reason_code(canary_tenants):
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			evaluate_full_readiness(session, contact_id, CANARY_B, dnc_provider=_FixedDnc(listed=False))
+			event = session.execute(
+				text(
+					"SELECT payload FROM events WHERE event_type = 'compliance_gate_evaluated' "
+					"AND entity_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": str(contact_id)},
+			).first()
+		assert event is not None, "compliance_gate_evaluated event not logged"
+		assert event.payload["reason_code"] == "COLD_EMAIL_ONLY"
+		assert event.payload["compliance_eligibility"] == "EMAIL_COLD_ELIGIBLE"
+	finally:
+		_cleanup_compliance_events(contact_id)
+
+
+def test_full_readiness_end_to_end_cold_clean_contact(canary_tenants):
+	"""Integration per the DoD: a contact clearing all four checks returns
+	readiness=TRUE and EMAIL_COLD_ELIGIBLE (cold — no prior engagement)."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			result = evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=_FixedDnc(listed=False))
+		assert result.readiness is True
+		assert result.compliance_eligibility == "EMAIL_COLD_ELIGIBLE"
+
+		with get_db_context(client_id=CANARY_A) as session:
+			stored = session.execute(
+				text("SELECT compliance_eligibility FROM contacts WHERE contact_id = :cid"), {"cid": contact_id}
+			).scalar()
+		assert stored == "EMAIL_COLD_ELIGIBLE", "final eligibility must be written back to contacts"
+	finally:
+		_cleanup_compliance_events(contact_id)

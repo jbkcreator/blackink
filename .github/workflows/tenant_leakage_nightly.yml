@@ -51,6 +51,7 @@ jobs:
           echo "DATABASE_URL_APP=postgresql://blackink_app:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
           echo "DATABASE_URL_SYSTEM=postgresql://blackink_system:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
           PYTHONPATH=. python migrations/apply_counties.py
+          PYTHONPATH=. python migrations/apply_area_code_timezones.py
           PYTHONPATH=. python migrations/apply_clients.py
           PYTHONPATH=. python migrations/apply_relay_halts.py
           PYTHONPATH=. python migrations/apply_companies.py
