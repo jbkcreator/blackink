@@ -17,6 +17,8 @@ C:\\Users\\HEU-Vishnu\\.claude\\plans\\dev-1-data-synthetic-fox.md.
 from datetime import datetime, date
 from typing import Optional
 
+from sqlalchemy.dialects.postgresql import ARRAY
+
 from sqlalchemy import (
 	CheckConstraint,
 	Date,
@@ -33,7 +35,7 @@ from sqlalchemy import (
 	UniqueConstraint,
 	func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
