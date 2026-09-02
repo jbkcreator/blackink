@@ -123,8 +123,10 @@ def read_batch(
 
 def ack(message_id: str) -> None:
     """Call only after the draft has been durably posted to Slack for review."""
+    r = get_redis_client()
     try:
-        get_redis_client().xack(STREAM_KEY, GROUP_NAME, message_id)
+        r.xack(STREAM_KEY, GROUP_NAME, message_id)
+        r.xdel(STREAM_KEY, message_id)
     except Exception as exc:
         logger.warning("cora.queue: ack failed message_id=%s: %s", message_id, exc)
 
@@ -215,6 +217,7 @@ def _dead_letter_pending(r, message_id: str) -> None:
         r.xadd(DLQ_KEY, {**fields, "original_message_id": message_id, "dlq_reason": "max_deliveries_exceeded"})
         logger.warning("cora.queue: dead-lettered message_id=%s", message_id)
     r.xack(STREAM_KEY, GROUP_NAME, message_id)
+    r.xdel(STREAM_KEY, message_id)
 
 
 def pending_count() -> int:

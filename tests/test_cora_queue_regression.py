@@ -241,3 +241,71 @@ class TestPublishNoTrim:
         assert msgs[0].event_type == "draft.requested"
         assert msgs[0].client_id == "acme_pm"
         assert msgs[0].payload == {"contact_id": 9}
+
+
+# ── Issue 3: ack() must remove the stream entry to prevent unbounded growth ───
+
+class TestAckCleansStream:
+    """Regression: ack() and _dead_letter_pending() must call xdel after xack.
+
+    xack only removes the message from the consumer group's PEL; the stream
+    entry itself remains until explicitly deleted. Without xdel, every
+    processed draft accumulates in cora:drafts indefinitely, exhausting Redis
+    memory and eventually disrupting publishes, reads, and halt controls.
+    """
+
+    def test_ack_removes_entry_from_stream(self, r):
+        """Core regression: after a successful ack, xlen must reflect the
+        deletion — the stream entry must not survive beyond ack."""
+        msg = _publish_and_claim(r)
+
+        assert r.xlen(STREAM_KEY) == 1, "entry must exist before ack"
+        cora_queue.ack(msg.message_id)
+        assert r.xlen(STREAM_KEY) == 0, (
+            "ack() must call xdel — stream entry must be removed after ack"
+        )
+
+    def test_multiple_acks_drain_stream_to_zero(self, r):
+        """Bulk drain: every acked message must be deleted from the stream,
+        leaving xlen at zero regardless of how many were published."""
+        count = 10
+        for i in range(count):
+            cora_queue.publish("draft.requested", "acme_pm", {"contact_id": i})
+
+        msgs = cora_queue.read_batch("test-consumer", count=count, block_ms=100)
+        assert len(msgs) == count
+
+        for msg in msgs:
+            cora_queue.ack(msg.message_id)
+
+        assert r.xlen(STREAM_KEY) == 0, (
+            f"expected stream to be empty after {count} acks, "
+            f"got xlen={r.xlen(STREAM_KEY)}"
+        )
+
+    def test_dead_letter_removes_entry_from_source_stream(self, r):
+        """Dead-lettered messages must be deleted from cora:drafts after
+        being written to the DLQ — the source stream must not grow unboundedly
+        from failed messages."""
+        _publish_and_claim(r, client_id="acme_pm")
+
+        assert r.xlen(STREAM_KEY) == 1
+
+        with patch("src.agents.cora.queue.is_halted", return_value=False):
+            for _ in range(MAX_DELIVERIES + 1):
+                cora_queue.claim_stale("sweeper", min_idle_ms=0)
+
+        assert r.xlen(DLQ_KEY) == 1, "message must be in DLQ"
+        assert r.xlen(STREAM_KEY) == 0, (
+            "_dead_letter_pending() must call xdel — source entry must be "
+            "removed after dead-lettering"
+        )
+
+    def test_pending_count_is_zero_after_ack_and_stream_is_empty(self, r):
+        """End-to-end cleanup: after ack, both the PEL and the stream entry
+        must be gone — queue_depth and pending_count must both read zero."""
+        msg = _publish_and_claim(r)
+        cora_queue.ack(msg.message_id)
+
+        assert cora_queue.pending_count() == 0
+        assert cora_queue.queue_depth() == 0
