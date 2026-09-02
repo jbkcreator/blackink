@@ -412,6 +412,8 @@ def test_campaign_readiness_rejects_cross_tenant_contact_id(canary_tenants):
 		except Exception:
 			raised = True
 	assert raised, "evaluate_campaign_readiness leaked another tenant's contact by ID"
+
+
 # ── Subtask 1.2.2 — Checks 3+4 (DNC / quiet hours / warm-channel waterfall) ──
 #
 # Per the master blueprint (§3.1.2's waterfall diagram + §3.0.4's CI-enforced
