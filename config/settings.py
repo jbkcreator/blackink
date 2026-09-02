@@ -144,6 +144,11 @@ class AppSettings(BaseSettings):
 	def blackink_global_approvers(self) -> Tuple[str, ...]:
 		return tuple(v.strip() for v in self.blackink_global_approvers_raw.split(",") if v.strip())
 
+	# ── Relay halt / resume ──────────────────────────────────────────────────
+	# HMAC-SHA256 signing key for cryptographic resume tokens. Must be set
+	# before any halt can be issued or resumed. Recommended: 32+ bytes of entropy.
+	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
+
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 

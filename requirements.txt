@@ -20,4 +20,5 @@ slack-bolt>=1.18
 # explicit line, `pip install -r requirements.txt` on a clean environment
 # installs slack-bolt fine but AsyncSocketModeHandler fails to import.
 aiohttp>=3.13
+fakeredis>=2.0
 

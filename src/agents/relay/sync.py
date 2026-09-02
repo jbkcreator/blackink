@@ -46,14 +46,30 @@ def sync_halts_from_db() -> int:
 
     r = get_redis_client()
     synced = 0
+    active_keys: set = set()
+
     for row in rows:
+        key = _redis_key(row.scope, row.scope_id)
+        active_keys.add(key)
         try:
-            r.set(_redis_key(row.scope, row.scope_id), str(row.id))  # no TTL
+            r.set(key, str(row.id))  # no TTL
             synced += 1
         except Exception as exc:
             logger.error(
                 "relay.sync: failed to set Redis key for halt_id=%d: %s", row.id, exc
             )
+
+    # Reconcile: delete any Redis halt keys not in the active Postgres set.
+    # This covers the case where resume_halt() cleared Postgres but its Redis
+    # delete failed — without this step, sync would leave the stale key in
+    # place, set relay:synced, and is_halted() would trust it forever.
+    try:
+        for key in r.scan_iter("relay:halt:*"):
+            if key not in active_keys:
+                r.delete(key)
+                logger.info("relay.sync: removed stale Redis halt key %s", key)
+    except Exception as exc:
+        logger.error("relay.sync: failed during stale-key reconciliation: %s", exc)
 
     try:
         r.set(_REDIS_SYNCED_KEY, "1")

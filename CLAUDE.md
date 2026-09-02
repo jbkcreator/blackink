@@ -37,6 +37,7 @@ PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
+python -m src.tasks.hunter_nightly_sweep
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most

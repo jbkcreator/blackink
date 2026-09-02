@@ -19,8 +19,10 @@ get_db_context() for CREATE TABLE, which under this branch's database.py
 docstring) runs as blackink_app, a role with no CREATE TABLE privilege on
 any table it doesn't already own. Every other migration on this branch
 uses get_owner_db_context() for exactly this reason; changed here to
-match. The two branches' database.py differ on this point and need
-reconciling before merge — flagged separately, not resolved here.
+match. Confirmed get_owner_db_context() also exists on Dev 2's
+database.py after merging main (PR #2) into this branch, so both copies
+of this migration converge on the same privilege model — no reconciling
+left to do.
 
     PYTHONPATH=. python migrations/apply_relay_halts.py
 """
