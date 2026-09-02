@@ -38,7 +38,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      - name: Apply migrations 1-11
+      - name: Apply migrations
         run: |
           PYTHONPATH=. python migrations/apply_db_roles.py
           echo "DATABASE_URL_APP=postgresql://blackink_app:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
@@ -47,6 +47,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_clients.py
           PYTHONPATH=. python migrations/apply_companies.py
           PYTHONPATH=. python migrations/apply_contacts.py
+          PYTHONPATH=. python migrations/apply_pm_profiles.py
           PYTHONPATH=. python migrations/apply_owner_entities.py
           PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
           PYTHONPATH=. python migrations/apply_events.py
