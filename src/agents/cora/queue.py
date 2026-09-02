@@ -26,6 +26,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from src.agents.relay.halt_service import is_halted
 from src.core.redis_client import get_redis_client
 
 logger = logging.getLogger(__name__)
@@ -34,6 +35,10 @@ STREAM_KEY = "cora:drafts"
 GROUP_NAME = "cora_draft_workers"
 DLQ_KEY = "cora:drafts:dlq"
 MAX_DELIVERIES = 3
+# STREAM_MAXLEN is intentionally NOT used in publish(). Trimming a work queue
+# at publish time evicts entries the consumer group has not yet read, silently
+# losing draft requests during outages or halts. Any trim must only remove
+# entries that have been acknowledged or safely archived.
 STREAM_MAXLEN = 10_000
 
 
@@ -72,9 +77,8 @@ def publish(
         "payload": json.dumps(payload, default=str),
     }
     try:
-        return get_redis_client().xadd(
-            STREAM_KEY, fields, maxlen=STREAM_MAXLEN, approximate=True
-        )
+        # No maxlen trim here — see STREAM_MAXLEN comment above.
+        return get_redis_client().xadd(STREAM_KEY, fields)
     except Exception as exc:
         logger.error(
             "cora.queue: publish failed event_type=%s client_id=%s: %s",
@@ -125,8 +129,27 @@ def ack(message_id: str) -> None:
         logger.warning("cora.queue: ack failed message_id=%s: %s", message_id, exc)
 
 
+def _get_stream_client_id(r, message_id: str) -> Optional[str]:
+    """Peek at a stream entry to read its client_id without claiming it."""
+    try:
+        entries = r.xrange(STREAM_KEY, min=message_id, max=message_id)
+        if entries:
+            _, fields = entries[0]
+            return fields.get("client_id")
+    except Exception as exc:
+        logger.warning(
+            "cora.queue: client_id lookup failed message_id=%s: %s", message_id, exc
+        )
+    return None
+
+
 def claim_stale(consumer_name: str, min_idle_ms: int = 60_000) -> List[DraftMessage]:
-    """Reclaim pending messages idle longer than min_idle_ms; dead-letter at MAX_DELIVERIES."""
+    """Reclaim pending messages idle longer than min_idle_ms; dead-letter at MAX_DELIVERIES.
+
+    Messages whose client currently has an active halt are skipped entirely —
+    they are intentionally deferred, not failed, and must not have their
+    times_delivered count incremented or be moved to the DLQ while halted.
+    """
     r = get_redis_client()
     try:
         pending = r.xpending_range(STREAM_KEY, GROUP_NAME, min="-", max="+", count=100)
@@ -142,6 +165,20 @@ def claim_stale(consumer_name: str, min_idle_ms: int = 60_000) -> List[DraftMess
         delivery_count = entry.get("times_delivered", 1)
         if entry.get("time_since_delivered", 0) < min_idle_ms:
             continue
+
+        # Do not reclaim or dead-letter messages whose client is currently
+        # halted. The message is intentionally deferred — reclaiming it would
+        # bump times_delivered and eventually dead-letter a valid request that
+        # the operator expects to recover automatically when the halt is lifted.
+        entry_client_id = _get_stream_client_id(r, message_id)
+        if entry_client_id and is_halted(client_id=entry_client_id):
+            logger.info(
+                "cora.queue: claim_stale skipping message_id=%s "
+                "— CLIENT halt active for client_id=%s",
+                message_id, entry_client_id,
+            )
+            continue
+
         if delivery_count >= MAX_DELIVERIES:
             _dead_letter_pending(r, message_id)
             continue
