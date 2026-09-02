@@ -38,6 +38,7 @@ from src.core.database import get_system_db_context
 from src.core.models import Company, Contact, RawProspectCompany
 from src.loaders.base import BaseIngestLoader
 from src.services import quarantine_gate
+from src.services.events import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -148,12 +149,12 @@ def _process_company(session: Session, raw_company) -> None:
 		)
 		session.add(resolved_company)
 		session.flush()
-		session.execute(
-			text(
-				"INSERT INTO events (client_id, event_type, entity_type, entity_id, payload) "
-				"VALUES ('_platform_internal', 'company_promoted', 'company', :entity_id, :payload)"
-			),
-			{"entity_id": resolved_company.company_id, "payload": "{}"},
+		log_event(
+			"_platform_internal",
+			"company_promoted",
+			entity_type="company",
+			entity_id=resolved_company.company_id,
+			payload={},
 		)
 
 	_promote_company_row(session, raw_company, resolved_company.company_id)

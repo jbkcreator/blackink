@@ -43,6 +43,7 @@ from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
 from src.core.database import get_db_context
 from src.services import work_orders as wo
+from src.services.events import log_event as _shared_log_event, MalformedEventError
 from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
 from src.services.slack.bolt_app import get_listener_app
@@ -88,25 +89,14 @@ def _snooze_until(duration_key: str, now: Optional[datetime] = None) -> datetime
 
 
 def _log_event(client_id: str, event_type: str, *, entity_id: str, actor: str, payload: dict) -> None:
-	"""Matches the raw-SQL pattern already established in
-	src/tasks/promotion_sweep.py — no shared events-writer helper exists
-	yet in this codebase, so this stays consistent with that rather than
-	introducing a new abstraction for one caller."""
+	"""Thin adapter over src.services.events.log_event — kept as a private
+	wrapper (not a call-site-by-call-site rewrite) so this diff stays
+	minimal; entity_type is fixed at 'work_order' here because every
+	existing caller in this file logs against a work order."""
 	try:
-		with get_db_context(client_id=client_id) as session:
-			session.execute(
-				text(
-					"INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
-					"VALUES (:client_id, :event_type, 'work_order', :entity_id, :actor, :payload)"
-				),
-				{
-					"client_id": client_id,
-					"event_type": event_type,
-					"entity_id": entity_id,
-					"actor": actor,
-					"payload": json.dumps(payload),
-				},
-			)
+		_shared_log_event(client_id, event_type, entity_type="work_order", entity_id=entity_id, actor=actor, payload=payload)
+	except MalformedEventError:
+		logger.error("[listeners] malformed event payload, not written (event_type=%s)", event_type, exc_info=True)
 	except Exception:
 		logger.error("[listeners] failed to write events row (event_type=%s)", event_type, exc_info=True)
 
