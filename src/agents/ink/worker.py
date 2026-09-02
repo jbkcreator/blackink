@@ -43,6 +43,10 @@ POLL_INTERVAL_MS      = 1_000
 CLAIM_INTERVAL_SEC    = 60
 CLAIM_MIN_IDLE_MS     = 60_000
 
+# Nodes that suspend via interrupt() — resumption comes from ink:resume_signals,
+# not from a fresh graph.invoke() call.
+_INTERRUPT_NODES = frozenset({"wait_reply", "wait_approve"})
+
 
 def _ensure_resume_group() -> None:
     r = get_redis_client()
@@ -183,9 +187,29 @@ class InkWorker:
                 _ack_resume_signal(message_id)
                 continue
 
+            # Guard: only resume if the graph is still suspended at an interrupt node
+            config = {"configurable": {"thread_id": work_order_id}}
+            try:
+                existing = self._graph.get_state(config)
+            except Exception as exc:
+                logger.warning(
+                    "ink.worker: get_state failed work_order_id=%s: %s — discarding resume signal",
+                    work_order_id, exc,
+                )
+                _ack_resume_signal(message_id)
+                continue
+
+            if not existing or not existing.next:
+                logger.info(
+                    "ink.worker: resume signal for completed/unknown work_order_id=%s — acking",
+                    work_order_id,
+                )
+                _ack_resume_signal(message_id)
+                continue
+
             logger.info(
-                "ink.worker: processing resume — work_order_id=%s reason=%s",
-                work_order_id, resume_payload.get("reason", "?"),
+                "ink.worker: processing resume — work_order_id=%s next=%s",
+                work_order_id, list(existing.next),
             )
             try:
                 self._resume_graph(work_order_id, resume_payload)
@@ -207,12 +231,44 @@ class InkWorker:
                 "ink.worker: reclaimed stale — company_id=%s work_order_id=%s delivery=%d",
                 msg.company_id, msg.work_order_id, msg.delivery_count,
             )
+            config = {"configurable": {"thread_id": msg.work_order_id}}
             try:
-                self._run_graph(msg.work_order_id, _initial_state(msg))
+                existing = self._graph.get_state(config)
+            except Exception as exc:
+                logger.warning(
+                    "ink.worker: get_state failed work_order_id=%s: %s — starting fresh",
+                    msg.work_order_id, exc,
+                )
+                existing = None
+
+            try:
+                if existing and existing.next:
+                    if _INTERRUPT_NODES.intersection(existing.next):
+                        # Suspended at wait_reply or wait_approve — external signal will resume it
+                        logger.info(
+                            "ink.worker: stale message at interrupt %s work_order_id=%s — acking",
+                            list(existing.next), msg.work_order_id,
+                        )
+                    else:
+                        # Crashed mid-node — resume from the last checkpoint
+                        logger.info(
+                            "ink.worker: stale mid-execution work_order_id=%s next=%s — resuming",
+                            msg.work_order_id, list(existing.next),
+                        )
+                        self._graph.invoke(Command(resume=None), config=config)
+                elif existing:
+                    # Checkpoint exists but graph already completed — just ack
+                    logger.info(
+                        "ink.worker: stale already completed work_order_id=%s — acking",
+                        msg.work_order_id,
+                    )
+                else:
+                    # No checkpoint — graph never ran; start fresh
+                    self._run_graph(msg.work_order_id, _initial_state(msg))
                 ack(msg.message_id)
             except Exception:
                 logger.warning(
-                    "ink.worker: stale retry failed message_id=%s",
+                    "ink.worker: stale handling failed message_id=%s",
                     msg.message_id,
                 )
 

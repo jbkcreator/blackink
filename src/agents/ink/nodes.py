@@ -291,13 +291,13 @@ def node_wait_approve(state: GlobalState) -> dict:
         "work_order_id": state["work_order_id"],
         "draft_message_id": state.get("draft_message_id"),
     })
+    approved = bool(resume_data.get("approved"))
     logger.info(
         "ink.nodes: wait_approve resumed — company_id=%s approved=%s",
-        state["company_id"], resume_data.get("approved"),
+        state["company_id"], approved,
     )
     return {
-        "stage": InkStage.RELAY_DISPATCH if resume_data.get("approved") else InkStage.FAILED,
-        **resume_data,
+        "stage": InkStage.RELAY_DISPATCH if approved else InkStage.FAILED,
     }
 
 
