@@ -18,7 +18,7 @@ from src.services.campaign_readiness_gate import (
 	ENGAGED_SMS_ELIGIBLE,
 	_decide_channel,
 	_in_quiet_hours,
-	_is_engaged,
+	is_engaged,
 	_resolve_dnc_listed,
 )
 from src.services.compliance_gate import DncProvider
@@ -72,7 +72,7 @@ class _FakeSession:
 		return _FakeResult()
 
 
-# ── _is_engaged ──────────────────────────────────────────────────────────
+# ── is_engaged ───────────────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -85,7 +85,7 @@ class _FakeSession:
 	],
 )
 def test_is_engaged(inbound_sms_count, booked_appointment_id, expected):
-	assert _is_engaged(inbound_sms_count, booked_appointment_id) is expected
+	assert is_engaged(inbound_sms_count, booked_appointment_id) is expected
 
 
 # ── _resolve_dnc_listed — cache behavior ────────────────────────────────

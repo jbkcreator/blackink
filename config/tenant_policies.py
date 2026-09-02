@@ -40,6 +40,7 @@ TENANT_POLICIES = {
 	"client_pm_books": {"mode": "direct", "column": "client_id"},
 	"events": {"mode": "direct", "column": "client_id"},
 	"compliance_gate_checks": {"mode": "direct", "column": "client_id"},
+	"sms_dispatch_log": {"mode": "direct", "column": "client_id"},
 	"sending_domains": {"mode": "direct", "column": "client_id"},
 	"mailboxes": {"mode": "direct", "column": "client_id"},
 }

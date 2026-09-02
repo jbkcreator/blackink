@@ -21,12 +21,23 @@ Two layers, deliberately kept separate:
 """
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from config.tenant_policies import TENANT_POLICIES
 from src.core.database import Database, get_db_context, get_owner_db_context, get_system_db_context
 from src.services.campaign_readiness_gate import evaluate_full_readiness
 from src.services.compliance_gate import DncProvider
+from src.services.sms_dispatch import ColdSMSBlockedError, SmsProvider, dispatch_sms
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
+
+
+class _CountingSmsProvider(SmsProvider):
+	def __init__(self):
+		self.calls = []
+
+	def send(self, phone, message):
+		self.calls.append((phone, message))
+		return "stub-message-id"
 
 
 class _FixedDnc(DncProvider):
@@ -547,3 +558,130 @@ def test_full_readiness_end_to_end_cold_clean_contact(canary_tenants):
 		assert stored == "EMAIL_COLD_ELIGIBLE", "final eligibility must be written back to contacts"
 	finally:
 		_cleanup_compliance_events(contact_id)
+
+
+# ── Subtask 1.2.3 — Cold SMS Hard Block (DB / application / CI/CD layers) ──
+
+
+def _cleanup_cold_sms_events(contact_id):
+	with get_owner_db_context() as session:
+		session.execute(
+			text("DELETE FROM events WHERE event_type = 'cold_sms_blocked' AND entity_id = :cid"),
+			{"cid": str(contact_id)},
+		)
+		session.execute(text("DELETE FROM sms_dispatch_log WHERE contact_id = :cid"), {"cid": contact_id})
+		session.commit()
+
+
+def test_sms_dispatch_log_db_constraint_rejects_cold_insert(canary_tenants):
+	"""DB layer: a raw SQL INSERT for a cold contact (no engagement) is
+	rejected by ck_sms_dispatch_log_not_cold regardless of application code.
+	The test itself logs the cold_sms_blocked/DATABASE event on catching the
+	violation, since a rolled-back transaction can't log anything from
+	inside itself."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	raised = False
+	try:
+		# Letting the IntegrityError propagate out of the `with` block (rather
+		# than catching it inline) so get_db_context()'s own except-rollback
+		# handles the aborted transaction — committing a session after
+		# swallowing a DB error inside the block would itself raise.
+		with get_db_context(client_id=CANARY_A) as session:
+			session.execute(
+				text(
+					"INSERT INTO sms_dispatch_log "
+					"(client_id, contact_id, inbound_sms_count_at_send, booked_appointment_id_at_send) "
+					"VALUES (:client_id, :contact_id, 0, NULL)"
+				),
+				{"client_id": CANARY_A, "contact_id": contact_id},
+			)
+	except IntegrityError:
+		raised = True
+	assert raised, "cold sms_dispatch_log INSERT should violate ck_sms_dispatch_log_not_cold"
+
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			session.execute(
+				text(
+					"INSERT INTO events (client_id, event_type, entity_type, entity_id, payload) "
+					"VALUES (:client_id, 'cold_sms_blocked', 'contact', :entity_id, "
+					"jsonb_build_object('layer', 'DATABASE'))"
+				),
+				{"client_id": CANARY_A, "entity_id": str(contact_id)},
+			)
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_sms_dispatch_log_db_constraint_allows_engaged_insert(canary_tenants):
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			session.execute(
+				text(
+					"INSERT INTO sms_dispatch_log "
+					"(client_id, contact_id, inbound_sms_count_at_send, booked_appointment_id_at_send) "
+					"VALUES (:client_id, :contact_id, 0, 'appt_db_test')"
+				),
+				{"client_id": CANARY_B, "contact_id": contact_id},
+			)
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_application_layer_blocks_cold_contact_before_provider_call(canary_tenants):
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	provider = _CountingSmsProvider()
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			try:
+				dispatch_sms(session, contact_id, CANARY_A, "hi", sms_provider=provider)
+				raised = False
+			except ColdSMSBlockedError:
+				raised = True
+			event = session.execute(
+				text(
+					"SELECT payload FROM events WHERE event_type = 'cold_sms_blocked' "
+					"AND entity_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": str(contact_id)},
+			).first()
+		assert raised, "dispatch_sms did not raise ColdSMSBlockedError for a cold contact"
+		assert provider.calls == [], "provider.send must never be called for a cold contact"
+		assert event is not None, "cold_sms_blocked event not logged"
+		assert event.payload["layer"] == "APPLICATION"
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(canary_tenants):
+	"""DoD: a legitimately consented contact successfully passes all three
+	layers and reaches the (stubbed) Twilio call."""
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 "
+				"WHERE contact_id = :cid"
+			),
+			{"cid": contact_id},
+		)
+	provider = _CountingSmsProvider()
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			message_id = dispatch_sms(session, contact_id, CANARY_B, "your appointment is confirmed", sms_provider=provider)
+
+			log_row = session.execute(
+				text(
+					"SELECT status, provider_message_id FROM sms_dispatch_log "
+					"WHERE contact_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": contact_id},
+			).first()
+		assert message_id == "stub-message-id"
+		assert provider.calls == [("+18135550100", "your appointment is confirmed")]
+		assert log_row is not None, "sms_dispatch_log row not written for a successful send"
+		assert log_row.status == "SENT"
+		assert log_row.provider_message_id == "stub-message-id"
+	finally:
+		_cleanup_cold_sms_events(contact_id)

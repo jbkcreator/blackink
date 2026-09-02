@@ -87,8 +87,10 @@ def _resolve_dnc_listed(
 	return listed
 
 
-def _is_engaged(inbound_sms_count: int, booked_appointment_id: Optional[str]) -> bool:
-	"""Literal predicate from the master blueprint §3.0.4."""
+def is_engaged(inbound_sms_count: int, booked_appointment_id: Optional[str]) -> bool:
+	"""Literal predicate from the master blueprint §3.0.4. Public — also
+	reused by src/services/sms_dispatch.py's application-layer cold-SMS
+	linter (Subtask 1.2.3), so the rule has one definition, not two."""
 	return inbound_sms_count > 0 or booked_appointment_id is not None
 
 
@@ -191,7 +193,7 @@ def evaluate_full_readiness(
 	).one()
 
 	dnc_listed = _resolve_dnc_listed(session, contact_id, contact.phone, dnc_provider)
-	engaged = _is_engaged(contact.inbound_sms_count, contact.booked_appointment_id)
+	engaged = is_engaged(contact.inbound_sms_count, contact.booked_appointment_id)
 	quiet_hours_active = engaged and not dnc_listed and _in_quiet_hours(session, contact.phone)
 
 	eligibility, reason_code = _decide_channel(engaged, dnc_listed, quiet_hours_active)
