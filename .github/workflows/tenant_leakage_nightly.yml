@@ -38,6 +38,13 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      # This list must stay in the same order as CLAUDE.md's "Migrations"
+      # block, and must include EVERY migration that creates a table listed
+      # in config/tenant_policies.py — apply_rls_policies.py iterates that
+      # registry and ALTERs each table, so a missing CREATE here fails the
+      # build with an UndefinedTable error that reads like a schema bug
+      # rather than a stale CI list. Adding a tenant-bearing table means
+      # touching three files: the migration, tenant_policies.py, and this.
       - name: Apply migrations
         run: |
           PYTHONPATH=. python migrations/apply_db_roles.py
@@ -45,6 +52,7 @@ jobs:
           echo "DATABASE_URL_SYSTEM=postgresql://blackink_system:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
           PYTHONPATH=. python migrations/apply_counties.py
           PYTHONPATH=. python migrations/apply_clients.py
+          PYTHONPATH=. python migrations/apply_relay_halts.py
           PYTHONPATH=. python migrations/apply_companies.py
           PYTHONPATH=. python migrations/apply_contacts.py
           PYTHONPATH=. python migrations/apply_pm_profiles.py
@@ -52,7 +60,9 @@ jobs:
           PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
           PYTHONPATH=. python migrations/apply_events.py
           PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
+          PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
           PYTHONPATH=. python migrations/apply_sending_domains.py
+          PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       - name: Run tenant leakage suite
         run: PYTHONPATH=. pytest tests/test_tenant_isolation.py -v

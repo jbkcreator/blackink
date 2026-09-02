@@ -26,13 +26,14 @@ from sqlalchemy import (
 	Integer,
 	BigInteger,
 	Numeric,
+	SmallInteger,
 	String,
 	Text,
 	Boolean,
 	UniqueConstraint,
 	func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -581,4 +582,67 @@ class Mailbox(Base):
 		CheckConstraint(
 			"quarantine_state IN ('active','quarantined','reserve')", name="ck_mailboxes_quarantine_state"
 		),
+	)
+
+
+class AgentWorkOrder(Base):
+	"""The durable row behind every Slack action card (Dev 3 plan §3.3).
+	action_id is APPLICATION-GENERATED (uuid4 in src/services/work_orders),
+	never the DEFAULT below — see this table's migration
+	(migrations/apply_agent_work_orders.py) for why: it is part of the
+	payload-hash preimage (src/services/slack/payload_hash.py), so the
+	digest cannot be computed until action_id is known.
+
+	client_id references clients(client_id), NOT companies(company_id) —
+	the blueprint's own §5.3 raw SQL has the latter, which is wrong on its
+	face; same class of blueprint/code contradiction as Company.company_id
+	above."""
+
+	__tablename__ = "agent_work_orders"
+
+	action_id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, server_default=func.gen_random_uuid())
+	client_id: Mapped[str] = mapped_column(String(40), ForeignKey("clients.client_id"), nullable=False)
+	entity_type: Mapped[str] = mapped_column(String(30), nullable=False)
+	entity_id: Mapped[str] = mapped_column(String(64), nullable=False)
+	opportunity_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	agent_id: Mapped[str] = mapped_column(String(50), nullable=False)
+	action_class: Mapped[str] = mapped_column(String(100), nullable=False)
+	autonomy_band: Mapped[str] = mapped_column(String(20), nullable=False)
+	risk_class: Mapped[str] = mapped_column(String(20), nullable=False)
+	confidence_score: Mapped[Optional[float]] = mapped_column(Numeric(5, 2), nullable=True)
+	recipient: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+	config_fingerprint: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+	payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+	hash_version: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=1)
+	status: Mapped[str] = mapped_column(String(20), nullable=False, default="QUEUED")
+	idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+	slack_channel_id: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+	slack_message_ts: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+	decided_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+	decided_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	execution_receipt: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+	error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	due_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		UniqueConstraint("client_id", "idempotency_key", name="uq_agent_work_orders_idem"),
+		CheckConstraint(
+			"status IN ('QUEUED','APPROVED','REJECTED','SNOOZED','SKIPPED','DONE','EXECUTING','FAILED')",
+			name="ck_agent_work_orders_status",
+		),
+		CheckConstraint(
+			"autonomy_band IN ('BAND_1_OBSERVE','BAND_2_ONE_TAP','BAND_3_AUTO')",
+			name="ck_agent_work_orders_band",
+		),
+		CheckConstraint(
+			"risk_class IN ('LOW','MEDIUM','HIGH','CRITICAL')", name="ck_agent_work_orders_risk"
+		),
+		Index("ix_awo_client_status", "client_id", "status"),
+		Index("ix_awo_entity", "entity_type", "entity_id"),
+		Index("ix_awo_due", "status", "due_at"),
 	)
