@@ -18,6 +18,7 @@ from datetime import datetime, date
 from typing import Optional
 
 from sqlalchemy import (
+	ARRAY,
 	CheckConstraint,
 	Date,
 	DateTime,
@@ -32,6 +33,7 @@ from sqlalchemy import (
 	Boolean,
 	UniqueConstraint,
 	func,
+	text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -252,6 +254,13 @@ class Contact(Base):
 	last_outbound_touch_at: Mapped[Optional[datetime]] = mapped_column(
 		DateTime(timezone=True), nullable=True
 	)
+	# Structured objections captured by the 60-second post-meeting Slack
+	# modal (src/services/meeting_outcomes.py), read by the future Owner
+	# Score engine. Mirrored here from meeting_outcomes so Owner Score can
+	# read one contact row rather than joining outcome history.
+	prospect_objections: Mapped[list[str]] = mapped_column(
+		ARRAY(Text), nullable=False, server_default=text("'{}'")
+	)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -272,6 +281,60 @@ class Contact(Base):
 		),
 		UniqueConstraint("company_id", "contact_role_type", name="uq_contacts_company_role"),
 		Index("ix_contacts_email", "email", unique=True, postgresql_where=(email.isnot(None))),
+	)
+
+
+# ============================================================================
+# POST-MEETING OUTCOME CAPTURE — 60-second Slack modal (blueprint §3.1.7).
+# See src/services/meeting_outcomes.py and src/services/slack/listeners.py.
+# ============================================================================
+
+_ATTENDANCE_STATUSES = "'Held','No-Show','Rescheduled'"
+
+
+class MeetingOutcome(Base):
+	"""Current-state record of one completed sales meeting, captured by the
+	60-second post-meeting Slack modal (blueprint §3.1.7).
+
+	Deliberately SEPARATE from the append-only `events` ledger: the DoD
+	requires a second submission for the same meeting to UPDATE rather than
+	duplicate, which an immutable ledger structurally cannot express. Every
+	write here also emits a `meeting_outcome_recorded` event through
+	src/services/events.py for the audit trail — this table is the current
+	state, the ledger is the history.
+
+	Tenant-bearing (direct client_id) — registered in
+	config/tenant_policies.py.
+	"""
+
+	__tablename__ = "meeting_outcomes"
+
+	id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	contact_id: Mapped[int] = mapped_column(
+		BigInteger, ForeignKey("contacts.contact_id"), nullable=False, index=True
+	)
+	meeting_occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	attendance_status: Mapped[str] = mapped_column(String(20), nullable=False)
+	pm_software: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+	door_count_est: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+	objections: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("'{}'"))
+	next_action: Mapped[Optional[str]] = mapped_column(String(280), nullable=True)
+	recorded_by: Mapped[str] = mapped_column(String(100), nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		CheckConstraint(
+			f"attendance_status IN ({_ATTENDANCE_STATUSES})", name="ck_meeting_outcomes_attendance"
+		),
+		UniqueConstraint(
+			"client_id", "contact_id", "meeting_occurred_at", name="uq_meeting_outcomes_meeting"
+		),
 	)
 
 

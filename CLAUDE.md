@@ -30,6 +30,8 @@ PYTHONPATH=. python migrations/apply_events.py
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
 PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
+PYTHONPATH=. python migrations/apply_meeting_outcomes.py
+PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 

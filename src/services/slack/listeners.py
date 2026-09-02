@@ -39,11 +39,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from datetime import datetime as _datetime
+
 from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
-from src.core.database import get_db_context
+from src.core.database import get_db_context, get_system_db_context
 from src.services import work_orders as wo
 from src.services.events import log_event as _shared_log_event, MalformedEventError
+from src.services.meeting_outcomes import record_outcome
 from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
 from src.services.slack.bolt_app import get_listener_app
@@ -543,3 +546,145 @@ async def handle_halt_resume_click(ack, body, respond, action):
 		return
 
 	await respond(response_type="in_channel", text=f":white_check_mark: Halt #{halt_id} resumed by <@{user_id}>.")
+
+
+# ── Post-meeting outcome modal (blueprint §3.1.7) — NO trigger wired here
+# by design. Dev 3's post-meeting Slack card (not yet shipped) is the only
+# entry point: its button handler calls open_meeting_outcome_modal()
+# directly. See this task's brief for the rejected-alternative note on why
+# there is deliberately no interim slash command. ─────────────────────────
+
+_MEETING_OUTCOME_CALLBACK_ID = "meeting_outcome_modal"
+
+_PM_SOFTWARE_OPTIONS = ["AppFolio", "Buildium", "Propertyware", "Rent Manager", "Other", "Unknown"]
+_OBJECTION_OPTIONS = ["Pricing", "Software Integration", "Capacity", "Existing Agency"]
+
+
+def _meeting_outcome_modal_view(contact_id: str, meeting_occurred_at: str) -> dict:
+	return {
+		"type": "modal",
+		"callback_id": _MEETING_OUTCOME_CALLBACK_ID,
+		"private_metadata": json.dumps({"contact_id": contact_id, "meeting_occurred_at": meeting_occurred_at}),
+		"title": {"type": "plain_text", "text": "Log Meeting Outcome"},
+		"submit": {"type": "plain_text", "text": "Submit"},
+		"close": {"type": "plain_text", "text": "Cancel"},
+		"blocks": [
+			{
+				"type": "input", "block_id": "attendance_block",
+				"label": {"type": "plain_text", "text": "Meeting Attendance Status"},
+				"element": {
+					"type": "static_select", "action_id": "attendance",
+					"options": [{"text": {"type": "plain_text", "text": v}, "value": v} for v in ("Held", "No-Show", "Rescheduled")],
+				},
+			},
+			{
+				"type": "input", "block_id": "pm_software_block", "optional": True,
+				"label": {"type": "plain_text", "text": "Target PM Software"},
+				"element": {
+					"type": "static_select", "action_id": "pm_software",
+					"options": [{"text": {"type": "plain_text", "text": v}, "value": v} for v in _PM_SOFTWARE_OPTIONS],
+				},
+			},
+			{
+				"type": "input", "block_id": "door_count_block", "optional": True,
+				"label": {"type": "plain_text", "text": "Estimated Door Count"},
+				"element": {"type": "number_input", "action_id": "door_count", "is_decimal_allowed": False},
+			},
+			{
+				"type": "input", "block_id": "objections_block", "optional": True,
+				"label": {"type": "plain_text", "text": "Stated Objections"},
+				"element": {
+					"type": "multi_static_select", "action_id": "objections",
+					"options": [{"text": {"type": "plain_text", "text": v}, "value": v} for v in _OBJECTION_OPTIONS],
+				},
+			},
+			{
+				"type": "input", "block_id": "next_action_block",
+				"label": {"type": "plain_text", "text": "Next Action"},
+				"element": {"type": "plain_text_input", "action_id": "next_action", "max_length": 280},
+			},
+		],
+	}
+
+
+async def open_meeting_outcome_modal(*, trigger_id: str, contact_id: str, meeting_occurred_at: str) -> bool:
+	"""THE entry point into the post-meeting form — exported for Dev 3's
+	booking-confirmation card handler to call from its "Log Outcome"
+	button. There is deliberately no slash command and no other trigger
+	(see this task's design note): Dev 3's card is the only way in.
+
+	trigger_id comes from the Slack interaction that is opening this modal
+	and expires ~3 seconds after it — call this immediately on the click,
+	never after an await that could cross that window.
+
+	meeting_occurred_at is an ISO 8601 string, validated here rather than
+	trusted: it becomes part of the modal's private_metadata and then the
+	upsert key, so a malformed value would surface as a confusing failure
+	at submit time, long after the mistake.
+	"""
+	try:
+		_datetime.fromisoformat(meeting_occurred_at)
+	except (ValueError, TypeError):
+		logger.error(
+			"[listeners] open_meeting_outcome_modal: meeting_occurred_at=%r is not ISO 8601 — modal not opened",
+			meeting_occurred_at,
+		)
+		return False
+	return await post.open_modal(
+		trigger_id=trigger_id,
+		view=_meeting_outcome_modal_view(contact_id, meeting_occurred_at),
+	)
+
+
+@app.view(_MEETING_OUTCOME_CALLBACK_ID)
+async def handle_meeting_outcome_submit(ack, body, view):
+	user_id = body.get("user", {}).get("id", "")
+	meta = json.loads(view.get("private_metadata", "{}"))
+	values = view["state"]["values"]
+
+	attendance = values["attendance_block"]["attendance"]["selected_option"]["value"]
+	pm_software_option = values["pm_software_block"]["pm_software"].get("selected_option")
+	door_count_raw = values["door_count_block"]["door_count"].get("value")
+	objection_options = values["objections_block"]["objections"].get("selected_options") or []
+	next_action = values["next_action_block"]["next_action"]["value"]
+
+	await ack()
+
+	# contacts has no client_id column of its own (scoped through its parent
+	# companies.owning_client_id, per config/tenant_policies.py's "join"
+	# mode) — resolving the real owning client_id for an arbitrary
+	# contact_id requires a cross-tenant lookup. This is a batch/system-style
+	# read used only to find which tenant a Slack-submitted contact_id
+	# belongs to before writing through the tenant-scoped path, consistent
+	# with queued_depth(client_id=None)'s existing precedent.
+	with get_system_db_context() as session:
+		row = session.execute(
+			text("SELECT co.owning_client_id FROM contacts c JOIN companies co USING(company_id) WHERE c.contact_id = :cid"),
+			{"cid": int(meta["contact_id"])},
+		).mappings().first()
+	if row is None or row["owning_client_id"] is None:
+		await post.post_notice(channel_key="qa", text=f":warning: meeting_outcome submit for unresolvable contact_id={meta['contact_id']}")
+		return
+	client_id_for_contact = row["owning_client_id"]
+
+	record_outcome(
+		client_id_for_contact,
+		contact_id=int(meta["contact_id"]),
+		meeting_occurred_at=_datetime.fromisoformat(meta["meeting_occurred_at"]),
+		attendance_status=attendance,
+		pm_software=pm_software_option["value"] if pm_software_option else None,
+		door_count_est=int(door_count_raw) if door_count_raw else None,
+		objections=[o["value"] for o in objection_options],
+		next_action=next_action,
+		recorded_by=f"slack:{user_id}",
+	)
+
+	if attendance == "No-Show":
+		# TODO(dev3-no-show): the real outbound-sequence pause lives in Dev
+		# 3's Subtask 3.2.3 no-show handler, which does not exist on this
+		# branch yet — this notice is a visible flag of that gap, not a
+		# substitute for the real pause.
+		await post.post_notice(
+			channel_key="setter",
+			text=f":warning: No-show recorded for contact `{meta['contact_id']}` by <@{user_id}> — outbound sequence pause is Dev 3's no-show handler (Subtask 3.2.3), not yet wired here.",
+		)
