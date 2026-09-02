@@ -63,6 +63,29 @@ def _policy_sql(table: str, policy: dict) -> str:
 
 def main() -> int:
 	with get_owner_db_context() as db:
+		# ── Preflight: every registered table must actually exist ───────────
+		# This script is documented to run LAST, so a table in TENANT_POLICIES
+		# with no table in the DB means its own migration was never run —
+		# in practice, a CI workflow or runbook whose migration list drifted
+		# behind the registry (config/tenant_policies.py's docstring calls out
+		# that there is no automatic net for this). Without this check the
+		# first ALTER TABLE just raises psycopg2 UndefinedTable, which reads
+		# like a broken schema rather than a missing step, and names only the
+		# first offender.
+		missing = [
+			t for t in TENANT_POLICIES
+			if not db.execute(text("SELECT to_regclass(:qualified)"), {"qualified": f"public.{t}"}).scalar()
+		]
+		if missing:
+			print(
+				"apply_rls_policies: ABORTED — these tables are registered in "
+				f"config/tenant_policies.py but do not exist: {missing}.\n"
+				"Run their migrations first (see CLAUDE.md's migration order). "
+				"No RLS policy was applied, so nothing is half-enforced.",
+				file=sys.stderr,
+			)
+			return 1
+
 		for table, policy in TENANT_POLICIES.items():
 			t = _quote_ident(table)
 			db.execute(text(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"))
