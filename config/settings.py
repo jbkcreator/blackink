@@ -152,6 +152,14 @@ class AppSettings(BaseSettings):
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 
+	# ── Rent valuation adapter ───────────────────────────────────────────────
+	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
+	# False: no valuation vendor is under contract, so enabling this would
+	# point the adapter at a provider that does not exist. Flipped to True
+	# only when a real RentValuationProvider implementation lands in Q1.
+	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
+	rentbot_live_api_timeout_seconds: int = Field(default=20, env="RENTBOT_LIVE_API_TIMEOUT_SECONDS")
+
 
 @lru_cache
 def get_settings() -> AppSettings:
