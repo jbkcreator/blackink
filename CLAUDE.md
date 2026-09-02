@@ -28,6 +28,7 @@ PYTHONPATH=. python migrations/apply_owner_entities.py
 PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
+PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS

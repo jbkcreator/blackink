@@ -23,7 +23,7 @@ Two layers, deliberately kept separate:
 from sqlalchemy import text
 
 from config.tenant_policies import TENANT_POLICIES
-from src.core.database import Database, get_db_context
+from src.core.database import Database, get_db_context, get_owner_db_context, get_system_db_context
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
 
 
@@ -187,3 +187,179 @@ def test_non_poach_function_discloses_no_identity(canary_tenants):
 			session.execute(
 				text("DELETE FROM client_pm_books WHERE client_id = :cid"), {"cid": CANARY_B}
 			)
+
+
+# ── Subtask 1.2.1 — evaluate_campaign_readiness() Check 1 + Check 2 ──
+
+
+def test_campaign_readiness_permanently_blocks_opted_out_contact(canary_tenants):
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET is_opted_out = TRUE WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+
+	with get_db_context(client_id=CANARY_A) as session:
+		status = session.execute(
+			text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id}
+		).scalar()
+	assert status == "PERMANENTLY_BLOCKED"
+
+
+def test_campaign_readiness_permanently_blocks_suppressed_contact(canary_tenants):
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET suppression_state = TRUE WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+
+	with get_db_context(client_id=CANARY_B) as session:
+		status = session.execute(
+			text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id}
+		).scalar()
+	assert status == "PERMANENTLY_BLOCKED"
+
+
+def test_campaign_readiness_suppresses_non_poach_domain_match_and_logs_event(canary_tenants):
+	"""Canary A's own company domain is seeded into Canary B's PM book —
+	evaluating Canary A's contact under Canary A's own tenant context must
+	see the conflict (Check 2 excludes only the REQUESTING client's own
+	book rows, not the target's), return SUPPRESSED, and log a
+	non_poach_suppressed event naming the matching client_id."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	domain = canary_tenants[CANARY_A]["domain"]
+
+	with get_db_context(client_id=CANARY_B) as session:
+		session.execute(
+			text("INSERT INTO client_pm_books (client_id, owner_domain) VALUES (:cid, :domain)"),
+			{"cid": CANARY_B, "domain": domain},
+		)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			status = session.execute(
+				text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id}
+			).scalar()
+			event = session.execute(
+				text(
+					"SELECT payload FROM events WHERE event_type = 'non_poach_suppressed' "
+					"AND entity_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": str(contact_id)},
+			).first()
+		assert status == "SUPPRESSED"
+		assert event is not None, "non_poach_suppressed event not logged"
+		assert event.payload["matched_client_id"] == CANARY_B
+	finally:
+		with get_db_context(client_id=CANARY_B) as session:
+			session.execute(text("DELETE FROM client_pm_books WHERE client_id = :cid"), {"cid": CANARY_B})
+		# The function's own INSERT into events (owned by the requesting
+		# client, CANARY_A here) must be cleaned up too — canary_tenants'
+		# teardown deletes the clients row afterward, and events.client_id
+		# has a NOT NULL FK to clients, so a leftover event row would break
+		# every test that runs after this one. events is deliberately
+		# append-only (apply_events.py grants blackink_app/blackink_system
+		# SELECT+INSERT only, no DELETE) — the owner/superuser context
+		# (what migrations run as) is the only role that can clean it up.
+		with get_owner_db_context() as session:
+			session.execute(
+				text(
+					"DELETE FROM events WHERE event_type = 'non_poach_suppressed' AND entity_id = :cid"
+				),
+				{"cid": str(contact_id)},
+			)
+			session.commit()
+
+
+def test_campaign_readiness_suppresses_non_poach_email_match_and_logs_event(canary_tenants):
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	domain = canary_tenants[CANARY_B]["domain"]
+	email = f"owner@{domain}"
+
+	with get_db_context(client_id=CANARY_A) as session:
+		session.execute(
+			text("INSERT INTO client_pm_books (client_id, owner_email) VALUES (:cid, :email)"),
+			{"cid": CANARY_A, "email": email},
+		)
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			status = session.execute(
+				text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id}
+			).scalar()
+			event = session.execute(
+				text(
+					"SELECT payload FROM events WHERE event_type = 'non_poach_suppressed' "
+					"AND entity_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": str(contact_id)},
+			).first()
+		assert status == "SUPPRESSED"
+		assert event is not None, "non_poach_suppressed event not logged"
+		assert event.payload["matched_client_id"] == CANARY_A
+	finally:
+		with get_db_context(client_id=CANARY_A) as session:
+			session.execute(text("DELETE FROM client_pm_books WHERE client_id = :cid"), {"cid": CANARY_A})
+		# See the domain-match test above for why this cleanup is required
+		# and why it must go through the owner context.
+		with get_owner_db_context() as session:
+			session.execute(
+				text(
+					"DELETE FROM events WHERE event_type = 'non_poach_suppressed' AND entity_id = :cid"
+				),
+				{"cid": str(contact_id)},
+			)
+			session.commit()
+
+
+def test_campaign_readiness_passes_clean_contact(canary_tenants):
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_db_context(client_id=CANARY_A) as session:
+		status = session.execute(
+			text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id}
+		).scalar()
+	assert status == "PASS"
+
+
+def test_only_blackink_app_can_execute_campaign_readiness_function():
+	db = Database()
+	with db.session_scope() as session:
+		for role in ("akrash_ingest", "blackink_system"):
+			allowed = session.execute(
+				text(
+					"SELECT has_function_privilege(:role, "
+					"'evaluate_campaign_readiness(bigint)', 'EXECUTE')"
+				),
+				{"role": role},
+			).scalar()
+			assert allowed is False, f"{role} can execute evaluate_campaign_readiness — should be denied"
+
+		has_public_grant = session.execute(
+			text(
+				"SELECT EXISTS ("
+				"  SELECT 1 FROM pg_proc p, unnest(p.proacl) AS acl"
+				"  WHERE p.proname = 'evaluate_campaign_readiness' AND acl::text LIKE '=%'"
+				")"
+			)
+		).scalar()
+		assert has_public_grant is False, "PUBLIC still holds an EXECUTE grant on evaluate_campaign_readiness"
+
+		allowed = session.execute(
+			text(
+				"SELECT has_function_privilege('blackink_app', "
+				"'evaluate_campaign_readiness(bigint)', 'EXECUTE')"
+			)
+		).scalar()
+		assert allowed is True, "blackink_app should retain EXECUTE — the app is the only caller"
+
+
+def test_campaign_readiness_requires_tenant_context(canary_tenants):
+	"""A clean contact reaches Check 2, which needs a real client_id to
+	attribute the audit event to — missing tenant context must raise, not
+	silently guess or return a status."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_db_context() as session:  # no client_id
+		try:
+			session.execute(text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id})
+			raised = False
+		except Exception:
+			raised = True
+	assert raised, "evaluate_campaign_readiness did not raise with no tenant context set"
