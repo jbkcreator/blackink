@@ -101,9 +101,11 @@ def main() -> int:
 		# columns come from one consistent source.
 		rows = db.execute(
 			text(
-				"SELECT c.relname AS tablename, c.relrowsecurity AS rowsecurity, "
-				"c.relforcerowsecurity AS forcerowsecurity "
-				"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"SELECT c.relname AS tablename, "
+				"       c.relrowsecurity AS rowsecurity, "
+				"       c.relforcerowsecurity AS forcerowsecurity "
+				"FROM pg_class c "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"WHERE n.nspname = 'public' AND c.relname = ANY(:tables)"
 			),
 			{"tables": list(TENANT_POLICIES.keys())},
