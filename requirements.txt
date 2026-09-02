@@ -22,3 +22,14 @@ slack-bolt>=1.18
 aiohttp>=3.13
 fakeredis>=2.0
 
+# ── Ink (Campaign Agent) ────────────────────────────────────────────────────
+# langgraph-checkpoint-postgres uses psycopg (v3), not psycopg2.
+# Both coexist safely — psycopg2-binary stays for SQLAlchemy.
+langgraph>=0.2
+langgraph-checkpoint-postgres>=1.0
+psycopg[binary]>=3.1
+
+# ── Ghost Shopper subagent ───────────────────────────────────────────────────
+playwright>=1.44
+anthropic>=0.40
+
