@@ -3,8 +3,18 @@
 Mirrors Forced Action's config/settings.py convention (single AppSettings,
 env_file=".env", Field(..., env="...") per var, @lru_cache singleton) —
 see C:\\Users\\HEU-Vishnu\\Forced-action-\\config\\settings.py.
+
+Which file gets loaded is controlled by the ENV_FILE shell environment
+variable (not itself read from any .env file — set it before running a
+command), defaulting to ".env". Local Docker-Postgres testing should use a
+permanent, gitignored ".env.local" instead of overwriting the real ".env" —
+see CLAUDE.md's "Local development database" section:
+
+    $env:ENV_FILE=".env.local"
+    python migrations/apply_db_roles.py
 """
 
+import os
 from functools import lru_cache
 from typing import Optional
 
@@ -16,7 +26,7 @@ class AppSettings(BaseSettings):
 	"""Central place for environment-driven configuration."""
 
 	model_config = SettingsConfigDict(
-		env_file=".env",
+		env_file=os.environ.get("ENV_FILE", ".env"),
 		env_file_encoding="utf-8",
 		case_sensitive=False,
 		extra="ignore",

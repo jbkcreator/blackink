@@ -24,7 +24,7 @@ class AkrashProspectLoader(BaseIngestLoader):
 		"""raw_row shape: {company_name, domain, county_slug, door_count_est,
 		door_count_source, source_channel, source_timestamp, submitted_by,
 		enrichment_provider, enrichment_timestamp,
-		contacts: [{role, name, email, phone, source}, ...]}"""
+		contacts: [{role, first_name, last_name, title, email, phone, source}, ...]}"""
 		missing = [f for f in REQUIRED_COMPANY_FIELDS if not raw_row.get(f)]
 
 		domain = raw_row.get("domain") or ""
@@ -60,7 +60,9 @@ class AkrashProspectLoader(BaseIngestLoader):
 		record = RawProspectContact(
 			company_ref_id=company.id,
 			role=role or "OWNER_BROKER_MD",
-			name=contact.get("name"),
+			first_name=contact.get("first_name"),
+			last_name=contact.get("last_name"),
+			title=contact.get("title"),
 			email=contact.get("email"),
 			phone=contact.get("phone"),
 			source=contact.get("source"),

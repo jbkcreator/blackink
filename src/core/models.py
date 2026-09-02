@@ -437,7 +437,9 @@ class RawProspectContact(Base):
 		BigInteger, ForeignKey("raw_prospect_companies.id"), nullable=False, index=True
 	)
 	role: Mapped[str] = mapped_column(String(20), nullable=False)
-	name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+	first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	title: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
 	email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 	phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 	source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
