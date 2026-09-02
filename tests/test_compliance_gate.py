@@ -142,13 +142,13 @@ def test_dnc_fails_on_fresh_cached_false():
 
 def test_non_poach_passes_when_not_claimed():
 	session = FakeSession(scalar_result=False)
-	result = _check_non_poach(session, "company_x", "client_a")
+	result = _check_non_poach(session, "company_x")
 	assert result.status == PASS
 
 
 def test_non_poach_fails_when_claimed():
 	session = FakeSession(scalar_result=True)
-	result = _check_non_poach(session, "company_x", "client_a")
+	result = _check_non_poach(session, "company_x")
 	assert result.status == FAIL
 
 
@@ -156,5 +156,5 @@ def test_non_poach_abstains_on_db_error():
 	"""The one case the Dev 1 plan calls out explicitly: a query failure
 	must ABSTAIN, never be swallowed into an implicit PASS."""
 	session = FakeSession(raise_error=True)
-	result = _check_non_poach(session, "company_x", "client_a")
+	result = _check_non_poach(session, "company_x")
 	assert result.status == ABSTAIN

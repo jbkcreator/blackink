@@ -30,7 +30,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
 	"""
@@ -48,6 +48,11 @@ DDL = [
 	)
 	""",
 	"GRANT SELECT, INSERT, UPDATE ON clients TO blackink_app",
+	# INSERT/UPDATE/DELETE (not just SELECT) so internal provisioning jobs and
+	# the adversarial leakage-test fixture (tests/fixtures/synthetic_tenants.py,
+	# which tears down its canary rows on DELETE) can manage client rows
+	# without needing the app role.
+	"GRANT SELECT, INSERT, UPDATE, DELETE ON clients TO blackink_system",
 	"""
 	CREATE TABLE IF NOT EXISTS county_allocations (
 		id                BIGSERIAL    PRIMARY KEY,
@@ -69,6 +74,10 @@ DDL = [
 	""",
 	"GRANT SELECT, INSERT, UPDATE ON county_allocations TO blackink_app",
 	"GRANT USAGE ON SEQUENCE county_allocations_id_seq TO blackink_app",
+	# county_allocation_reassessment.py (src/tasks/) runs as blackink_system —
+	# it spans every client's allocations by nature, so needs full CRUD here.
+	"GRANT SELECT, INSERT, UPDATE ON county_allocations TO blackink_system",
+	"GRANT USAGE ON SEQUENCE county_allocations_id_seq TO blackink_system",
 	"""
 	CREATE TABLE IF NOT EXISTS client_pm_books (
 		id           BIGSERIAL    PRIMARY KEY,
@@ -85,6 +94,10 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_client_pm_books_email ON client_pm_books (owner_email)",
 	"GRANT SELECT, INSERT, UPDATE, DELETE ON client_pm_books TO blackink_app",
 	"GRANT USAGE ON SEQUENCE client_pm_books_id_seq TO blackink_app",
+	# The nightly PMS read-sync (not yet built) and county_allocation_reassessment.py
+	# both run as blackink_system and need cross-client visibility here.
+	"GRANT SELECT, INSERT, UPDATE, DELETE ON client_pm_books TO blackink_system",
+	"GRANT USAGE ON SEQUENCE client_pm_books_id_seq TO blackink_system",
 ]
 
 # Reserved internal client_id for Blackink's own platform-level activity
@@ -101,7 +114,7 @@ SEED_INTERNAL_CLIENT_SQL = """
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for stmt in DDL:
 			db.execute(text(stmt))
 		db.execute(text(SEED_INTERNAL_CLIENT_SQL))

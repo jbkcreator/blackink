@@ -19,7 +19,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
 	"""
@@ -39,6 +39,8 @@ DDL = [
 	""",
 	"GRANT SELECT, INSERT, UPDATE ON owner_entities TO blackink_app",
 	"GRANT USAGE ON SEQUENCE owner_entities_id_seq TO blackink_app",
+	"GRANT SELECT, INSERT, UPDATE ON owner_entities TO blackink_system",
+	"GRANT USAGE ON SEQUENCE owner_entities_id_seq TO blackink_system",
 	"""
 	CREATE TABLE IF NOT EXISTS owner_entity_links (
 		id                BIGSERIAL   PRIMARY KEY,
@@ -55,13 +57,15 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_owner_entity_links_entity ON owner_entity_links (owner_entity_id)",
 	"GRANT SELECT, INSERT, UPDATE, DELETE ON owner_entity_links TO blackink_app",
 	"GRANT USAGE ON SEQUENCE owner_entity_links_id_seq TO blackink_app",
+	"GRANT SELECT, INSERT, UPDATE, DELETE ON owner_entity_links TO blackink_system",
+	"GRANT USAGE ON SEQUENCE owner_entity_links_id_seq TO blackink_system",
 	"ALTER TABLE companies ADD COLUMN IF NOT EXISTS owner_entity_id BIGINT REFERENCES owner_entities(id)",
 	"CREATE INDEX IF NOT EXISTS ix_companies_owner_entity ON companies (owner_entity_id)",
 ]
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for stmt in DDL:
 			db.execute(text(stmt))
 		db.commit()

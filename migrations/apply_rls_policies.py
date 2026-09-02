@@ -31,7 +31,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from sqlalchemy import text
 
 from config.tenant_policies import TENANT_POLICIES
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 
 def _quote_ident(name: str) -> str:
@@ -62,7 +62,7 @@ def _policy_sql(table: str, policy: dict) -> str:
 
 
 def main() -> int:
-	with get_db_context() as db:
+	with get_owner_db_context() as db:
 		for table, policy in TENANT_POLICIES.items():
 			t = _quote_ident(table)
 			db.execute(text(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"))
@@ -72,6 +72,10 @@ def main() -> int:
 		db.commit()
 
 		# ── Fail-loud verification ──────────────────────────────────────────
+		# pg_tables has no forcerowsecurity column — that flag lives on
+		# pg_class.relforcerowsecurity, not the pg_tables view. rowsecurity
+		# is available both places; queried from pg_class here too so both
+		# columns come from one consistent source.
 		rows = db.execute(
 			text(
 				"SELECT c.relname AS tablename, "
