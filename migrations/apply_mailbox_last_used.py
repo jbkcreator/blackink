@@ -11,7 +11,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_db_context
+from src.core.database import get_owner_db_context
 
 DDL = [
     "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NULL;",
@@ -20,7 +20,7 @@ DDL = [
 
 
 def main():
-    with get_db_context() as session:
+    with get_owner_db_context() as session:
         for stmt in DDL:
             session.execute(text(stmt))
         session.commit()
