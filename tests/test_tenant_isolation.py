@@ -20,6 +20,7 @@ Two layers, deliberately kept separate:
      query, would produce).
 """
 
+import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
@@ -584,9 +585,17 @@ def test_full_readiness_end_to_end_cold_clean_contact(canary_tenants):
 
 
 def _cleanup_cold_sms_events(contact_id):
+	# dispatch_sms() now always runs a fresh evaluate_full_readiness() first
+	# (PR #10 review fixup), which logs its own compliance_gate_evaluated
+	# event on every call — clean that up too, same reason
+	# _cleanup_compliance_events exists: events.client_id has a NOT NULL FK
+	# to clients, so a leftover row breaks canary_tenants' teardown.
 	with get_owner_db_context() as session:
 		session.execute(
-			text("DELETE FROM events WHERE event_type = 'cold_sms_blocked' AND entity_id = :cid"),
+			text(
+				"DELETE FROM events WHERE event_type IN ('cold_sms_blocked', 'compliance_gate_evaluated') "
+				"AND entity_id = :cid"
+			),
 			{"cid": str(contact_id)},
 		)
 		session.execute(text("DELETE FROM sms_dispatch_log WHERE contact_id = :cid"), {"cid": contact_id})
@@ -689,7 +698,17 @@ def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(can
 	provider = _CountingSmsProvider()
 	try:
 		with get_db_context(client_id=CANARY_B) as session:
-			message_id = dispatch_sms(session, contact_id, CANARY_B, "your appointment is confirmed", sms_provider=provider)
+			# StubDncProvider's default None ("unknown") now correctly withholds
+			# SMS since the PR #9 tri-state fix — an explicit clear result is
+			# needed here to reach TRANSACTIONAL_SMS_ONLY at all.
+			message_id = dispatch_sms(
+				session,
+				contact_id,
+				CANARY_B,
+				"your appointment is confirmed",
+				sms_provider=provider,
+				dnc_provider=_FixedDnc(listed=False),
+			)
 
 			log_row = session.execute(
 				text(
@@ -703,5 +722,101 @@ def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(can
 		assert log_row is not None, "sms_dispatch_log row not written for a successful send"
 		assert log_row.status == "SENT"
 		assert log_row.provider_message_id == "stub-message-id"
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_writes_a_unique_idempotency_key_before_sending(canary_tenants):
+	"""PR #10 review fixup: the PENDING outbox row (and its idempotency_key)
+	must exist and be committed independently of the SENT row's own
+	transaction — proven end to end here against a real Postgres, not just
+	the mocked open_outbox_session unit tests in test_sms_dispatch.py."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 WHERE contact_id = :cid"),
+			{"cid": contact_id},
+		)
+	provider = _CountingSmsProvider()
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			dispatch_sms(
+				session,
+				contact_id,
+				CANARY_A,
+				"reminder",
+				sms_provider=provider,
+				dnc_provider=_FixedDnc(listed=False),
+			)
+			log_row = session.execute(
+				text(
+					"SELECT status, idempotency_key FROM sms_dispatch_log "
+					"WHERE contact_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": contact_id},
+			).first()
+		assert log_row.status == "SENT"
+		assert log_row.idempotency_key, "idempotency_key was not written"
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_blocks_opted_out_engaged_contact_end_to_end(canary_tenants):
+	"""Finding 1 regression: an opted-out contact that also happens to look
+	'engaged' (inbound_sms_count > 0) must still be blocked — before this
+	fix, dispatch_sms only checked is_engaged() and would have sent to
+	them. Uses the real evaluate_full_readiness() path, not a mock, to
+	prove the wiring actually works end to end."""
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1, is_opted_out = TRUE "
+				"WHERE contact_id = :cid"
+			),
+			{"cid": contact_id},
+		)
+	provider = _CountingSmsProvider()
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			with pytest.raises(ColdSMSBlockedError):
+				dispatch_sms(session, contact_id, CANARY_B, "hi", sms_provider=provider)
+		assert provider.calls == [], "an opted-out contact must never reach the provider, engaged or not"
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_blocked_audit_event_survives_exception_propagating_out_of_session_scope(canary_tenants):
+	"""Finding 3 regression: unlike
+	test_dispatch_sms_application_layer_blocks_cold_contact_before_provider_call
+	above (which catches ColdSMSBlockedError *inside* the get_db_context()
+	block — the exact pattern the review flagged as masking the bug), this
+	lets the exception propagate all the way out of the `with` block and
+	trigger session_scope()'s own except-rollback, then checks the audit
+	event in a completely separate session/transaction. Only passes because
+	the blocked-audit write now goes through its own independently
+	committed outbox transaction, not the caller's (now-rolled-back) one."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	provider = _CountingSmsProvider()
+
+	try:
+		with pytest.raises(ColdSMSBlockedError):
+			with get_db_context(client_id=CANARY_A) as session:
+				dispatch_sms(session, contact_id, CANARY_A, "hi", sms_provider=provider)
+
+		assert provider.calls == []
+
+		with get_db_context(client_id=CANARY_A) as session:
+			event = session.execute(
+				text(
+					"SELECT payload FROM events WHERE event_type = 'cold_sms_blocked' "
+					"AND entity_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": str(contact_id)},
+			).first()
+		assert event is not None, (
+			"cold_sms_blocked audit event did not survive the caller's session_scope() rollback"
+		)
+		assert event.payload["layer"] == "APPLICATION"
 	finally:
 		_cleanup_cold_sms_events(contact_id)
