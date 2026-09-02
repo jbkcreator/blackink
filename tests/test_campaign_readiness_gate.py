@@ -14,6 +14,7 @@ import pytest
 from src.services.campaign_readiness_gate import (
 	COLD_EMAIL_ONLY,
 	ENGAGED_DNC_SMS_WITHHELD,
+	ENGAGED_DNC_UNKNOWN_SMS_WITHHELD,
 	ENGAGED_QUIET_HOURS_SMS_WITHHELD,
 	ENGAGED_SMS_ELIGIBLE,
 	_decide_channel,
@@ -21,7 +22,8 @@ from src.services.campaign_readiness_gate import (
 	_is_engaged,
 	_resolve_dnc_listed,
 )
-from src.services.compliance_gate import DncProvider
+from migrations.apply_area_code_timezones import SEED_AREA_CODES
+from src.services.compliance_gate import DncProvider, StubDncProvider
 
 
 class _AlwaysListedDnc(DncProvider):
@@ -42,6 +44,18 @@ class _CountingDnc(DncProvider):
 	def check(self, phone):
 		self.calls += 1
 		return self.listed
+
+
+class _UnknownDnc(DncProvider):
+	"""A live provider whose lookup failed or couldn't determine a result —
+	distinct from StubDncProvider (no vendor at all), same None contract."""
+
+	def __init__(self):
+		self.calls = 0
+
+	def check(self, phone):
+		self.calls += 1
+		return None
 
 
 class _FakeResult:
@@ -123,8 +137,34 @@ def test_dnc_no_phone_does_not_call_provider():
 	session = _FakeSession([_FakeResult(row=SimpleNamespace(dnc_clean=None, dnc_checked_at=None))])
 	provider = _CountingDnc(listed=True)
 	listed = _resolve_dnc_listed(session, 1, None, provider)
-	assert listed is False
+	assert listed is None, "no phone means unknown, not clear — must not be treated as not-listed"
 	assert provider.calls == 0
+
+
+def test_dnc_provider_unknown_result_is_not_cached_as_clean():
+	"""A live provider returning None (lookup failed / indeterminate) must
+	propagate as unknown, not get coerced to False and written into the
+	dnc_clean cache — that would falsely mark the contact clean for the
+	whole recheck window."""
+	session = _FakeSession([_FakeResult(row=SimpleNamespace(dnc_clean=None, dnc_checked_at=None))])
+	provider = _UnknownDnc()
+	listed = _resolve_dnc_listed(session, 1, "+15551234567", provider)
+	assert listed is None
+	assert provider.calls == 1
+	assert not any("UPDATE contacts" in stmt for stmt, _ in session.executed), (
+		"an unknown DNC result must not be written to the cache"
+	)
+
+
+def test_dnc_stub_provider_unknown_result_is_not_cached_as_clean():
+	"""StubDncProvider — the default when no vendor is contracted — always
+	returns None. Same contract, same guarantee: never coerced to clean."""
+	session = _FakeSession([_FakeResult(row=SimpleNamespace(dnc_clean=None, dnc_checked_at=None))])
+	listed = _resolve_dnc_listed(session, 1, "+15551234567", StubDncProvider())
+	assert listed is None
+	assert not any("UPDATE contacts" in stmt for stmt, _ in session.executed), (
+		"StubDncProvider's unknown result must not be written to the cache"
+	)
 
 
 # ── _in_quiet_hours ──────────────────────────────────────────────────────
@@ -145,6 +185,37 @@ def test_quiet_hours_non_us_phone_fails_closed():
 	assert _in_quiet_hours(session, "+442071234567") is True
 
 
+# ── us_area_code_timezones seed data — production coverage ─────────────
+
+
+def test_area_code_seed_is_not_a_small_representative_subset():
+	"""Regression for a prior version of this migration that seeded only 11
+	area codes while _in_quiet_hours() fails closed (quiet hours, no SMS)
+	for anything unmapped — silently suppressing transactional SMS for the
+	overwhelming majority of real US phone numbers. The production seed
+	must cover essentially the full NANP US assignment, not a handful of
+	examples."""
+	assert len(SEED_AREA_CODES) > 250, (
+		f"only {len(SEED_AREA_CODES)} area codes seeded — looks like a small "
+		"representative subset again, not full US NANP coverage"
+	)
+
+
+def test_area_code_seed_covers_a_non_example_code():
+	"""214 (Dallas) was never one of the original hand-picked example codes
+	(212/813/305/407/904/312/713/303/602/415/213) — proves the seed is real
+	coverage, not just the old examples re-labeled."""
+	area_codes = {row["area_code"] for row in SEED_AREA_CODES}
+	assert "214" in area_codes
+	dallas = next(row for row in SEED_AREA_CODES if row["area_code"] == "214")
+	assert dallas["iana_timezone"] == "America/Chicago"
+
+
+def test_area_code_seed_has_no_duplicate_codes():
+	area_codes = [row["area_code"] for row in SEED_AREA_CODES]
+	assert len(area_codes) == len(set(area_codes))
+
+
 # ── _decide_channel — the CI-enforced predicate ─────────────────────────
 
 
@@ -160,6 +231,15 @@ def test_engaged_dnc_listed_gets_email_only_not_blocked():
 	eligibility, reason = _decide_channel(engaged=True, dnc_listed=True, quiet_hours_active=False)
 	assert eligibility == "EMAIL_COLD_ELIGIBLE"
 	assert reason == ENGAGED_DNC_SMS_WITHHELD
+
+
+def test_engaged_dnc_unknown_withholds_sms_not_blocked():
+	"""An unresolved DNC check (None) must withhold SMS exactly like a
+	listed result — never fall through to TRANSACTIONAL_SMS_ONLY just
+	because it isn't literally True."""
+	eligibility, reason = _decide_channel(engaged=True, dnc_listed=None, quiet_hours_active=False)
+	assert eligibility == "EMAIL_COLD_ELIGIBLE"
+	assert reason == ENGAGED_DNC_UNKNOWN_SMS_WITHHELD
 
 
 def test_engaged_quiet_hours_withholds_sms():

@@ -38,6 +38,7 @@ COLD_EMAIL_ONLY = "COLD_EMAIL_ONLY"
 ENGAGED_SMS_ELIGIBLE = "ENGAGED_SMS_ELIGIBLE"
 ENGAGED_QUIET_HOURS_SMS_WITHHELD = "ENGAGED_QUIET_HOURS_SMS_WITHHELD"
 ENGAGED_DNC_SMS_WITHHELD = "ENGAGED_DNC_SMS_WITHHELD"
+ENGAGED_DNC_UNKNOWN_SMS_WITHHELD = "ENGAGED_DNC_UNKNOWN_SMS_WITHHELD"
 
 _SQL_GATE_REASON = {
 	"PERMANENTLY_BLOCKED": OPT_OUT,
@@ -58,11 +59,19 @@ class FullReadinessResult:
 
 def _resolve_dnc_listed(
 	session: Session, contact_id: int, phone: Optional[str], dnc_provider: DncProvider
-) -> bool:
+) -> Optional[bool]:
 	"""Cache-first DNC check reusing contacts.dnc_clean/dnc_checked_at (built
 	in Task 1.1 for exactly this). Cache hit within dnc_recheck_days reuses
 	the cached value; miss (or no phone) queries the live provider and
-	writes the result back so the next evaluation hits cache."""
+	writes the result back so the next evaluation hits cache.
+
+	Tri-state: True (listed), False (clear), or None (couldn't determine —
+	no phone, or the provider itself returned None, e.g. the default
+	StubDncProvider with no vendor contracted, or a live lookup failure). A
+	None result is never written to the cache — caching a guess as clean
+	would let a later evaluation trust a value nothing ever actually
+	verified, and extend that false confidence for the whole recheck
+	window."""
 	row = session.execute(
 		text("SELECT dnc_clean, dnc_checked_at FROM contacts WHERE contact_id = :contact_id"),
 		{"contact_id": contact_id},
@@ -74,9 +83,12 @@ def _resolve_dnc_listed(
 			return not row.dnc_clean
 
 	if not phone:
-		return False
+		return None
 
-	listed = bool(dnc_provider.check(phone))
+	listed = dnc_provider.check(phone)
+	if listed is None:
+		return None
+
 	session.execute(
 		text(
 			"UPDATE contacts SET dnc_clean = :clean, dnc_checked_at = NOW() "
@@ -92,13 +104,17 @@ def _is_engaged(inbound_sms_count: int, booked_appointment_id: Optional[str]) ->
 	return inbound_sms_count > 0 or booked_appointment_id is not None
 
 
-def _decide_channel(engaged: bool, dnc_listed: bool, quiet_hours_active: bool) -> tuple[str, str]:
+def _decide_channel(engaged: bool, dnc_listed: Optional[bool], quiet_hours_active: bool) -> tuple[str, str]:
 	"""Pure warm-channel waterfall decision (Check 4), factored out for unit
 	testing without a DB. Never returns TRANSACTIONAL_SMS_ONLY unless
-	engaged, not DNC-listed, and outside quiet hours — the CI-enforced
-	predicate from the master blueprint §3.0.4."""
+	engaged, confirmed NOT DNC-listed (dnc_listed is False, not just
+	falsy — None must not slip through the same as False), and outside
+	quiet hours — the CI-enforced predicate from the master blueprint
+	§3.0.4."""
 	if not engaged:
 		return "EMAIL_COLD_ELIGIBLE", COLD_EMAIL_ONLY
+	if dnc_listed is None:
+		return "EMAIL_COLD_ELIGIBLE", ENGAGED_DNC_UNKNOWN_SMS_WITHHELD
 	if dnc_listed:
 		return "EMAIL_COLD_ELIGIBLE", ENGAGED_DNC_SMS_WITHHELD
 	if quiet_hours_active:
@@ -192,7 +208,7 @@ def evaluate_full_readiness(
 
 	dnc_listed = _resolve_dnc_listed(session, contact_id, contact.phone, dnc_provider)
 	engaged = _is_engaged(contact.inbound_sms_count, contact.booked_appointment_id)
-	quiet_hours_active = engaged and not dnc_listed and _in_quiet_hours(session, contact.phone)
+	quiet_hours_active = engaged and dnc_listed is False and _in_quiet_hours(session, contact.phone)
 
 	eligibility, reason_code = _decide_channel(engaged, dnc_listed, quiet_hours_active)
 
