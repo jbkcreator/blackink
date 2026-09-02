@@ -363,3 +363,25 @@ def test_campaign_readiness_requires_tenant_context(canary_tenants):
 		except Exception:
 			raised = True
 	assert raised, "evaluate_campaign_readiness did not raise with no tenant context set"
+
+
+def test_campaign_readiness_rejects_cross_tenant_contact_id(canary_tenants):
+	"""evaluate_campaign_readiness is SECURITY DEFINER and bypasses RLS, so
+	the contact_id -> companies.owning_client_id ownership check inside the
+	function is the only thing standing between a caller and another
+	tenant's contact. Canary B must not be able to read Canary A's contact
+	by ID, whether or not it happens to be opted out — either way it must
+	raise, never return a status."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET is_opted_out = TRUE WHERE contact_id = :cid"), {"cid": contact_id}
+		)
+
+	with get_db_context(client_id=CANARY_B) as session:
+		try:
+			session.execute(text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id})
+			raised = False
+		except Exception:
+			raised = True
+	assert raised, "evaluate_campaign_readiness leaked another tenant's contact by ID"

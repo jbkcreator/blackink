@@ -50,9 +50,25 @@ DDL = [
 		v_requesting_client_id VARCHAR(40);
 		v_matched_client_id    VARCHAR(40);
 	BEGIN
-		SELECT is_opted_out, suppression_state, company_id, email
+		-- Tenant context is established BEFORE the contact is fetched. This
+		-- function is SECURITY DEFINER and bypasses RLS, so the contact_id ->
+		-- client_id ownership check below is the only thing standing between
+		-- a caller and another tenant's contact data.
+		v_requesting_client_id := current_setting('app.current_client_id', true);
+		IF v_requesting_client_id IS NULL OR v_requesting_client_id = '' THEN
+			RAISE EXCEPTION 'evaluate_campaign_readiness: no tenant context set (app.current_client_id)';
+		END IF;
+
+		-- contacts has no client_id column of its own — tenancy is derived
+		-- via company_id -> companies.owning_client_id (config/tenant_policies.py's
+		-- "join" mode). The join is inlined here, not left to RLS, because this
+		-- function is SECURITY DEFINER and RLS does not apply to it at all.
+		SELECT c.is_opted_out, c.suppression_state, c.company_id, c.email
 		  INTO v_is_opted_out, v_suppression_state, v_company_id, v_email
-		  FROM contacts WHERE contact_id = p_contact_id;
+		  FROM contacts c
+		  JOIN companies co ON co.company_id = c.company_id
+		  WHERE c.contact_id = p_contact_id
+		    AND co.owning_client_id = v_requesting_client_id;
 
 		IF NOT FOUND THEN
 			RAISE EXCEPTION 'evaluate_campaign_readiness: contact % not found', p_contact_id;
@@ -64,11 +80,6 @@ DDL = [
 		END IF;
 
 		-- Check 2 — Cross-Client Non-Poach. Only reached if Check 1 passed.
-		v_requesting_client_id := current_setting('app.current_client_id', true);
-		IF v_requesting_client_id IS NULL OR v_requesting_client_id = '' THEN
-			RAISE EXCEPTION 'evaluate_campaign_readiness: no tenant context set (app.current_client_id)';
-		END IF;
-
 		SELECT domain INTO v_domain FROM companies WHERE company_id = v_company_id;
 
 		SELECT b.client_id INTO v_matched_client_id
