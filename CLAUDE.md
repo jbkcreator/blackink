@@ -8,8 +8,8 @@ Blackink is a B2B lead-gen/growth SaaS for property-management firms (HEU AI
 LLC). It is a fork of an existing project, Forced Action, reusing its
 patterns and some agent code (Cora, Vera, Hunter, Relay) — but built fresh
 for strict multi-tenant `client_id` isolation across many paying customers,
-which Forced Action never had. See `C:\Users\HEU-Vishnu\.claude\plans\dev-1-data-synthetic-fox.md`
-for the full Dev 1 (Data Infrastructure & Pipeline) design and rationale.
+which Forced Action never had. See the Data Infrastructure & Pipeline
+design plan for the full schema design and rationale.
 
 ## Common Commands
 
@@ -23,6 +23,7 @@ PYTHONPATH=. python migrations/apply_counties.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py
+PYTHONPATH=. python migrations/apply_pm_profiles.py
 PYTHONPATH=. python migrations/apply_owner_entities.py
 PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
@@ -40,6 +41,38 @@ python -m src.tasks.deliverability_sentinel
 pytest tests/                       # unit tests, no DB required for most
 pytest tests/test_tenant_isolation.py  # requires a live Postgres with migrations applied
 ```
+
+## Local development database
+
+Schema/migration work must be developed and verified against a disposable
+local Postgres, never against the live server — there is no separate
+staging database yet, so the server's database is effectively production.
+
+```bash
+# Start a disposable local Postgres (port 5433, not 5432 — avoids clashing
+# with a native Postgres install some dev machines already have on 5432)
+docker compose up -d postgres-test
+
+# Point .env at it for the duration of your local testing:
+#   DATABASE_URL=postgresql://postgres:localdevpass@localhost:5433/blackink
+#   DATABASE_URL_APP=postgresql://blackink_app:app_local_pw@localhost:5433/blackink
+#   DATABASE_URL_SYSTEM=postgresql://blackink_system:system_local_pw@localhost:5433/blackink
+#   DATABASE_URL_AKRASH=postgresql://akrash_ingest:akrash_local_pw@localhost:5433/blackink
+#   BLACKINK_APP_DB_PASSWORD=app_local_pw
+#   BLACKINK_SYSTEM_DB_PASSWORD=system_local_pw
+#   AKRASH_INGEST_DB_PASSWORD=akrash_local_pw
+# (back up your real .env first, restore it when done — never leave it
+# pointed at the local container)
+
+# Then run the full migration sequence from Common Commands above, and:
+pytest tests/
+
+# Tear down when finished:
+docker compose down -v postgres-test
+```
+
+Only once a change is verified this way should it be applied to the real
+server (manual sync today — no CI/CD deploy pipeline exists yet).
 
 ## Architecture
 
