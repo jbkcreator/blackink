@@ -84,6 +84,11 @@ class AppSettings(BaseSettings):
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
 	blackink_qa_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_QA_SLACK_CHANNEL")
 
+	# ── Relay halt / resume ──────────────────────────────────────────────────
+	# HMAC-SHA256 signing key for cryptographic resume tokens. Must be set
+	# before any halt can be issued or resumed. Recommended: 32+ bytes of entropy.
+	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
+
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 

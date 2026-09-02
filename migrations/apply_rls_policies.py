@@ -13,7 +13,7 @@ docs/adr/0001-tenant-isolation-rls-plus-app-layer.md and the Dev 1 plan's
 Run LAST, after every tenant table exists (migrations 1-10 must already
 be applied). Safely re-runnable: DROP POLICY IF EXISTS then recreate.
 
-The verification step at the end queries pg_tables/pg_policies and FAILS
+The verification step at the end queries pg_class/pg_policies and FAILS
 LOUDLY if any table registered in TENANT_POLICIES lacks
 rowsecurity=true AND forcerowsecurity=true — this is what closes the exact
 gap that let Forced Action ship with zero enforcement silently: a new
