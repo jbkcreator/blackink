@@ -63,3 +63,34 @@ def test_log_event_writes_all_required_fields_present():
 	assert bound_params["client_id"] == "acme_pm"
 	assert bound_params["entity_type"] == "contact"
 	assert bound_params["actor"] == "system:sequencer"
+
+
+def test_log_event_with_session_does_not_open_new_db_context():
+	"""When a caller passes its own session (e.g. promotion_sweep joining its
+	own already-open system-role transaction), log_event must not call
+	get_db_context — that would open a second connection under a different
+	role and commit independently of the caller's transaction."""
+	fake_session = MagicMock()
+	with patch("src.services.events.get_db_context") as mock_ctx:
+		log_event(
+			"acme_pm",
+			"company_promoted",
+			entity_type="company",
+			entity_id="c1",
+			payload={},
+			session=fake_session,
+		)
+		mock_ctx.assert_not_called()
+	fake_session.execute.assert_called_once()
+
+
+def test_log_event_without_session_still_opens_db_context():
+	"""session=None (the default) must keep the pre-existing behavior."""
+	fake_session = MagicMock()
+	fake_session.__enter__.return_value = fake_session
+	fake_session.__exit__.return_value = False
+	with patch("src.services.events.get_db_context") as mock_ctx:
+		mock_ctx.return_value = fake_session
+		log_event("acme_pm", "company_promoted", entity_type="company", entity_id="c1", payload={})
+		mock_ctx.assert_called_once()
+	fake_session.execute.assert_called_once()

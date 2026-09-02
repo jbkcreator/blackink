@@ -23,6 +23,7 @@ import logging
 from typing import Optional
 
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 
@@ -71,22 +72,31 @@ def _required_fields_ok(event_type: str, payload: dict) -> None:
 		raise MalformedEventError(f"event_type={event_type!r} missing required payload fields: {sorted(missing)}")
 
 
-def _insert(client_id: str, event_type: str, entity_type: str, entity_id: str, payload: dict, actor: Optional[str]) -> None:
-	with get_db_context(client_id=client_id) as session:
-		session.execute(
-			text(
-				"INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
-				"VALUES (:client_id, :event_type, :entity_type, :entity_id, :actor, :payload)"
-			),
-			{
-				"client_id": client_id,
-				"event_type": event_type,
-				"entity_type": entity_type,
-				"entity_id": entity_id,
-				"actor": actor,
-				"payload": json.dumps(payload),
-			},
-		)
+def _execute_insert(session: Session, client_id: str, event_type: str, entity_type: str, entity_id: str, payload: dict, actor: Optional[str]) -> None:
+	session.execute(
+		text(
+			"INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
+			"VALUES (:client_id, :event_type, :entity_type, :entity_id, :actor, :payload)"
+		),
+		{
+			"client_id": client_id,
+			"event_type": event_type,
+			"entity_type": entity_type,
+			"entity_id": entity_id,
+			"actor": actor,
+			"payload": json.dumps(payload),
+		},
+	)
+
+
+def _insert(client_id: str, event_type: str, entity_type: str, entity_id: str, payload: dict, actor: Optional[str], session: Optional[Session] = None) -> None:
+	if session is not None:
+		# Caller's transaction owns the commit and the DB role — no new
+		# get_db_context(), no commit here. See log_event's docstring.
+		_execute_insert(session, client_id, event_type, entity_type, entity_id, payload, actor)
+		return
+	with get_db_context(client_id=client_id) as new_session:
+		_execute_insert(new_session, client_id, event_type, entity_type, entity_id, payload, actor)
 
 
 def log_event(
@@ -97,15 +107,24 @@ def log_event(
 	entity_id: str,
 	payload: dict,
 	actor: Optional[str] = None,
+	session: Optional[Session] = None,
 ) -> None:
 	"""Write one row to `events`. Raises MalformedEventError (event NOT
 	written) if a required field for this event_type is missing. On a DB
 	write failure, buffers the event in memory and re-raises nothing —
 	callers must not have their own business logic fail because logging
-	did; flush_pending() drains the buffer once the DB is reachable again."""
+	did; flush_pending() drains the buffer once the DB is reachable again.
+
+	If `session` is provided, the event is written into that session (no
+	new get_db_context(), no commit — the caller's own transaction owns
+	the commit and the DB role) — for a caller like promotion_sweep that
+	must have this write share its own already-open system-role
+	transaction. If `session` is None (the default, and every other
+	current call site), behavior is unchanged from before this parameter
+	existed."""
 	_required_fields_ok(event_type, payload)
 	try:
-		_insert(client_id, event_type, entity_type, entity_id, payload, actor)
+		_insert(client_id, event_type, entity_type, entity_id, payload, actor, session=session)
 	except Exception:
 		logger.error("[events] write failed, buffering (event_type=%s)", event_type, exc_info=True)
 		if len(_pending_buffer) >= _MAX_BUFFER:

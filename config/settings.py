@@ -158,7 +158,6 @@ class AppSettings(BaseSettings):
 	# point the adapter at a provider that does not exist. Flipped to True
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
-	rentbot_live_api_timeout_seconds: int = Field(default=20, env="RENTBOT_LIVE_API_TIMEOUT_SECONDS")
 
 
 @lru_cache

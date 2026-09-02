@@ -27,6 +27,7 @@ PYTHONPATH=. python migrations/apply_contacts.py
 PYTHONPATH=. python migrations/apply_owner_entities.py
 PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
+PYTHONPATH=. python migrations/apply_sandbox_dashboard_view.py   # read-only view over companies+events, not tenant-bearing — safe any time after both
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
 PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients

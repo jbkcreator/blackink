@@ -620,7 +620,9 @@ async def open_meeting_outcome_modal(*, trigger_id: str, contact_id: str, meetin
 	meeting_occurred_at is an ISO 8601 string, validated here rather than
 	trusted: it becomes part of the modal's private_metadata and then the
 	upsert key, so a malformed value would surface as a confusing failure
-	at submit time, long after the mistake.
+	at submit time, long after the mistake. contact_id is validated for the
+	identical reason — it is int()-cast unguarded at submit time in
+	handle_meeting_outcome_submit.
 	"""
 	try:
 		_datetime.fromisoformat(meeting_occurred_at)
@@ -628,6 +630,14 @@ async def open_meeting_outcome_modal(*, trigger_id: str, contact_id: str, meetin
 		logger.error(
 			"[listeners] open_meeting_outcome_modal: meeting_occurred_at=%r is not ISO 8601 — modal not opened",
 			meeting_occurred_at,
+		)
+		return False
+	try:
+		int(contact_id)
+	except (ValueError, TypeError):
+		logger.error(
+			"[listeners] open_meeting_outcome_modal: contact_id=%r is not an int — modal not opened",
+			contact_id,
 		)
 		return False
 	return await post.open_modal(
@@ -667,17 +677,28 @@ async def handle_meeting_outcome_submit(ack, body, view):
 		return
 	client_id_for_contact = row["owning_client_id"]
 
-	record_outcome(
-		client_id_for_contact,
-		contact_id=int(meta["contact_id"]),
-		meeting_occurred_at=_datetime.fromisoformat(meta["meeting_occurred_at"]),
-		attendance_status=attendance,
-		pm_software=pm_software_option["value"] if pm_software_option else None,
-		door_count_est=int(door_count_raw) if door_count_raw else None,
-		objections=[o["value"] for o in objection_options],
-		next_action=next_action,
-		recorded_by=f"slack:{user_id}",
-	)
+	try:
+		record_outcome(
+			client_id_for_contact,
+			contact_id=int(meta["contact_id"]),
+			meeting_occurred_at=_datetime.fromisoformat(meta["meeting_occurred_at"]),
+			attendance_status=attendance,
+			pm_software=pm_software_option["value"] if pm_software_option else None,
+			door_count_est=int(door_count_raw) if door_count_raw else None,
+			objections=[o["value"] for o in objection_options],
+			next_action=next_action,
+			recorded_by=f"slack:{user_id}",
+		)
+	except Exception as exc:
+		logger.error(
+			"[listeners] record_outcome failed for contact_id=%s — outcome lost",
+			meta["contact_id"], exc_info=True,
+		)
+		await post.post_notice(
+			channel_key="qa",
+			text=f":warning: meeting_outcome record_outcome failed for contact_id={meta['contact_id']}: {exc}",
+		)
+		return
 
 	if attendance == "No-Show":
 		# TODO(dev3-no-show): the real outbound-sequence pause lives in Dev

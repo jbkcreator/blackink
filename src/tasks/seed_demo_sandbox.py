@@ -91,6 +91,11 @@ def build_mock_contacts_for_company(company: dict) -> list[dict]:
     owner_last = _LAST_NAMES[seed_int % len(_LAST_NAMES)]
     ops_first = _FIRST_NAMES[(seed_int // 7) % len(_FIRST_NAMES)]
     ops_last = _LAST_NAMES[(seed_int // 11) % len(_LAST_NAMES)]
+    # Reserved-range fake numbers (+1813555 prefix, same as the old hardcoded
+    # pair) with the last 4 digits derived from the hash so different
+    # companies don't all show the same two phone numbers on a live demo.
+    owner_phone = f"+1813555{seed_int % 10000:04d}"
+    ops_phone = f"+1813555{(seed_int // 13) % 10000:04d}"
     return [
         {
             "company_id": company["company_id"],
@@ -99,7 +104,7 @@ def build_mock_contacts_for_company(company: dict) -> list[dict]:
             "last_name": owner_last,
             "title": "Managing Broker",
             "email": f"{owner_first.lower()}.{owner_last.lower()}@{company['domain']}",
-            "phone": "+18135550100",
+            "phone": owner_phone,
         },
         {
             "company_id": company["company_id"],
@@ -108,7 +113,7 @@ def build_mock_contacts_for_company(company: dict) -> list[dict]:
             "last_name": ops_last,
             "title": "Operations Manager",
             "email": f"ops.{ops_last.lower()}@{company['domain']}",
-            "phone": "+18135550101",
+            "phone": ops_phone,
         },
     ]
 

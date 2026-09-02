@@ -155,6 +155,7 @@ def _process_company(session: Session, raw_company) -> None:
 			entity_type="company",
 			entity_id=resolved_company.company_id,
 			payload={},
+			session=session,
 		)
 
 	_promote_company_row(session, raw_company, resolved_company.company_id)

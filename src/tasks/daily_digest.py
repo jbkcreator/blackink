@@ -103,7 +103,9 @@ def build_digest_text() -> str:
         return ":warning: *Daily Digest* — Data Unavailable (read-replica query failed; see #blackink-qa)"
 
     def fmt(value, suffix=""):
-        return "n/a" if value is None else f"{value}{suffix}"
+        if value is None:
+            return "n/a"
+        return f"{round(float(value), 1)}{suffix}"
 
     return (
         ":bar_chart: *Daily Pipeline Digest — last 24h*\n"

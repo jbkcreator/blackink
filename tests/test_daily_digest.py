@@ -1,3 +1,4 @@
+from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
 from src.tasks.daily_digest import build_digest_text, main
@@ -21,6 +22,17 @@ def test_build_digest_text_includes_all_seven_metrics():
         text_out = build_digest_text()
     for expected in ("12", "4230", "340", "41.2", "9.8", "22.5", "6"):
         assert expected in text_out
+
+
+def test_build_digest_text_rounds_full_precision_decimal_to_one_place():
+    """Postgres numeric division comes back as a many-digit Decimal — the
+    digest must round it to 1 decimal place, not interpolate it raw."""
+    with patch("src.tasks.daily_digest._query_metrics", return_value=_rows(
+        open_rate_pct=Decimal("41.176470588235294118"),
+    )):
+        text_out = build_digest_text()
+    assert "41.2" in text_out
+    assert "41.176470588235294118" not in text_out
 
 
 def test_build_digest_text_data_unavailable_notice_on_query_failure():
