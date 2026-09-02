@@ -121,10 +121,48 @@ def cmd_seed(args: argparse.Namespace) -> int:
 	return 0
 
 
+def _recover_stalled(client_id: str) -> None:
+	"""Two recovery steps that must run BEFORE approved_batch(), because
+	both produce rows that approved_batch would otherwise never see:
+
+	  1. Expired snoozes (SNOOZED + due_at passed) -> QUEUED, card reposted.
+	     Without this a snooze never ends; see wo.requeue_due_snoozed.
+	  2. Stale claims (EXECUTING, untouched past the timeout) -> APPROVED,
+	     recovering work stranded by a worker that died mid-dispatch; see
+	     wo.reclaim_stale_executing.
+
+	Both are safe to run on every sweep: each is a single guarded UPDATE
+	that matches nothing when there is nothing to recover."""
+	revived = wo.requeue_due_snoozed(client_id)
+	for order in revived:
+		# "setter" to match _load_and_verify's own refreshed-card repost —
+		# config_fingerprint["channel"] is the DISPATCHER key (email/noop),
+		# not a Slack channel key, so it must not be used here.
+		posted = _post_card(order)
+		_line(
+			f"snooze expired — action_id={order.action_id} back to QUEUED"
+			+ ("" if posted else " (card NOT reposted — see logs)")
+		)
+
+	for action_id in wo.reclaim_stale_executing(client_id):
+		_line(f"reclaimed stale EXECUTING action_id={action_id} -> APPROVED (worker likely died mid-dispatch)")
+
+
+def _post_card(order) -> bool:
+	"""Sync seam around the async post, matching cmd_seed's own
+	asyncio.run() style — keeps _recover_stalled a plain sync function and
+	gives the tests one thing to stub."""
+	from src.services.slack.listeners import post_work_order_card
+
+	return asyncio.run(post_work_order_card(order, channel_key="setter")) is not None
+
+
 def cmd_sweep(client_id: str) -> int:
 	if halt_service.is_halted(client_id=client_id):
 		_line(f"HALTED — client_id={client_id!r} is halted (global or client-scoped); executing zero items")
 		return 0
+
+	_recover_stalled(client_id)
 
 	batch = wo.approved_batch(client_id)
 	if not batch:

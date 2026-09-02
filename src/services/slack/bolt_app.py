@@ -15,7 +15,7 @@ THIS FILE IS BOOTSTRAP ONLY — the AsyncApp instance and the Socket Mode
 connection lifecycle. It does not register any @app.action / @app.command
 / @app.view listeners; those are the actual interaction handlers (the
 Dev 3 plan's still-unbuilt slack_router equivalent) and belong in a
-separate module that imports get_bolt_app() and decorates it.
+separate module that imports get_listener_app() and decorates it.
 
 Migration path back to HTTP webhooks (once DNS/TLS is ready): the AsyncApp
 core and every listener registered on it are IDENTICAL between Socket Mode
@@ -67,6 +67,51 @@ def get_bolt_app() -> AsyncApp:
 			signing_secret=settings.slack_signing_secret.get_secret_value(),
 		)
 	return _app
+
+
+class _UnconfiguredApp:
+	"""Registration stub returned by get_listener_app() when Slack has no
+	credentials — every @app.action / @app.command / @app.view decorator
+	becomes an identity decorator, so the listener module still imports and
+	its handler functions are still defined as plain functions.
+
+	Exists because src/services/slack/listeners.py binds `app` at MODULE
+	scope and decorates with it at import time, and src/api/main.py imports
+	that module to register the handlers. Without this, a missing
+	SLACK_BOT_TOKEN raised SlackNotConfiguredError during FastAPI app
+	construction — BEFORE the lifespan's run_socket_mode_task() error
+	handling could log and degrade — turning an optional Slack outage into
+	a total API outage (/healthz included).
+
+	Registering onto a throwaway object is safe precisely because Socket
+	Mode cannot start without those same credentials either: if this stub
+	is in play, there is no connection for a listener to have served. This
+	mirrors src/services/slack/post.py's own no-op-when-unconfigured
+	contract rather than inventing a second degradation style."""
+
+	def _noop_decorator(self, *args, **kwargs):
+		def decorate(func):
+			return func
+
+		return decorate
+
+	action = command = view = view_closed = event = message = shortcut = _noop_decorator
+
+
+def get_listener_app():
+	"""What a listener MODULE should bind at import time — the real AsyncApp
+	when configured, else a no-op registration stub. Use get_bolt_app()
+	directly only where a genuinely working Slack app is required (starting
+	Socket Mode, making Web API calls), so those paths still fail loudly."""
+	try:
+		return get_bolt_app()
+	except SlackNotConfiguredError as exc:
+		logger.warning(
+			"[slack.bolt_app] Slack not configured (%s) — listeners will not be registered; "
+			"the rest of the app still starts normally",
+			exc,
+		)
+		return _UnconfiguredApp()
 
 
 async def start_socket_mode() -> None:

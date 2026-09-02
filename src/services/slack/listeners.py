@@ -45,12 +45,17 @@ from src.core.database import get_db_context
 from src.services import work_orders as wo
 from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
-from src.services.slack.bolt_app import get_bolt_app
+from src.services.slack.bolt_app import get_listener_app
 from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
-app = get_bolt_app()
+# get_listener_app(), NOT get_bolt_app(): this binding happens at IMPORT
+# time and src/api/main.py imports this module to register the handlers, so
+# raising here on a missing SLACK_BOT_TOKEN would take the whole API down
+# with it. The stub degrades to "no listeners registered" instead — see
+# bolt_app._UnconfiguredApp.
+app = get_listener_app()
 
 # ── Vocabulary ───────────────────────────────────────────────────────────
 
@@ -318,14 +323,22 @@ _REVISE_CALLBACK_ID = "revise_work_order"
 
 
 @app.action("revise")
-async def handle_revise_open(ack, body, action, client):
+async def handle_revise_open(ack, body, respond, action, client):
+	"""Goes through the SAME _load_and_verify prelude as every terminal
+	action. It previously hand-rolled its own wo.get() load, which silently
+	skipped approver_authorized() — any workspace member who could see a
+	card could open this modal and (via handle_revise_submit) force the
+	order to SKIPPED, defeating the Slack approval control entirely."""
 	await ack()
+	user_id = body.get("user", {}).get("id", "")
 	try:
 		value = json.loads(action.get("value", "{}"))
 	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
 		return
-	order = wo.get(value.get("client_id", ""), value.get("action_id", ""))
-	if order is None:
+	try:
+		order = await _load_and_verify(value, user_id, respond=respond)
+	except ClickRejected:
 		return
 	private_metadata = json.dumps(
 		{
@@ -367,6 +380,17 @@ async def handle_revise_submit(ack, body, view):
 		return
 
 	client_id, action_id, provided_hash = meta.get("client_id"), meta.get("action_id"), meta.get("payload_hash")
+
+	# Re-checked here even though handle_revise_open already gated the modal
+	# open: a view_submission is a SEPARATE inbound request carrying only
+	# private_metadata this app wrote earlier, and nothing in it proves the
+	# submitter is the person the modal was opened for. Defense in depth,
+	# the same reason _load_and_verify re-reads status rather than trusting
+	# the card.
+	if not approver_authorized(user_id, client_id=client_id):
+		await ack(response_action="errors", errors={"revision_note_block": "Not authorized to act on this card."})
+		return
+
 	order = wo.get(client_id, action_id) if client_id and action_id else None
 	if order is None:
 		await ack(response_action="errors", errors={"revision_note_block": "This card is no longer available."})

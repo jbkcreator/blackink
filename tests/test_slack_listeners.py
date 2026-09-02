@@ -390,3 +390,155 @@ async def test_halt_resume_click_not_authorized(monkeypatch):
 	await listeners.handle_halt_resume_click(ack, body, respond, action)
 	resume_mock.assert_not_called()
 	assert "Not authorized" in respond.call_args.kwargs["text"]
+
+
+# ── Revise authorization — PR #4 review finding 1. Both handlers used to
+# hand-roll their own wo.get() load, skipping approver_authorized()
+# entirely: any workspace member who could SEE a card could open the modal
+# and submit it, forcing the order to SKIPPED. Revise now goes through the
+# same _load_and_verify prelude as every terminal action, and the
+# view_submission re-checks independently (it is a separate request). ────
+
+
+def _revise_meta(order) -> str:
+	from src.services.slack import payload_hash as ph
+
+	return json.dumps(
+		{
+			"client_id": order.client_id,
+			"action_id": order.action_id,
+			"payload_hash": ph.compute(order),
+			"channel_id": order.slack_channel_id,
+			"message_ts": order.slack_message_ts,
+		}
+	)
+
+
+def _revise_view(order, note: str = "please tighten the subject line") -> dict:
+	return {
+		"private_metadata": _revise_meta(order),
+		"state": {"values": {"revision_note_block": {"revision_note": {"value": note}}}},
+	}
+
+
+@pytest.mark.asyncio
+async def test_revise_open_rejects_unauthorized_user(monkeypatch):
+	order = _order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: False)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U_INTRUDER"}, "trigger_id": "T1"}
+	action = {"action_id": "revise", "value": json.dumps(_button_value(order, "REVISE"))}
+
+	await listeners.handle_revise_open(ack, body, respond, action, client)
+
+	client.views_open.assert_not_called()  # the modal never opens
+	assert "Not authorized" in respond.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_revise_open_authorized_user_gets_the_modal(monkeypatch):
+	order = _order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U1"}, "trigger_id": "T1"}
+	action = {"action_id": "revise", "value": json.dumps(_button_value(order, "REVISE"))}
+
+	await listeners.handle_revise_open(ack, body, respond, action, client)
+
+	client.views_open.assert_awaited_once()
+	assert client.views_open.call_args.kwargs["view"]["callback_id"] == listeners._REVISE_CALLBACK_ID
+
+
+@pytest.mark.asyncio
+async def test_revise_open_rejects_stale_card(monkeypatch):
+	"""Revise now inherits the freshness check too — it previously had none
+	at all, so a stale card could open a modal against rotated content."""
+	order = _order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	monkeypatch.setattr(listeners, "_log_event", lambda *a, **k: None)
+	monkeypatch.setattr(listeners, "post_work_order_card", AsyncMock())
+
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U1"}, "trigger_id": "T1"}
+	value = {"client_id": order.client_id, "action_id": order.action_id, "payload_hash": "0" * 64}
+	await listeners.handle_revise_open(ack, body, respond, {"action_id": "revise", "value": json.dumps(value)}, client)
+
+	client.views_open.assert_not_called()
+	assert "out of date" in respond.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_revise_submit_rejects_unauthorized_user_and_does_not_skip_the_order(monkeypatch):
+	"""The core of the finding: an unauthorized submit must not transition
+	the order to SKIPPED. Asserted against the DB seam itself, so it fails
+	if the guard is ever removed regardless of what the handler responds."""
+	order = _order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: False)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+
+	db_mock = AsyncMock()
+	monkeypatch.setattr(listeners, "get_db_context", db_mock)
+	notice_mock = AsyncMock()
+	monkeypatch.setattr(listeners.post, "post_notice", notice_mock)
+
+	ack = AsyncMock()
+	body = {"user": {"id": "U_INTRUDER"}}
+	await listeners.handle_revise_submit(ack, body, _revise_view(order))
+
+	db_mock.assert_not_called()  # no UPDATE ... SET status = 'SKIPPED'
+	notice_mock.assert_not_awaited()
+	assert ack.call_args.kwargs["response_action"] == "errors"
+	assert "Not authorized" in ack.call_args.kwargs["errors"]["revision_note_block"]
+
+
+@pytest.mark.asyncio
+async def test_revise_submit_authorized_user_records_the_revision(monkeypatch):
+	"""The guard must not break the legitimate path."""
+	order = _order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	monkeypatch.setattr(listeners, "_log_event", lambda *a, **k: None)
+
+	executed = []
+
+	class _FakeSession:
+		def execute(self, stmt, params=None):
+			executed.append((str(stmt), params))
+
+	from contextlib import contextmanager
+
+	@contextmanager
+	def _fake_db(client_id=None):
+		yield _FakeSession()
+
+	monkeypatch.setattr(listeners, "get_db_context", _fake_db)
+	monkeypatch.setattr(listeners.post, "update_card", AsyncMock())
+	monkeypatch.setattr(listeners.post, "post_notice", AsyncMock())
+
+	ack = AsyncMock()
+	await listeners.handle_revise_submit(ack, {"user": {"id": "U1"}}, _revise_view(order))
+
+	assert len(executed) == 1
+	sql, params = executed[0]
+	assert "SKIPPED" in sql
+	assert params["decided_by"] == "slack:U1"
+
+
+@pytest.mark.asyncio
+async def test_revise_submit_still_rejects_an_already_decided_order(monkeypatch):
+	order = _order(status="APPROVED")
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	db_mock = AsyncMock()
+	monkeypatch.setattr(listeners, "get_db_context", db_mock)
+
+	ack = AsyncMock()
+	await listeners.handle_revise_submit(ack, {"user": {"id": "U1"}}, _revise_view(order))
+
+	db_mock.assert_not_called()
+	assert "Already decided" in ack.call_args.kwargs["errors"]["revision_note_block"]

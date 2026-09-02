@@ -373,16 +373,85 @@ def approved_batch(client_id: Optional[str] = None, *, limit: int = 50) -> list:
 	return [_row_to_order(dict(r)) for r in rows]
 
 
+def requeue_due_snoozed(client_id: str) -> list:
+	"""SNOOZED rows whose due_at has passed -> QUEUED, so a snooze actually
+	expires. Returns the revived orders (callers re-post their cards).
+
+	Without this, snooze was a one-way trip: listeners.handle_snooze set
+	status='SNOOZED' + due_at, but nothing ever read due_at back —
+	approved_batch() only selects APPROVED — so "Snooze 1h" silently
+	deleted the order from the workflow forever.
+
+	One UPDATE ... RETURNING, not SELECT-then-UPDATE: the status='SNOOZED'
+	guard inside the same statement is what makes a due order revive
+	EXACTLY once even if two sweeps race. decided_by/decided_at are cleared
+	because the row is genuinely undecided again — _load_and_verify's
+	status == 'QUEUED' check is what re-opens the card's buttons. due_at is
+	deliberately KEPT as the record of what the snooze was set to."""
+	with get_db_context(client_id=client_id) as session:
+		rows = session.execute(
+			text(
+				"UPDATE agent_work_orders "
+				"SET status = 'QUEUED', decided_by = NULL, decided_at = NULL, updated_at = NOW() "
+				"WHERE client_id = :client_id AND status = 'SNOOZED' "
+				"  AND due_at IS NOT NULL AND due_at <= NOW() "
+				"RETURNING action_id"
+			),
+			{"client_id": client_id},
+		).mappings().all()
+		revived_ids = [str(r["action_id"]) for r in rows]
+	return [o for o in (get(client_id, aid) for aid in revived_ids) if o is not None]
+
+
+# How long an EXECUTING row may sit untouched before a sweep assumes the
+# worker that claimed it died and hands it back. Generous on purpose: the
+# cost of reclaiming too early (a double dispatch) is worse than the cost
+# of reclaiming too late (a delayed send).
+STALE_EXECUTING_AFTER = timedelta(minutes=30)
+
+
+def reclaim_stale_executing(client_id: str, *, older_than: timedelta = STALE_EXECUTING_AFTER) -> list:
+	"""EXECUTING rows untouched for longer than `older_than` -> APPROVED,
+	so the next sweep re-dispatches them. Returns the reclaimed action_ids.
+
+	claim_for_execution() commits APPROVED -> EXECUTING BEFORE the
+	dispatcher runs (see __main__.cmd_sweep). If that process is killed
+	between the claim and record_execution_result(), the row stays
+	EXECUTING and no later sweep will ever look at it again — approved_batch
+	selects only APPROVED. This is the reclaim path that makes the claim
+	survivable; it is a crash-recovery concern, distinct from (and present
+	even without) the concurrency concern noted on claim_for_execution.
+
+	ponytail: wall-clock timeout, no lease/heartbeat — a dispatch that
+	legitimately runs longer than `older_than` would be reclaimed and
+	double-executed. Fine while Week 0 dispatchers are fast and
+	non-concurrent; move to a lease renewed by the running worker (or an
+	outbox with idempotent retry) once a dispatcher can run long."""
+	cutoff = datetime.now(timezone.utc) - older_than
+	with get_db_context(client_id=client_id) as session:
+		rows = session.execute(
+			text(
+				"UPDATE agent_work_orders "
+				"SET status = 'APPROVED', updated_at = NOW() "
+				"WHERE client_id = :client_id AND status = 'EXECUTING' AND updated_at <= :cutoff "
+				"RETURNING action_id"
+			),
+			{"client_id": client_id, "cutoff": cutoff},
+		).mappings().all()
+		return [str(r["action_id"]) for r in rows]
+
+
 def claim_for_execution(client_id: str, action_id: str) -> Optional[WorkOrder]:
 	"""Atomically transitions APPROVED -> EXECUTING. Returns None if the
 	row was not APPROVED at the moment of claim — guards two concurrent
 	--sweep runs from both claiming and dispatching the same order.
 
-	ponytail: no batch_id / staleness-reclaim tracking (FA/relay/queue.py's
-	try_claim_for_batch has both, for exactly this reason) — Week 0 runs
-	--sweep as a single, non-concurrent process, so a lost claim can't
-	currently happen. Add batch_id + staleness reclaim if --sweep ever
-	runs as more than one concurrent worker."""
+	ponytail: no batch_id tracking (FA/relay/queue.py's try_claim_for_batch
+	has one) — Week 0 runs --sweep as a single, non-concurrent process, so
+	attributing a claim to a specific worker buys nothing yet. Add batch_id
+	if --sweep ever runs as more than one concurrent worker. A crashed
+	claim is recovered by reclaim_stale_executing() above, which needs no
+	batch_id."""
 	with get_db_context(client_id=client_id) as session:
 		result = session.execute(
 			text(

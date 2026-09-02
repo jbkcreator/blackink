@@ -111,6 +111,10 @@ class FakeSession:
 				return self._update_status(params, decision_field=None)
 			if keys == {"action_id", "client_id"}:
 				return self._claim_for_execution(params)
+			if keys == {"client_id"}:
+				return self._requeue_due_snoozed(params)
+			if keys == {"client_id", "cutoff"}:
+				return self._reclaim_stale_executing(params)
 			raise NotImplementedError(f"FakeSession: unrecognized UPDATE param shape: {sorted(keys)}")
 
 		raise NotImplementedError(f"FakeSession cannot handle: {sql[:80]}")
@@ -190,6 +194,37 @@ class FakeSession:
 			row["error"] = params["error"]
 			return SimpleNamespace(rowcount=1)
 		return SimpleNamespace(rowcount=0)
+
+	def _requeue_due_snoozed(self, params):
+		"""Models the UPDATE ... RETURNING as one atomic step: the
+		status == 'SNOOZED' guard and the flip happen together, which is
+		what makes a due row revive exactly once under a repeated call."""
+		now = datetime.now(timezone.utc)
+		revived = []
+		for row in self.table.rows.values():
+			if (
+				row["client_id"] == params["client_id"]
+				and row["status"] == "SNOOZED"
+				and row.get("due_at") is not None
+				and row["due_at"] <= now
+			):
+				row["status"] = "QUEUED"
+				row["decided_by"] = None
+				row["decided_at"] = None
+				revived.append({"action_id": row["action_id"]})
+		return _FakeResult(revived)
+
+	def _reclaim_stale_executing(self, params):
+		reclaimed = []
+		for row in self.table.rows.values():
+			if (
+				row["client_id"] == params["client_id"]
+				and row["status"] == "EXECUTING"
+				and row["updated_at"] <= params["cutoff"]
+			):
+				row["status"] = "APPROVED"
+				reclaimed.append({"action_id": row["action_id"]})
+		return _FakeResult(reclaimed)
 
 	def _count(self, params):
 		rows = list(self.table.rows.values())
@@ -491,3 +526,114 @@ def test_full_state_machine_queued_to_done(fake_db):
 	assert executing.status == "EXECUTING"
 	done = wo.record_execution_result(order.client_id, order.action_id, success=True, receipt={"dispatcher": "noop"})
 	assert done.status == "DONE"
+
+
+# ── snooze expiry — PR #4 review finding 3: a snooze was a one-way trip.
+# snooze() set status/due_at but nothing ever read due_at back, so
+# "Snooze 1h" silently removed the order from the workflow forever. ──────
+
+
+def test_due_snoozed_order_is_requeued(fake_db):
+	order = _enqueue()
+	past = datetime.now(timezone.utc) - timedelta(minutes=1)
+	wo.snooze(order.client_id, order.action_id, until=past, decided_by="slack:U1")
+	assert wo.get(order.client_id, order.action_id).status == "SNOOZED"
+
+	revived = wo.requeue_due_snoozed(order.client_id)
+
+	assert [o.action_id for o in revived] == [order.action_id]
+	assert wo.get(order.client_id, order.action_id).status == "QUEUED"
+
+
+def test_snooze_that_has_not_expired_is_left_alone(fake_db):
+	order = _enqueue()
+	future = datetime.now(timezone.utc) + timedelta(hours=4)
+	wo.snooze(order.client_id, order.action_id, until=future, decided_by="slack:U1")
+
+	assert wo.requeue_due_snoozed(order.client_id) == []
+	assert wo.get(order.client_id, order.action_id).status == "SNOOZED"
+
+
+def test_expired_snooze_is_requeued_exactly_once(fake_db):
+	"""The guard lives inside the UPDATE, so a second sweep (or a
+	concurrent one) must not revive the same row twice."""
+	order = _enqueue()
+	past = datetime.now(timezone.utc) - timedelta(minutes=1)
+	wo.snooze(order.client_id, order.action_id, until=past, decided_by="slack:U1")
+
+	first = wo.requeue_due_snoozed(order.client_id)
+	second = wo.requeue_due_snoozed(order.client_id)
+
+	assert len(first) == 1
+	assert second == []
+
+
+def test_requeued_order_clears_the_snooze_decision(fake_db):
+	"""A revived order must look genuinely undecided — _load_and_verify
+	gates on status == 'QUEUED', and a leftover decided_by would misreport
+	who owns the still-open card."""
+	order = _enqueue()
+	past = datetime.now(timezone.utc) - timedelta(minutes=1)
+	wo.snooze(order.client_id, order.action_id, until=past, decided_by="slack:U1")
+	wo.requeue_due_snoozed(order.client_id)
+
+	revived = wo.get(order.client_id, order.action_id)
+	assert revived.decided_by is None and revived.decided_at is None
+	assert revived.due_at is not None  # kept as the record of the snooze
+
+
+def test_requeue_due_snoozed_does_not_touch_other_tenants(fake_db):
+	past = datetime.now(timezone.utc) - timedelta(minutes=1)
+	mine = _enqueue(client_id="client_a")
+	theirs = _enqueue(client_id="client_b")
+	wo.snooze(mine.client_id, mine.action_id, until=past, decided_by="slack:U1")
+	wo.snooze(theirs.client_id, theirs.action_id, until=past, decided_by="slack:U2")
+
+	revived = wo.requeue_due_snoozed("client_a")
+
+	assert [o.action_id for o in revived] == [mine.action_id]
+	assert wo.get("client_b", theirs.action_id).status == "SNOOZED"
+
+
+# ── stale-claim reclaim — PR #4 review finding 4: claim_for_execution
+# commits APPROVED -> EXECUTING before the dispatcher runs, so a crash in
+# between stranded the row forever (approved_batch only sees APPROVED). ──
+
+
+def test_crashed_claim_is_reclaimed_on_a_later_sweep(fake_db):
+	"""Simulates the crash: claim the order, then never call
+	record_execution_result — exactly the state a killed worker leaves."""
+	order = _enqueue()
+	wo.record_decision(order.client_id, order.action_id, decision="APPROVED", decided_by="slack:U1")
+	wo.claim_for_execution(order.client_id, order.action_id)
+	assert wo.get(order.client_id, order.action_id).status == "EXECUTING"
+	assert wo.approved_batch(order.client_id) == []  # invisible to the sweep
+
+	# Age the claim past the timeout, as wall-clock would.
+	fake_db.rows[order.action_id]["updated_at"] = datetime.now(timezone.utc) - timedelta(hours=1)
+	reclaimed = wo.reclaim_stale_executing(order.client_id)
+
+	assert reclaimed == [order.action_id]
+	assert wo.get(order.client_id, order.action_id).status == "APPROVED"
+	assert [o.action_id for o in wo.approved_batch(order.client_id)] == [order.action_id]
+
+
+def test_fresh_claim_is_not_reclaimed(fake_db):
+	"""A dispatch still in flight must survive a concurrent sweep."""
+	order = _enqueue()
+	wo.record_decision(order.client_id, order.action_id, decision="APPROVED", decided_by="slack:U1")
+	wo.claim_for_execution(order.client_id, order.action_id)
+
+	assert wo.reclaim_stale_executing(order.client_id) == []
+	assert wo.get(order.client_id, order.action_id).status == "EXECUTING"
+
+
+def test_reclaim_ignores_rows_that_finished_normally(fake_db):
+	order = _enqueue()
+	wo.record_decision(order.client_id, order.action_id, decision="APPROVED", decided_by="slack:U1")
+	wo.claim_for_execution(order.client_id, order.action_id)
+	wo.record_execution_result(order.client_id, order.action_id, success=True, receipt={"dispatcher": "noop"})
+	fake_db.rows[order.action_id]["updated_at"] = datetime.now(timezone.utc) - timedelta(hours=1)
+
+	assert wo.reclaim_stale_executing(order.client_id) == []
+	assert wo.get(order.client_id, order.action_id).status == "DONE"
