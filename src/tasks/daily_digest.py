@@ -29,60 +29,59 @@ logger = logging.getLogger(__name__)
 _WINDOW = timedelta(hours=24)
 
 # ── CROSS-TASK EVENT CONTRACT — read this before changing an event name ──
+# v2 spec correction (Tasks/Updated_client spec/Week1_Tasks_Dev_Split_v2.md
+# §Demo Sandbox & Metrics Engine, Subtask 4.2.3): the metric set changed. The
+# client spec now explicitly says: "metrics are: Scores generated, county
+# rank reports, emails dispatched, open rate, CTR, reply rate, appointments
+# booked — not ghost-shopper latency or video completion rate." Ghost-Shopper
+# and Sendspark are permanently deferred (v2 blueprint line 1264) — their
+# events (audit_reply_received, audit_pdf_generated, sendspark_engagement)
+# must never appear in this query again.
+#
 # Every event_type below is WRITTEN by a different Week 1 task's code, not
-# by this one. Where the split doc names the event explicitly, this query
-# uses that name verbatim:
-#   audit_reply_received     — Ghost-Shopper Audit Factory, Subtask 2.1.2 (carries audit_speed_score_sec)
-#   audit_pdf_generated      — Ghost-Shopper Audit Factory, Subtask 2.1.3 (one per completed audit)
-#   sendspark_engagement     — Sendspark Video Integration, Subtask 2.2.3 (payload.watch_percent)
-#   outbound_touch_dispatched— Outbound Sequencer & Booking Engine, Subtask 3.1.1
-#   meeting_booked           — Outbound Sequencer & Booking Engine, Subtask 3.2.1
+# by this one:
+#   owner_score_generated     — Owner Visibility Score Engine (replaces the
+#       Ghost-Shopper Audit Factory); fields: score_total, county,
+#       data_coverage_pct, county_rank (see src/services/events.py's
+#       REQUIRED_PAYLOAD_FIELDS)
+#   outbound_touch_dispatched — Outbound Sequencer & Booking Engine, Subtask 3.1.1
+#   meeting_booked            — Outbound Sequencer & Booking Engine, Subtask 3.2.1
 #
-# email_opened / email_clicked are the ONE gap: Subtask 3.1.1 requires
-# "open and click tracking pixels active" but never names the resulting
-# event types. These two names are DECIDED HERE and are the contract —
-# the tracking-pixel handler must emit exactly these. Communicate this
-# name; do not add a translation layer if a different name was picked,
-# rename that one instead.
+# Three event names are DECIDED HERE and are the contract — the producing
+# side must emit exactly these, or the metric silently stays at 0/'n/a':
+#   email_opened / email_clicked — unchanged from the original decision.
+#   email_replied — NEW for reply_rate_pct. No document defines this name;
+#       it follows the same naming precedent as email_opened/email_clicked
+#       and the blueprint's "Inbound Reply Bridge" concept. Communicate
+#       this name to whoever builds inbound reply handling.
 #
-# THREE OF THESE SEVEN METRICS WILL READ 'n/a' FOR NOW, and that is
-# expected, not a bug to chase (client clarifications, Week 1 Open Items
-# #6 and #2):
-#   audits_completed / avg_response_latency_sec — the Ghost-Shopper is on
-#       hold ("Hold. Do not build it." — the client objects to submitting
-#       pretext inquiries to real businesses at volume). No audit_* events
-#       will be written until Rank v1's public-data approach replaces it.
-#   video_completion_rate_pct — Sendspark is deferred ("Do not build the
-#       video flow in September — build the trigger hook and leave the
-#       provider behind a config row"), so no sendspark_engagement events.
-# The query deliberately still asks for all seven: when those features do
-# land and start writing events, the digest starts reporting them with no
-# code change. NULLIF keeps the divide-by-zero cases as NULL -> 'n/a'.
+# county_rank_reports_delivered needs NO new event: county_rank is already
+# one of owner_score_generated's required fields (the "County Rank
+# Calculator" computes it as part of scoring, not as a separate delivery
+# step — v2 blueprint lines 209, 367, 398). Defined here as the number of
+# DISTINCT counties scored in the window. If "delivered" is later confirmed
+# to mean something else (e.g. a held-back report), this becomes a real
+# event and this one query line changes — nothing else in this module does.
 _METRICS_SQL = """
     SELECT
-        COUNT(*) FILTER (WHERE event_type = 'audit_pdf_generated') AS audits_completed,
-        AVG((payload->>'audit_speed_score_sec')::numeric)
-            FILTER (WHERE event_type = 'audit_reply_received'
-                    AND payload->>'audit_speed_score_sec' ~ '^[0-9]+(\\.[0-9]+)?$') AS avg_response_latency_sec,
+        COUNT(*) FILTER (WHERE event_type = 'owner_score_generated') AS scores_generated,
+        COUNT(DISTINCT payload->>'county') FILTER (WHERE event_type = 'owner_score_generated') AS county_rank_reports_delivered,
         COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
         (COUNT(*) FILTER (WHERE event_type = 'email_opened')::numeric
             / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS open_rate_pct,
         (COUNT(*) FILTER (WHERE event_type = 'email_clicked')::numeric
             / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS click_rate_pct,
-        (COUNT(*) FILTER (WHERE event_type = 'sendspark_engagement'
-                          AND payload->>'watch_percent' ~ '^[0-9]+(\\.[0-9]+)?$'
-                          AND (payload->>'watch_percent')::numeric >= 100)::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'sendspark_engagement'), 0) * 100) AS video_completion_rate_pct,
+        (COUNT(*) FILTER (WHERE event_type = 'email_replied')::numeric
+            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS reply_rate_pct,
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
 """
-# The two `~ '^[0-9]+...'` regex guards are not defensive clutter: `->>`
-# returns text, and a single event whose payload carries a non-numeric
-# value in one of these keys would abort the WHOLE digest query with a
-# cast error, turning one bad row written by another team into a silent
-# daily "Data Unavailable". Filtering to castable values degrades one
-# metric instead of all seven.
+# No numeric-cast regex guards are needed here (unlike the old
+# avg_response_latency_sec/video_completion_rate_pct columns) — every
+# expression above is either a plain COUNT or a division of two COUNTs,
+# neither of which can fail on a malformed payload value the way a
+# `(payload->>'x')::numeric` cast on an arbitrary string could.
 
 
 def _query_metrics() -> dict:
@@ -110,12 +109,12 @@ def build_digest_text() -> str:
 
     return (
         ":bar_chart: *Daily Pipeline Digest — last 24h*\n"
-        f"- Audits completed: {fmt(metrics.get('audits_completed'))}\n"
-        f"- Avg metro response latency: {fmt(metrics.get('avg_response_latency_sec'), ' sec')}\n"
+        f"- Owner Visibility Scores generated: {fmt(metrics.get('scores_generated'))}\n"
+        f"- County rank reports delivered: {fmt(metrics.get('county_rank_reports_delivered'))}\n"
         f"- Cold emails dispatched: {fmt(metrics.get('cold_emails_dispatched'))}\n"
         f"- Open rate: {fmt(metrics.get('open_rate_pct'), '%')}\n"
         f"- Click-through rate: {fmt(metrics.get('click_rate_pct'), '%')}\n"
-        f"- Video completion rate: {fmt(metrics.get('video_completion_rate_pct'), '%')}\n"
+        f"- Reply rate: {fmt(metrics.get('reply_rate_pct'), '%')}\n"
         f"- Appointments booked: {fmt(metrics.get('appointments_booked'))}"
     )
 
