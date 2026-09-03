@@ -88,7 +88,7 @@ class AppSettings(BaseSettings):
 	# this field's use but doesn't require removing it.
 	slack_app_token: Optional[SecretStr] = Field(default=None, env="SLACK_APP_TOKEN")
 
-	# ── Relay halt / resume (Dev 2, src/agents/relay/) ──────────────────────
+	# ── Relay halt / resume (src/agents/relay/) ─────────────────────────────
 	# HMAC-SHA256 signing key for cryptographic resume tokens
 	# (src/agents/relay/resume_auth.py). Must be set before any halt can be
 	# issued or resumed. Recommended: 32+ bytes of entropy.
@@ -103,7 +103,7 @@ class AppSettings(BaseSettings):
 	# Fail-closed workspace-wide approver allowlist — Slack user IDs,
 	# comma-separated (e.g. "U012ABC,U034DEF"). src.services.slack.auth.
 	# approver_authorized() treats an empty/unset list as "nobody
-	# authorized", never "everybody". Dev 3 plan §7.4 — per-tenant
+	# authorized", never "everybody". Per-tenant
 	# approvers are Week 1 (need a clients column that doesn't exist yet);
 	# this is global-only for Week 0.
 	#
@@ -156,7 +156,7 @@ class AppSettings(BaseSettings):
 	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
 	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
 
-	# ── Owner Visibility Score (Dev 2) ────────────────────────────────────────
+	# ── Owner Visibility Score ───────────────────────────────────────────────
 	# When absent the stub provider is used — max achievable score is 42/100
 	# (38 website + 4 DBPR). Set to enable live Google Places API calls.
 	google_places_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_PLACES_API_KEY")

@@ -1,12 +1,12 @@
 """
-Provision the owner_visibility_scores table (Dev 2, Owner Visibility Score engine).
+Provision the owner_visibility_scores table.
 
 One scored row per (company_id, month_key). month_key is YYYY-MM, e.g. '2026-09'.
 The UNIQUE constraint prevents duplicate scoring runs from creating phantom history;
 a re-run of the sweep for the same month upserts rather than inserts.
 
 The composite index on (county_slug, month_key, score_total DESC) supports the
-county-rank query (Task 2.1.2) without a cross-table join: the sweep writes
+county-rank query without a cross-table join: the sweep writes
 county_slug alongside score_total so ranking is a single index scan.
 
 score_google stays 0 until a live GOOGLE_PLACES_API_KEY is configured —
@@ -56,7 +56,7 @@ DDL = [
     "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS county_rank       SMALLINT",
     "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS county_percentile SMALLINT",
     "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS peer_comparisons  JSONB",
-    # County-rank queries for Task 2.1.2: list top N firms in a county for a month.
+    # County-rank queries: list top N firms in a county for a month.
     "CREATE INDEX IF NOT EXISTS ix_ovs_county_month_rank ON owner_visibility_scores (county_slug, month_key, score_total DESC)",
     "CREATE INDEX IF NOT EXISTS ix_ovs_company_month ON owner_visibility_scores (company_id, month_key)",
     "GRANT SELECT, INSERT, UPDATE ON owner_visibility_scores TO blackink_app",

@@ -1,5 +1,5 @@
 """
-Add google_place_id column to companies (Dev 2, Owner Visibility Score engine).
+Add google_place_id column to companies.
 
 google_place_id is populated once per firm by the owner_visibility_sweep when
 the Google Places API key is present (stub provider leaves it NULL). Storing it

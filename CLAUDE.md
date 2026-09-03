@@ -21,7 +21,7 @@ uvicorn src.api.main:app --reload --port 8000
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
 PYTHONPATH=. python migrations/apply_clients.py
-PYTHONPATH=. python migrations/apply_relay_halts.py   # Dev 2 — not tenant-bearing, any time after clients
+PYTHONPATH=. python migrations/apply_relay_halts.py   # not tenant-bearing, any time after clients
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py
 PYTHONPATH=. python migrations/apply_owner_entities.py
@@ -29,10 +29,10 @@ PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
-PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
-PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # Dev 2 — adds google_place_id to companies
-PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # Dev 2 — removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
-PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # Dev 2 — OVS engine scoring table
+PYTHONPATH=. python migrations/apply_agent_work_orders.py   # before RLS, after clients
+PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # adds google_place_id to companies
+PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
+PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # OVS engine scoring table
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS

@@ -52,4 +52,4 @@ TENANT_POLICIES = {
 #   counties, owner_entities, owner_entity_links — global reference data.
 #   raw_prospect_companies, raw_prospect_contacts — Akrash has no visibility
 #     into the client roster by design; ownership is assigned only at
-#     promotion time (see Dev 1 plan §Key decision 6).
+#     promotion time (ownership is assigned at promotion, not ingestion).

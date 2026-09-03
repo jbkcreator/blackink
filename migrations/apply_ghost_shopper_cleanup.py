@@ -12,7 +12,7 @@ contacts table
   RENAME audit_pdf_url -> ovs_pdf_url   -- OVS sweep writes the OVS PDF URL here
   KEEP   audit_loss_dollars_est  -- OVS revenue model writes the same dollar figure
 
-pm_profiles table (kept -- used by Dev 3 setter context cards)
+pm_profiles table (kept -- used for setter context cards)
   DROP   average_speed_to_lead_seconds  -- ghost-shopper metro benchmark, never populated
   DROP   top10_speed_to_lead_seconds    -- same
 
