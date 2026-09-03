@@ -145,11 +145,16 @@ def log_event(
 def flush_pending() -> int:
 	"""Retries every buffered event. Returns the number successfully
 	flushed. Called at the top of src/tasks/daily_digest.py::main() (the
-	one guaranteed-scheduled process in the system) and safe to call from
-	any other task worker loop — no background thread is started for this
-	(ponytail: no scheduler dependency; a caller that never runs never
-	flushes, which is fine since the buffer is best-effort, not a
-	durability guarantee)."""
+	one guaranteed-scheduled process in the system), and periodically from
+	within src/api/main.py's lifespan (a background loop in the long-running
+	API process — the buffer is process-local, so daily_digest's own call
+	can only ever drain what THAT process buffered, never what the API
+	process did; the API process must drain its own). Safe to call from any
+	other task worker loop too. ponytail: neither caller survives a process
+	crash/restart — the buffer is in-memory, not a durable outbox (Redis
+	list or a WAL file is the upgrade path if outages start outlasting a
+	process's uptime); a caller that never runs never flushes, which is
+	fine since the buffer is best-effort, not a durability guarantee."""
 	flushed = 0
 	still_pending: list[dict] = []
 	for event in _pending_buffer:
