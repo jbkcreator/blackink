@@ -385,3 +385,103 @@ def test_campaign_readiness_rejects_cross_tenant_contact_id(canary_tenants):
 		except Exception:
 			raised = True
 	assert raised, "evaluate_campaign_readiness leaked another tenant's contact by ID"
+
+
+def test_evaluate_campaign_readiness_not_subverted_by_temp_table_shadowing(canary_tenants):
+	"""PR #8 review: SECURITY DEFINER + SET search_path = public + unqualified
+	table names (contacts/companies/client_pm_books/events) is a
+	privilege-escalation hole — blackink_app can create temp tables (Postgres
+	grants CREATE TEMP to PUBLIC by default), and Postgres searches a
+	session's temp schema before any schema literally named in search_path.
+	Without pg_temp explicitly listed (and last), a session-local `CREATE
+	TEMP TABLE contacts (...)` would silently shadow the real table for this
+	SECURITY DEFINER function, turning an app-role credential into a way to
+	feed the owner-privileged function fabricated data (or divert its
+	writes).
+
+	This seeds a REAL non-poach match (so a correct, unsubverted run returns
+	SUPPRESSED — a positive assertion, not just "didn't crash"), then
+	creates lookalike temp contacts/companies/client_pm_books/events tables
+	in the same session that would flip the result to PERMANENTLY_BLOCKED
+	(via a lying is_opted_out) and hide the audit event, if the function
+	were still resolving unqualified names against pg_temp first."""
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	domain = canary_tenants[CANARY_A]["domain"]
+
+	with get_db_context(client_id=CANARY_B) as session:
+		session.execute(
+			text("INSERT INTO public.client_pm_books (client_id, owner_domain) VALUES (:cid, :domain)"),
+			{"cid": CANARY_B, "domain": domain},
+		)
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			session.execute(
+				text(
+					"CREATE TEMP TABLE contacts (contact_id BIGINT PRIMARY KEY, "
+					"company_id VARCHAR(64), email VARCHAR(255), "
+					"is_opted_out BOOLEAN, suppression_state BOOLEAN)"
+				)
+			)
+			session.execute(
+				text(
+					"INSERT INTO contacts VALUES "
+					"(:cid, 'shadow-company', 'shadow@example.com', TRUE, FALSE)"
+				),
+				{"cid": contact_id},
+			)
+			session.execute(
+				text("CREATE TEMP TABLE companies (company_id VARCHAR(64) PRIMARY KEY, domain VARCHAR(255))")
+			)
+			session.execute(text("INSERT INTO companies VALUES ('shadow-company', 'shadow-domain.example')"))
+			session.execute(
+				text(
+					"CREATE TEMP TABLE client_pm_books (client_id VARCHAR(40), "
+					"owner_domain VARCHAR(255), owner_email VARCHAR(255))"
+				)
+			)
+			session.execute(text("CREATE TEMP TABLE events (client_id VARCHAR(40))"))
+
+			status = session.execute(
+				text("SELECT evaluate_campaign_readiness(:cid)"), {"cid": contact_id}
+			).scalar()
+			event = session.execute(
+				text(
+					"SELECT payload FROM public.events WHERE event_type = 'non_poach_suppressed' "
+					"AND entity_id = :cid ORDER BY created_at DESC LIMIT 1"
+				),
+				{"cid": str(contact_id)},
+			).first()
+
+			# Drop the shadows explicitly before this connection goes back to
+			# the pool — SQLAlchemy reuses physical connections across
+			# get_db_context() calls, and a Postgres temp table lives for the
+			# life of the BACKEND CONNECTION, not the `with` block. Left in
+			# place, these would silently follow whichever test next happens
+			# to check out this same pooled connection.
+			session.execute(text("DROP TABLE pg_temp.contacts, pg_temp.companies, pg_temp.client_pm_books, pg_temp.events"))
+
+		assert status == "SUPPRESSED", (
+			"evaluate_campaign_readiness was subverted by session-local temp tables "
+			"shadowing contacts/companies — a vulnerable version would return "
+			"PERMANENTLY_BLOCKED here, reading the shadow's fabricated is_opted_out"
+		)
+		assert event is not None, (
+			"non_poach_suppressed event was not found in the real public.events table "
+			"— it may have been silently redirected into the temp events shadow"
+		)
+		assert event.payload["matched_client_id"] == CANARY_B
+	finally:
+		# Schema-qualified, unlike the other tests' identical cleanup above —
+		# this test in particular may have left temp lookalikes of these same
+		# table names on a pooled connection (see the DROP above); qualifying
+		# here means this cleanup is correct regardless of whether that DROP
+		# ran (e.g. an assertion failed first) or which pooled connection
+		# these get_db_context() calls happen to reuse.
+		with get_db_context(client_id=CANARY_B) as session:
+			session.execute(text("DELETE FROM public.client_pm_books WHERE client_id = :cid"), {"cid": CANARY_B})
+		with get_owner_db_context() as session:
+			session.execute(
+				text("DELETE FROM public.events WHERE event_type = 'non_poach_suppressed' AND entity_id = :cid"),
+				{"cid": str(contact_id)},
+			)
+			session.commit()
