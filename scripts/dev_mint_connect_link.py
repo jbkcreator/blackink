@@ -30,7 +30,7 @@ def main() -> int:
 	client_id, provider = sys.argv[1], sys.argv[2].upper()
 
 	settings = get_settings()
-	with get_db_context() as session:
+	with get_db_context(client_id=client_id) as session:
 		token = mint_calendar_connect_link(session, client_id, provider)
 
 	connect_url = f"{settings.calendar_webhook_base_url}/api/v1/calendar/connect/{provider.lower()}?token={token}"

@@ -34,6 +34,12 @@ from src.api.calendar_oauth_router import router as calendar_oauth_router
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
 
+# Python's root logger defaults to WARNING — without this, every
+# logger.info() in the background workers (including each successful
+# sweep tick) is silently dropped, which looks identical to "the worker
+# isn't running" from the console. uvicorn configures its own loggers
+# independently of this, so this is still needed for app-level logging.
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 _QUEUE_DRAIN_INTERVAL_SECONDS = 10

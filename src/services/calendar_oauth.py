@@ -87,23 +87,35 @@ class ConnectLinkClaims:
 	nonce: str
 
 
-def verify_and_consume_connect_link(session: Session, token: str) -> ConnectLinkClaims:
+def decode_connect_link(token: str) -> ConnectLinkClaims:
+	"""Pure JWT decode, no DB access — the connect-link JWT already carries
+	client_id in its own payload (encoded at mint time), so the caller can
+	learn which client_id to scope its DB session to *before* ever opening
+	one. Does not consume the nonce; call consume_connect_link_nonce()
+	next, inside a session opened with client_id=this result's client_id
+	(oauth_connect_nonces is RLS-protected — a bare, unscoped session
+	can't see or update any row, which otherwise misreads as a false
+	"nonce already used/unknown" rather than the real cause)."""
 	try:
 		payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
 	except jwt.PyJWTError as exc:
 		raise OAuthStateError("Invalid or expired connect-link token") from exc
+	return ConnectLinkClaims(client_id=payload["client_id"], provider=payload["provider"], nonce=payload["nonce"])
 
+
+def consume_connect_link_nonce(session: Session, claims: ConnectLinkClaims) -> None:
+	"""session must already be scoped to claims.client_id — see
+	decode_connect_link()'s docstring."""
 	row = session.execute(
 		text(
 			"UPDATE oauth_connect_nonces SET consumed_at = NOW() "
-			"WHERE nonce = :nonce AND consumed_at IS NULL AND expires_at > NOW() "
-			"RETURNING client_id, provider"
+			"WHERE nonce = :nonce AND client_id = :client_id AND consumed_at IS NULL AND expires_at > NOW() "
+			"RETURNING nonce"
 		),
-		{"nonce": payload["nonce"]},
+		{"nonce": claims.nonce, "client_id": claims.client_id},
 	).first()
 	if row is None:
 		raise OAuthStateError("Connect-link nonce already used, expired, or unknown")
-	return ConnectLinkClaims(client_id=row.client_id, provider=row.provider, nonce=payload["nonce"])
 
 
 def build_authorization_url(claims: ConnectLinkClaims, redirect_uri: str) -> str:

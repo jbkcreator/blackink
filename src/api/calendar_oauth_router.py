@@ -6,6 +6,7 @@ doesn't have (see src/services/calendar_oauth.py's module docstring).
 
 from __future__ import annotations
 
+import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from src.services.calendar_oauth import OAuthStateError
 from src.services.calendar_providers import GoogleCalendarClient, MicrosoftGraphClient
 
 router = APIRouter(prefix="/api/v1/calendar", tags=["calendar-oauth"])
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -56,13 +58,21 @@ def _webhook_url(provider: str) -> str:
 @router.get("/connect/{provider}")
 def connect(provider: str, token: str = Query(...)):
 	provider = provider.upper()
-	with get_db_context() as session:
+	try:
+		# Pure decode first — no DB session yet, since we don't know which
+		# client_id to scope one to until the JWT itself is decoded (it's
+		# in the payload). See decode_connect_link()'s docstring.
+		claims = calendar_oauth.decode_connect_link(token)
+	except OAuthStateError as exc:
+		raise HTTPException(status_code=400, detail=str(exc)) from exc
+	if claims.provider != provider:
+		raise HTTPException(status_code=400, detail="Connect-link provider does not match route")
+
+	with get_db_context(client_id=claims.client_id) as session:
 		try:
-			claims = calendar_oauth.verify_and_consume_connect_link(session, token)
+			calendar_oauth.consume_connect_link_nonce(session, claims)
 		except OAuthStateError as exc:
 			raise HTTPException(status_code=400, detail=str(exc)) from exc
-		if claims.provider != provider:
-			raise HTTPException(status_code=400, detail="Connect-link provider does not match route")
 		auth_url = calendar_oauth.build_authorization_url(claims, _redirect_uri(provider))
 	return RedirectResponse(auth_url)
 
@@ -101,13 +111,20 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				access_token_encrypted=encrypt_token(tokens.access_token), token_expires_at=tokens.expires_at,
 			)
 			client = GoogleCalendarClient(session)
-			# register_watch needs a connection-shaped object with a valid
-			# access token available via get_valid_access_token(); the row
-			# doesn't exist yet, so we pass a lightweight stand-in exposing
-			# just what that call needs.
-			watch_result = client.register_watch(
-				existing_row, channel_id, _webhook_url(provider), verification_secret
-			)
+			if get_settings().skip_calendar_watch_registration:
+				logger.warning(
+					"SKIP_CALENDAR_WATCH_REGISTRATION is set — connecting client %s's Google calendar "
+					"WITHOUT a live push subscription. Real OAuth tokens and baseline sync still run; "
+					"new bookings will only be picked up by calendar_sync_worker's periodic safety sweep, "
+					"not in near-real-time. Never leave this set outside local dev.",
+					claims.client_id,
+				)
+			else:
+				# register_watch needs a connection-shaped object with a valid
+				# access token available via get_valid_access_token(); the row
+				# doesn't exist yet, so we pass a lightweight stand-in exposing
+				# just what that call needs.
+				client.register_watch(existing_row, channel_id, _webhook_url(provider), verification_secret)
 			subscription_expires_at = None
 		else:
 			me_calendar = requests.get(
@@ -122,7 +139,16 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				access_token_encrypted=encrypt_token(tokens.access_token), token_expires_at=tokens.expires_at,
 			)
 			client = MicrosoftGraphClient(session)
-			sub_result = client.register_subscription(existing_row, _webhook_url(provider), verification_secret)
+			subscription_expires_at = None
+			if get_settings().skip_calendar_watch_registration:
+				logger.warning(
+					"SKIP_CALENDAR_WATCH_REGISTRATION is set — connecting client %s's Microsoft calendar "
+					"WITHOUT a live push subscription. Never leave this set outside local dev.",
+					claims.client_id,
+				)
+			else:
+				sub_result = client.register_subscription(existing_row, _webhook_url(provider), verification_secret)
+				subscription_expires_at = sub_result.get("expires_at")
 			subscription_expires_at = sub_result.get("expires_at")
 
 		row = session.execute(
