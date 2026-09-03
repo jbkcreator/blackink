@@ -33,22 +33,29 @@ from src.core.database import get_owner_db_context
 DDL = [
     """
     CREATE TABLE IF NOT EXISTS owner_visibility_scores (
-        score_id        BIGSERIAL    PRIMARY KEY,
-        company_id      VARCHAR(64)  NOT NULL REFERENCES companies(company_id),
-        month_key       VARCHAR(7)   NOT NULL,
-        county_slug     VARCHAR(60)  NOT NULL REFERENCES counties(county_slug),
-        score_total     SMALLINT     NOT NULL,
-        score_website   SMALLINT     NOT NULL DEFAULT 0,
-        score_dbpr      SMALLINT     NOT NULL DEFAULT 0,
-        score_google    SMALLINT     NOT NULL DEFAULT 0,
-        signal_detail   JSONB,
-        data_gaps       TEXT[]       NOT NULL DEFAULT '{}',
-        scored_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        score_id           BIGSERIAL    PRIMARY KEY,
+        company_id         VARCHAR(64)  NOT NULL REFERENCES companies(company_id),
+        month_key          VARCHAR(7)   NOT NULL,
+        county_slug        VARCHAR(60)  NOT NULL REFERENCES counties(county_slug),
+        score_total        SMALLINT     NOT NULL,
+        score_website      SMALLINT     NOT NULL DEFAULT 0,
+        score_dbpr         SMALLINT     NOT NULL DEFAULT 0,
+        score_google       SMALLINT     NOT NULL DEFAULT 0,
+        signal_detail      JSONB,
+        data_gaps          TEXT[]       NOT NULL DEFAULT '{}',
+        county_rank        SMALLINT,
+        county_percentile  SMALLINT,
+        peer_comparisons   JSONB,
+        scored_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         CONSTRAINT ck_ovs_month_key   CHECK (month_key  ~ '^[0-9]{4}-[0-9]{2}$'),
         CONSTRAINT ck_ovs_score_total CHECK (score_total BETWEEN 0 AND 100),
         CONSTRAINT uq_ovs_company_month UNIQUE (company_id, month_key)
     )
     """,
+    # Idempotent column additions for databases provisioned before rank columns were added.
+    "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS county_rank       SMALLINT",
+    "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS county_percentile SMALLINT",
+    "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS peer_comparisons  JSONB",
     # County-rank queries for Task 2.1.2: list top N firms in a county for a month.
     "CREATE INDEX IF NOT EXISTS ix_ovs_county_month_rank ON owner_visibility_scores (county_slug, month_key, score_total DESC)",
     "CREATE INDEX IF NOT EXISTS ix_ovs_company_month ON owner_visibility_scores (company_id, month_key)",

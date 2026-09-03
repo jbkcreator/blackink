@@ -22,6 +22,7 @@ import sys
 from datetime import datetime, timezone
 
 from src.core.database import get_system_db_context
+from src.services.owner_visibility.county_rank import calculate_county_ranks
 from src.services.owner_visibility.score_calculator import calculate_score
 from src.services.owner_visibility.signals.website import WebsiteSignalProvider
 from src.services.owner_visibility.signals.dbpr_licence import DbprLicenceSignalProvider
@@ -125,8 +126,83 @@ def run_sweep() -> int:
                     {"place_id": company["google_place_id"], "company_id": company["company_id"]},
                 )
 
-    logger.info("owner_visibility_sweep: done, upserted=%d for month=%s", upserted, month_key)
+    logger.info("owner_visibility_sweep: done scoring, upserted=%d for month=%s", upserted, month_key)
+
+    _update_county_ranks(month_key)
     return upserted
+
+
+def _update_county_ranks(month_key: str) -> None:
+    """Compute county ranks for every county that has scores for month_key.
+
+    Runs as a second pass after all scores are written so every firm in the
+    county is present before ranking begins. Overwrites county_rank,
+    county_percentile, and peer_comparisons on each row.
+    """
+    from sqlalchemy import text
+
+    with get_system_db_context() as db:
+        county_slugs = [
+            r[0]
+            for r in db.execute(
+                text(
+                    "SELECT DISTINCT county_slug FROM owner_visibility_scores "
+                    "WHERE month_key = :month_key"
+                ),
+                {"month_key": month_key},
+            ).fetchall()
+        ]
+
+    logger.info("owner_visibility_sweep: ranking %d counties for month=%s", len(county_slugs), month_key)
+
+    for county_slug in county_slugs:
+        with get_system_db_context() as db:
+            raw_rows = db.execute(
+                text(
+                    "SELECT o.score_id, o.company_id, c.company_name, "
+                    "       o.score_total, o.signal_detail "
+                    "FROM owner_visibility_scores o "
+                    "JOIN companies c ON c.company_id = o.company_id "
+                    "WHERE o.county_slug = :county_slug AND o.month_key = :month_key"
+                ),
+                {"county_slug": county_slug, "month_key": month_key},
+            ).fetchall()
+
+        rows = [
+            {
+                "score_id":     r.score_id,
+                "company_id":   r.company_id,
+                "company_name": r.company_name,
+                "score_total":  r.score_total,
+                "signal_detail": r.signal_detail or {},
+            }
+            for r in raw_rows
+        ]
+
+        ranked = calculate_county_ranks(rows)
+
+        with get_system_db_context() as db:
+            for row in ranked:
+                db.execute(
+                    text(
+                        "UPDATE owner_visibility_scores SET "
+                        "  county_rank       = :county_rank, "
+                        "  county_percentile = :county_percentile, "
+                        "  peer_comparisons  = :peer_comparisons::jsonb "
+                        "WHERE score_id = :score_id"
+                    ),
+                    {
+                        "county_rank":       row["county_rank"],
+                        "county_percentile": row["county_percentile"],
+                        "peer_comparisons":  json.dumps(row["peer_comparisons"]),
+                        "score_id":          row["score_id"],
+                    },
+                )
+            logger.info(
+                "owner_visibility_sweep: ranked county=%s (%d firms)", county_slug, len(ranked)
+            )
+
+    logger.info("owner_visibility_sweep: county ranking complete for month=%s", month_key)
 
 
 def main() -> int:
