@@ -16,6 +16,19 @@ non_poach_suppressed event payload — the DoD explicitly asks for it, so the
 audit trail carries it even though the function's return value still never
 discloses it to the caller.
 
+SECURITY DEFINER + `SET search_path = public` + unqualified table names
+(contacts/companies/client_pm_books/events) is a privilege-escalation hole
+(PR #8 review): Postgres searches a session's temp schema before any
+schema named in search_path unless pg_temp is placed explicitly, so
+blackink_app — which can create temp tables — could CREATE TEMP TABLE
+contacts (...) before calling this function and have the owner-privileged
+function read/write its shadow table instead of the real one. Fixed by
+schema-qualifying every persistent object (public.contacts, etc.) and
+setting `search_path = pg_catalog, pg_temp` — pg_temp last, so it's never
+implicitly searched first, and qualifying the objects means it doesn't
+matter where in the path `public` would otherwise sit anyway (belt and
+suspenders, since a future edit could add an unqualified reference back).
+
 contact_id is BIGINT, not UUID as the DoD literally names it — matches
 contacts.contact_id's actual type (same class of blueprint-vs-reality
 deviation as company_id being sha256(domain), not gen_random_uuid()).
@@ -38,7 +51,7 @@ DDL = [
 	CREATE OR REPLACE FUNCTION evaluate_campaign_readiness(p_contact_id BIGINT)
 	RETURNS TEXT
 	SECURITY DEFINER
-	SET search_path = public
+	SET search_path = pg_catalog, pg_temp
 	LANGUAGE plpgsql
 	AS $$
 	DECLARE
@@ -63,10 +76,18 @@ DDL = [
 		-- via company_id -> companies.owning_client_id (config/tenant_policies.py's
 		-- "join" mode). The join is inlined here, not left to RLS, because this
 		-- function is SECURITY DEFINER and RLS does not apply to it at all.
+		--
+		-- Every table below is schema-qualified (public.*) and search_path is
+		-- pg_catalog, pg_temp (no "public", pg_temp listed last, never
+		-- implicit-first) — otherwise blackink_app (which can create temp
+		-- tables) could CREATE TEMP TABLE contacts (...) before calling this
+		-- SECURITY DEFINER function and have it read/write that shadow table
+		-- under the owner's privileges instead of the real one (PR #8 review;
+		-- see module docstring).
 		SELECT c.is_opted_out, c.suppression_state, c.company_id, c.email
 		  INTO v_is_opted_out, v_suppression_state, v_company_id, v_email
-		  FROM contacts c
-		  JOIN companies co ON co.company_id = c.company_id
+		  FROM public.contacts c
+		  JOIN public.companies co ON co.company_id = c.company_id
 		  WHERE c.contact_id = p_contact_id
 		    AND co.owning_client_id = v_requesting_client_id;
 
@@ -80,17 +101,17 @@ DDL = [
 		END IF;
 
 		-- Check 2 — Cross-Client Non-Poach. Only reached if Check 1 passed.
-		SELECT domain INTO v_domain FROM companies WHERE company_id = v_company_id;
+		SELECT domain INTO v_domain FROM public.companies WHERE company_id = v_company_id;
 
 		SELECT b.client_id INTO v_matched_client_id
-		  FROM client_pm_books b
+		  FROM public.client_pm_books b
 		  WHERE b.client_id <> v_requesting_client_id
 		    AND ((v_domain IS NOT NULL AND b.owner_domain = v_domain)
 		         OR (v_email IS NOT NULL AND b.owner_email = v_email))
 		  LIMIT 1;
 
 		IF v_matched_client_id IS NOT NULL THEN
-			INSERT INTO events (client_id, event_type, entity_type, entity_id, payload)
+			INSERT INTO public.events (client_id, event_type, entity_type, entity_id, payload)
 			VALUES (
 				v_requesting_client_id,
 				'non_poach_suppressed',
