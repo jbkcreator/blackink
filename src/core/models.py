@@ -532,6 +532,43 @@ class ComplianceGateCheck(Base):
 	)
 
 
+class SmsDispatchLog(Base):
+	"""DB-layer backstop of the three-layer cold-SMS block (Week 1 Subtask
+	1.2.3, master blueprint §3.1.2/§3.0.4). The CHECK constraint enforces
+	the same predicate as campaign_readiness_gate.is_engaged() directly at
+	the database engine, independent of the application-layer linter in
+	src/services/sms_dispatch.py. No SMS vendor is contracted yet (same
+	situation as the DNC vendor) — this table exists because neither the
+	blueprint nor the DoD gives a schema for "an outbound SMS record"."""
+
+	__tablename__ = "sms_dispatch_log"
+
+	dispatch_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	contact_id: Mapped[int] = mapped_column(
+		BigInteger, ForeignKey("contacts.contact_id"), nullable=False, index=True
+	)
+	inbound_sms_count_at_send: Mapped[int] = mapped_column(Integer, nullable=False)
+	booked_appointment_id_at_send: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	status: Mapped[str] = mapped_column(String(20), nullable=False, default="SENT")
+	provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+	__table_args__ = (
+		CheckConstraint(
+			"status IN ('PENDING','SENT','FAILED','BLOCKED','UNKNOWN')", name="ck_sms_dispatch_log_status"
+		),
+		CheckConstraint(
+			"inbound_sms_count_at_send > 0 OR booked_appointment_id_at_send IS NOT NULL",
+			name="ck_sms_dispatch_log_not_cold",
+		),
+		UniqueConstraint("client_id", "idempotency_key", name="uq_sms_dispatch_log_client_idempotency_key"),
+	)
+
+
 # ============================================================================
 # DELIVERABILITY INFRASTRUCTURE (20 domains / 40 mailboxes)
 # client_id NULL = Blackink self-marketing (5 of the 20 domains). NULL vs.
