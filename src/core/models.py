@@ -60,6 +60,18 @@ class County(Base):
 	state: Mapped[str] = mapped_column(String(2), nullable=False)
 
 
+class UsAreaCodeTimezone(Base):
+	"""US NANP phone area code -> IANA timezone, used to compute quiet hours
+	(9pm-8am recipient local time, Week 1 Subtask 1.2.2). Representative
+	seed set, not the full ~300-code NANP list — an area code missing here
+	fails closed (SMS withheld) rather than assumed clear."""
+
+	__tablename__ = "us_area_code_timezones"
+
+	area_code: Mapped[str] = mapped_column(String(3), primary_key=True)
+	iana_timezone: Mapped[str] = mapped_column(String(50), nullable=False)
+
+
 class Client(Base):
 	"""Tenant registry. Deny-by-default config resolution (get_client_config)
 	reads is_active/suspended_at here — see src/services/client_config.py."""
@@ -263,6 +275,11 @@ class Contact(Base):
 	last_outbound_touch_at: Mapped[Optional[datetime]] = mapped_column(
 		DateTime(timezone=True), nullable=True
 	)
+	# Week 1 Subtask 1.2.2 (Warm-Channel Waterfall) — literal field names from
+	# the master blueprint's CI-enforced predicate (§3.0.4): SMS eligibility
+	# requires inbound_sms_count > 0 OR booked_appointment_id IS NOT NULL.
+	booked_appointment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	inbound_sms_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -512,6 +529,43 @@ class ComplianceGateCheck(Base):
 
 	__table_args__ = (
 		CheckConstraint("status IN ('PASS','FAIL','ABSTAIN')", name="ck_compliance_gate_checks_status"),
+	)
+
+
+class SmsDispatchLog(Base):
+	"""DB-layer backstop of the three-layer cold-SMS block (Week 1 Subtask
+	1.2.3, master blueprint §3.1.2/§3.0.4). The CHECK constraint enforces
+	the same predicate as campaign_readiness_gate.is_engaged() directly at
+	the database engine, independent of the application-layer linter in
+	src/services/sms_dispatch.py. No SMS vendor is contracted yet (same
+	situation as the DNC vendor) — this table exists because neither the
+	blueprint nor the DoD gives a schema for "an outbound SMS record"."""
+
+	__tablename__ = "sms_dispatch_log"
+
+	dispatch_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	contact_id: Mapped[int] = mapped_column(
+		BigInteger, ForeignKey("contacts.contact_id"), nullable=False, index=True
+	)
+	inbound_sms_count_at_send: Mapped[int] = mapped_column(Integer, nullable=False)
+	booked_appointment_id_at_send: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	status: Mapped[str] = mapped_column(String(20), nullable=False, default="SENT")
+	provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+	__table_args__ = (
+		CheckConstraint(
+			"status IN ('PENDING','SENT','FAILED','BLOCKED','UNKNOWN')", name="ck_sms_dispatch_log_status"
+		),
+		CheckConstraint(
+			"inbound_sms_count_at_send > 0 OR booked_appointment_id_at_send IS NOT NULL",
+			name="ck_sms_dispatch_log_not_cold",
+		),
+		UniqueConstraint("client_id", "idempotency_key", name="uq_sms_dispatch_log_client_idempotency_key"),
 	)
 
 

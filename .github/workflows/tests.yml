@@ -1,17 +1,13 @@
-name: Tenant leakage suite
+name: Test suite
 
 on:
-  schedule:
-    - cron: "0 9 * * *"  # nightly, catches deployed-policy drift
   pull_request:
-    paths:
-      - "src/core/models.py"
-      - "migrations/**"
-      - "src/core/database.py"
-      - "config/tenant_policies.py"
+  push:
+    branches:
+      - main
 
 jobs:
-  leakage-suite:
+  test:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -27,24 +23,32 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       DATABASE_URL: postgresql://blackink_owner:test_only_password@localhost:5432/blackink_test
       BLACKINK_APP_DB_PASSWORD: test_only_password
       BLACKINK_SYSTEM_DB_PASSWORD: test_only_password
       AKRASH_INGEST_DB_PASSWORD: test_only_password
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      # This list must stay in the same order as CLAUDE.md's "Migrations"
-      # block, and must include EVERY migration that creates a table listed
-      # in config/tenant_policies.py — apply_rls_policies.py iterates that
-      # registry and ALTERs each table, so a missing CREATE here fails the
-      # build with an UndefinedTable error that reads like a schema bug
-      # rather than a stale CI list. Adding a tenant-bearing table means
-      # touching three files: the migration, tenant_policies.py, and this.
+      # Same migration order as tenant_leakage_nightly.yml and CLAUDE.md's
+      # "Migrations" block — must include every migration that creates a
+      # table any test in tests/ touches, or a test fails with an
+      # UndefinedTable error that reads like a schema bug rather than a
+      # stale CI list.
       - name: Apply migrations
         run: |
           PYTHONPATH=. python migrations/apply_db_roles.py
@@ -66,10 +70,10 @@ jobs:
           PYTHONPATH=. python migrations/apply_sending_domains.py
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
-      - name: Run tenant leakage suite
-        run: PYTHONPATH=. pytest tests/test_tenant_isolation.py -v
-      - name: Alert on failure
-        if: failure()
-        run: |
-          echo "::error::Tenant leakage suite failed — treat as a security incident, not a routine red build."
-          # Slack webhook posts to blackink_qa_slack_channel once configured — see config/settings.py.
+      # Full suite — this is what actually gates a PR on every change, not
+      # just the tenant-leakage path-filtered nightly. Runs
+      # tests/test_sms_dispatch.py (the cold-SMS application-layer linter)
+      # among everything else, closing the gap where that file existed but
+      # was never wired into any CI workflow.
+      - name: Run full test suite
+        run: PYTHONPATH=. pytest tests/ -v
