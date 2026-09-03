@@ -1,5 +1,7 @@
 """Ghost Shopper — nested LangGraph graph definition.
 
+# DEFERRED 2026-09-03 — see runner.py for full context and reactivation notes.
+
 Thread ID convention: "gs:{work_order_id}"
 Checkpointed to the same Postgres instance as Ink, different namespace.
 

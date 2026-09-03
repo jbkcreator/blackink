@@ -1,5 +1,22 @@
 """Ghost Shopper — entry point called by Ink's node_ghost_shopper.
 
+# ============================================================
+# DEFERRED — 2026-09-03
+# ============================================================
+# Ghost Shopper (automated form submission + IMAP reply timing) was deferred
+# per the Sep 3 2026 Source of Truth decision. Owner Visibility Score (OVS)
+# replaces it using only publicly observable signals — no pretext contact.
+#
+# This runner and the entire ghost_shopper/ subagent package are preserved
+# here for future reactivation. No code in this package is imported by any
+# active pipeline; it is safe to leave as-is.
+#
+# To reactivate: restore node_ghost_shopper and node_wait_reply in
+# src/agents/ink/nodes.py, re-wire graph.py, provision the IMAP listener,
+# and re-apply migrations/apply_ghost_shopper_columns.py on the target DB
+# (after reverting apply_ghost_shopper_cleanup.py).
+# ============================================================
+
 Handles:
   - First run:  invoke with initial CrawlState
   - Crash retry: detect in-progress checkpoint → resume from last completed node

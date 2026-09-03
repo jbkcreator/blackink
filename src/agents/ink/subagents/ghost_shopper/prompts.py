@@ -1,5 +1,7 @@
 """Ghost Shopper — LLM prompt templates.
 
+# DEFERRED 2026-09-03 — see runner.py for full context and reactivation notes.
+
 Two LLM calls per crawl run (typical):
   1. FORM_VALIDATOR  — called once per page that has <form> elements
   2. QUEUE_RANKER    — called once per page with no valid form found

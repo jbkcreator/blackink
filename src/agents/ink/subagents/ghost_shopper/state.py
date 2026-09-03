@@ -1,5 +1,7 @@
 """Ghost Shopper — crawl state and result types.
 
+# DEFERRED 2026-09-03 — see runner.py for full context and reactivation notes.
+
 CrawlState is the LangGraph state for the Ghost Shopper nested graph.
 It is checkpointed to Postgres after every node completion, keyed by
 thread_id = "gs:{work_order_id}".

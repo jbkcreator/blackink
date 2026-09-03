@@ -1,5 +1,20 @@
 """Add ghost-shopper audit columns to contacts and create pm_profiles table.
 
+# ============================================================
+# DEFERRED — DO NOT RUN ON THE LIVE DATABASE
+# ============================================================
+# Ghost Shopper was deferred on 2026-09-03 (Source of Truth).
+# Owner Visibility Score (OVS) replaces it as the proof-of-need artefact.
+#
+# The live DB cleanup is handled by:
+#   migrations/apply_ghost_shopper_cleanup.py  (on feature/owner-visibility-score-engine)
+# which drops the ghost-shopper-only columns and renames audit_pdf_url -> ovs_pdf_url.
+#
+# This migration file is preserved here for reference in case Ghost Shopper
+# is reactivated in a future sprint. It must NOT be added to the CLAUDE.md
+# migration runbook or applied to any environment while Ghost Shopper remains deferred.
+# ============================================================
+
 Dev 2 owns these columns — they are not part of Dev 1's contacts migration.
 This migration runs after apply_contacts.py and apply_companies.py.
 
