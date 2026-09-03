@@ -15,6 +15,11 @@ tzdata>=2024.1
 pytest-asyncio>=0.24
 slack_sdk>=3.38
 slack-bolt>=1.18
+# Required by fastapi.testclient.TestClient (tests/test_api_startup.py). Was
+# already needed before this line existed — it only ever worked because it
+# happened to be installed in developer environments. CI installs this file
+# and nothing else, so a clean box needs it declared explicitly.
+httpx>=0.27
 # aiohttp is required by slack_bolt's AsyncSocketModeHandler but is only
 # declared under slack_sdk's "optional" extra, not a hard dependency —
 # confirmed via `importlib.metadata.requires("slack_sdk")`. Without this
