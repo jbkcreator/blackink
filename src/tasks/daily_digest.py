@@ -66,9 +66,9 @@ _METRICS_SQL = """
                     AND payload->>'audit_speed_score_sec' ~ '^[0-9]+(\\.[0-9]+)?$') AS avg_response_latency_sec,
         COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
         (COUNT(*) FILTER (WHERE event_type = 'email_opened')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched'), 0) * 100) AS open_rate_pct,
+            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS open_rate_pct,
         (COUNT(*) FILTER (WHERE event_type = 'email_clicked')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched'), 0) * 100) AS click_rate_pct,
+            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS click_rate_pct,
         (COUNT(*) FILTER (WHERE event_type = 'sendspark_engagement'
                           AND payload->>'watch_percent' ~ '^[0-9]+(\\.[0-9]+)?$'
                           AND (payload->>'watch_percent')::numeric >= 100)::numeric

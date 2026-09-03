@@ -1,7 +1,8 @@
+import re
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
-from src.tasks.daily_digest import build_digest_text, main
+from src.tasks.daily_digest import _METRICS_SQL, build_digest_text, main
 
 
 def _rows(**kwargs):
@@ -58,3 +59,28 @@ def test_main_flushes_buffered_events_before_posting():
          patch("src.tasks.daily_digest.post_notice", new_callable=AsyncMock):
         main()
     mock_flush.assert_called_once()
+
+
+def test_metrics_sql_filters_open_and_click_rate_denominators_to_email_only():
+    """PR review fix: open_rate_pct/click_rate_pct previously divided by
+    EVERY outbound_touch_dispatched event (SMS/call/LinkedIn included), not
+    just email sends, which artificially depresses both rates once other
+    channels are logged under the same event_type. This is a regression
+    guard on the SQL text itself, not a behavioral test — every other test
+    in this file mocks _query_metrics() and so cannot see a bug inside
+    _METRICS_SQL. A live-Postgres test (insert mixed-channel events, call
+    the real _query_metrics(), assert the computed rate is unaffected by
+    the non-email rows) is the stronger check and should be run against a
+    real database before merge; this guard only catches the query text
+    regressing back to the unfiltered form."""
+    open_rate_clause = re.search(r"AS open_rate_pct", _METRICS_SQL)
+    click_rate_clause = re.search(r"AS click_rate_pct", _METRICS_SQL)
+    assert open_rate_clause and click_rate_clause
+
+    # The NULLIF(...) denominator immediately preceding each alias must
+    # include the same channel filter cold_emails_dispatched already uses.
+    open_rate_denominator = _METRICS_SQL[:open_rate_clause.start()].rsplit("NULLIF(", 1)[-1]
+    click_rate_denominator = _METRICS_SQL[:click_rate_clause.start()].rsplit("NULLIF(", 1)[-1]
+    for denominator in (open_rate_denominator, click_rate_denominator):
+        assert "outbound_touch_dispatched" in denominator
+        assert "payload->>'channel' = 'email'" in denominator
