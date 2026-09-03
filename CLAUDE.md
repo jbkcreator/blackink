@@ -38,6 +38,11 @@ PYTHONPATH=. python migrations/apply_meeting_outcomes.py    # adds meeting_outco
 PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # adds google_place_id to companies
 PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
 PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # OVS engine scoring table
+PYTHONPATH=. python migrations/apply_mailbox_smtp_credentials.py
+PYTHONPATH=. python migrations/apply_owner_contacts.py
+PYTHONPATH=. python migrations/apply_calendar_connections.py
+PYTHONPATH=. python migrations/apply_bookings.py
+PYTHONPATH=. python migrations/apply_booking_reminder_jobs.py      # Subtask 3.2.2 — Show-Rate Reminder Cascade
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -47,6 +52,10 @@ python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
 python -m src.tasks.hunter_nightly_sweep
+python -m src.tasks.calendar_subscription_renewal
+python -m src.tasks.calendar_sync_worker
+python -m src.tasks.booking_confirmation_sender
+python -m src.tasks.show_rate_reminder_sender
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
@@ -96,6 +105,65 @@ unset ENV_FILE   # or just open a fresh shell for real-.env work
 
 Only once a change is verified this way should it be applied to the real
 server (manual sync today — no CI/CD deploy pipeline exists yet).
+
+## Cloud Run deployment (test)
+
+A test-only deployment target for verifying the Google/Microsoft/GHL
+booking-engine webhooks against real providers (their push-notification
+APIs need a real, HTTPS-reachable URL — `localhost` doesn't work; see
+Subtask 3.2.1). Not a production deploy pipeline — that remains manual
+sync per above.
+
+`Dockerfile` runs `uvicorn src.api.main:app --host 0.0.0.0 --port
+${PORT}` — Cloud Run injects `PORT`, never hardcode a port. On startup,
+`src/api/main.py`'s lifespan spawns three background threads
+(`calendar_sync_worker.drain_queue`/`sweep_all_active_connections`,
+`booking_confirmation_sender.run_sweep`,
+`calendar_subscription_renewal.run_renewal_sweep`) — this only actually
+keeps running under an **instance-based** billing / **min-instances ≥
+1** Cloud Run configuration; request-based billing suspends the
+container (and these threads) between requests, which would silently
+break the whole point of a background worker.
+
+**Required environment variables / secrets** (exact names
+`config/settings.py` reads — set these as Cloud Run env vars or Secret
+Manager-backed env vars, never baked into the image):
+
+- `DATABASE_URL`, `DATABASE_URL_APP`, `DATABASE_URL_SYSTEM`,
+  `DATABASE_URL_AKRASH` — for Cloud SQL's Unix-socket connector (not a
+  TCP host/port), each DSN's format is
+  `postgresql://USER:PASSWORD@/DBNAME?host=/cloudsql/PROJECT:REGION:INSTANCE`
+  — the empty host before `@/DBNAME` is deliberate (psycopg2 reads the
+  socket directory from the `host` query param instead). Requires the
+  Cloud SQL Auth Proxy sidecar/connector enabled on the service (`--add-cloudsql-instances`).
+- `BLACKINK_APP_DB_PASSWORD`, `BLACKINK_SYSTEM_DB_PASSWORD`,
+  `AKRASH_INGEST_DB_PASSWORD` — only read by `apply_db_roles.py` at
+  provisioning time, but keep them set consistently with the DSNs above.
+- `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`,
+  `MICROSOFT_OAUTH_CLIENT_ID`, `MICROSOFT_OAUTH_CLIENT_SECRET` — from
+  the Google/Microsoft OAuth app consoles; the redirect URI registered
+  there must exactly match `{CALENDAR_WEBHOOK_BASE_URL}/api/v1/calendar/oauth/callback/{provider}`.
+- `TOKEN_ENCRYPTION_KEY` — a `Fernet.generate_key()` output, generated
+  once and stored in Secret Manager, never regenerated per deploy (that
+  would make every previously-encrypted token undecryptable).
+- `CALENDAR_OAUTH_STATE_SECRET` — any random secret string, signs
+  connect-link/state JWTs.
+- `CALENDAR_WEBHOOK_BASE_URL` — the Cloud Run service's own public
+  `https://...run.app` URL (or a mapped custom domain), used to build
+  both the OAuth redirect URI and the webhook URLs handed to Google/
+  Microsoft/GHL at subscribe time.
+- `EMAIL_SENDING_ENABLED` — leave `False`/unset unless real SMTP
+  credentials for a validated sending domain exist; see
+  `src/services/email_dispatch.py`.
+- `AKRASH_INGEST_JWT_SECRET`, `DNC_VENDOR_API_KEY`, etc. — the existing
+  Week 1 settings, only needed if those code paths are actually
+  exercised in this test deployment.
+
+Run the standard migration sequence from Common Commands against the
+Cloud SQL instance (via `psql` through the Auth Proxy, or a one-off
+Cloud Run Job using the same image) before the service handles traffic
+— `apply_rls_policies.py` in particular must run before any tenant data
+is written, same as local dev.
 
 ## Architecture
 
@@ -158,6 +226,55 @@ code (matches Forced Action's own ADR 0011 call). `sending_domains` /
 (adapted from Forced Action's `email_deliverability_monitor.py`)
 quarantines a domain and promotes a same-cluster reserve domain on a
 bounce/complaint-rate trip.
+
+### Inbound booking engine (Subtask 3.2.1)
+A property owner books on the **client's own** connected calendar
+(Google Calendar or Microsoft Graph — never a Blackink-owned calendar,
+and no Calendly; client comment W1-8). Only events tagged
+`extendedProperties.private.blackink_booking = "1"` (Google) /
+the equivalent `singleValueExtendedProperties` entry (Microsoft) —
+set by whichever component builds the owner-facing booking widget, not
+by this subsystem — become `bookings` rows; an ordinary meeting on the
+same calendar is ignored. Owner identity lives in `owner_contacts`, a
+new table distinct from `contacts` (capped at two PM-firm staff roles
+per prospected company) and `owner_entities` (unpopulated dedup
+scaffolding) — an unmatched booking is queued
+(`status='PENDING_RECONCILIATION'`) rather than a guessed
+company/contact being created.
+
+Webhook routes (`src/api/booking_webhook_router.py`) only validate the
+provider handshake and enqueue into `calendar_sync_queue` — both
+providers require a fast response, so the real sync
+(`src/services/booking_ingest.py`'s `sync_connection_locked`, serialized
+per connection via a Postgres advisory lock) runs out-of-band, via a
+FastAPI `BackgroundTask` for the common case and
+`src/tasks/calendar_sync_worker.py`'s scheduled sweep as the durability
+backstop and periodic safety net against dropped notifications.
+Confirmation email is real (not stubbed) but gated by
+`settings.email_sending_enabled` (default `False`) — a missing/
+misconfigured sending domain is a visible `booking_confirmation_blocked`
+event, not a silent no-op. **No SMS anywhere in this flow** — per
+client comment W1-4 ("we send no SMS this year"),
+`src/services/booking_ingest.py` never imports
+`src/services/sms_dispatch.py`.
+
+No client-portal login system exists anywhere in this repo (no
+`users`/session table). OAuth `state` binds to a single-use signed
+connect-link token (`src/services/calendar_oauth.mint_calendar_connect_link`),
+meant to be minted automatically by the (separate, not built here)
+onboarding flow's calendar-connect step.
+
+**GoHighLevel (GHL)** is the fallback when a client has neither a Google
+nor Microsoft calendar (`src/services/ghl_webhook.py`,
+`POST /api/v1/webhooks/booking/ghl/{connection_token}`) — real, not a
+stub. Unlike Google/Microsoft, GHL has no OAuth app and no fetch step
+(the full booking payload arrives directly in the webhook POST body,
+configured as a Custom Webhook workflow action in the client's GHL
+account) and no native HMAC signature scheme, so authentication is a
+per-client shared secret header rather than a computed signature. Reuses
+the identical booking/owner-matching/confirmation pipeline as Google/
+Microsoft via `booking_ingest._process_event` — one implementation, not
+three.
 
 ## Tooling Rules
 

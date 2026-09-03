@@ -66,11 +66,20 @@ jobs:
           PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
           PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
           PYTHONPATH=. python migrations/apply_sending_domains.py
+          PYTHONPATH=. python migrations/apply_mailbox_smtp_credentials.py
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_companies_google_place_id.py
           PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py
           PYTHONPATH=. python migrations/apply_meeting_outcomes.py
+          PYTHONPATH=. python migrations/apply_owner_contacts.py
+          PYTHONPATH=. python migrations/apply_calendar_connections.py
+          PYTHONPATH=. python migrations/apply_bookings.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
+      # Full suite — this is what actually gates a PR on every change, not
+      # just the tenant-leakage path-filtered nightly. Runs
+      # tests/test_sms_dispatch.py (the cold-SMS application-layer linter)
+      # among everything else, closing the gap where that file existed but
+      # was never wired into any CI workflow.
       - name: Run full test suite
         run: PYTHONPATH=. pytest tests/ -v

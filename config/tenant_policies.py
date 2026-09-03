@@ -53,6 +53,24 @@ TENANT_POLICIES = {
 		"join_on": "company_id",
 		"join_column": "owning_client_id",
 	},
+	"calendar_connections": {"mode": "direct", "column": "client_id"},
+	"owner_contacts": {"mode": "direct", "column": "client_id"},
+	"bookings": {"mode": "direct", "column": "client_id"},
+	"oauth_connect_nonces": {"mode": "direct", "column": "client_id"},
+	"calendar_sync_queue": {
+		"mode": "join",
+		"join_table": "calendar_connections",
+		"join_on": "connection_id",
+		"join_column": "client_id",
+	},
+	# booking_reminder_jobs has no client_id column of its own — scoped through
+	# bookings.client_id via booking_id FK (Subtask 3.2.2).
+	"booking_reminder_jobs": {
+		"mode": "join",
+		"join_table": "bookings",
+		"join_on": "booking_id",
+		"join_column": "client_id",
+	},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
