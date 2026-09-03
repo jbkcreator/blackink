@@ -44,6 +44,16 @@ TENANT_POLICIES = {
 	"sending_domains": {"mode": "direct", "column": "client_id"},
 	"mailboxes": {"mode": "direct", "column": "client_id"},
 	"agent_work_orders": {"mode": "direct", "column": "client_id"},
+	"calendar_connections": {"mode": "direct", "column": "client_id"},
+	"owner_contacts": {"mode": "direct", "column": "client_id"},
+	"bookings": {"mode": "direct", "column": "client_id"},
+	"oauth_connect_nonces": {"mode": "direct", "column": "client_id"},
+	"calendar_sync_queue": {
+		"mode": "join",
+		"join_table": "calendar_connections",
+		"join_on": "connection_id",
+		"join_column": "client_id",
+	},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

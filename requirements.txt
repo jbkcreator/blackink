@@ -27,4 +27,6 @@ httpx>=0.27
 # installs slack-bolt fine but AsyncSocketModeHandler fails to import.
 aiohttp>=3.13
 fakeredis>=2.0
+cryptography>=42.0
+icalendar>=5.0
 
