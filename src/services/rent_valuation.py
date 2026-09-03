@@ -9,7 +9,7 @@ free, leave the provider row disabled. Do not start a trial on our behalf."
 
 So this module defines the contract and nothing else: no cache, no fallback
 orchestration, no caller. Those arrive in Q1 with the rest of the bot — the
-Dev 4 plan's Appendix A specifies them in full, already-audited form.
+implementation plan's Appendix A specifies them in full, already-audited form.
 
 Same ABC-with-stub-default shape as src/services/compliance_gate.py's
 DncProvider / EmailVerificationProvider, which solve the identical problem

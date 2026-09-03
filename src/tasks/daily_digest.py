@@ -28,21 +28,22 @@ logger = logging.getLogger(__name__)
 
 _WINDOW = timedelta(hours=24)
 
-# ── CROSS-TEAM EVENT CONTRACT — read this before changing an event name ──
-# Every event_type below is WRITTEN by another developer's Week 1 code, not
-# by Dev 4. Where the split doc names the event explicitly, this query uses
-# that name verbatim:
-#   audit_reply_received     — Dev 2, Subtask 2.1.2 (carries audit_speed_score_sec)
-#   audit_pdf_generated      — Dev 2, Subtask 2.1.3 (one per completed audit)
-#   sendspark_engagement     — Dev 2, Subtask 2.2.3 (payload.watch_percent)
-#   outbound_touch_dispatched— Dev 3, Subtask 3.1.1
-#   meeting_booked           — Dev 3, Subtask 3.2.1
+# ── CROSS-TASK EVENT CONTRACT — read this before changing an event name ──
+# Every event_type below is WRITTEN by a different Week 1 task's code, not
+# by this one. Where the split doc names the event explicitly, this query
+# uses that name verbatim:
+#   audit_reply_received     — Ghost-Shopper Audit Factory, Subtask 2.1.2 (carries audit_speed_score_sec)
+#   audit_pdf_generated      — Ghost-Shopper Audit Factory, Subtask 2.1.3 (one per completed audit)
+#   sendspark_engagement     — Sendspark Video Integration, Subtask 2.2.3 (payload.watch_percent)
+#   outbound_touch_dispatched— Outbound Sequencer & Booking Engine, Subtask 3.1.1
+#   meeting_booked           — Outbound Sequencer & Booking Engine, Subtask 3.2.1
 #
 # email_opened / email_clicked are the ONE gap: Subtask 3.1.1 requires
 # "open and click tracking pixels active" but never names the resulting
 # event types. These two names are DECIDED HERE and are the contract —
-# Dev 3's tracking-pixel handler must emit exactly these. Tell Dev 3; do
-# not add a translation layer if they picked something else, rename theirs.
+# the tracking-pixel handler must emit exactly these. Communicate this
+# name; do not add a translation layer if a different name was picked,
+# rename that one instead.
 #
 # THREE OF THESE SEVEN METRICS WILL READ 'n/a' FOR NOW, and that is
 # expected, not a bug to chase (client clarifications, Week 1 Open Items

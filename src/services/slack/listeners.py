@@ -549,10 +549,11 @@ async def handle_halt_resume_click(ack, body, respond, action):
 
 
 # ── Post-meeting outcome modal (blueprint §3.1.7) — NO trigger wired here
-# by design. Dev 3's post-meeting Slack card (not yet shipped) is the only
-# entry point: its button handler calls open_meeting_outcome_modal()
-# directly. See this task's brief for the rejected-alternative note on why
-# there is deliberately no interim slash command. ─────────────────────────
+# by design. The Outbound Sequencer & Booking Engine's post-meeting Slack
+# card (not yet shipped) is the only entry point: its button handler calls
+# open_meeting_outcome_modal() directly. See this task's brief for the
+# rejected-alternative note on why there is deliberately no interim slash
+# command. ─────────────────────────────────────────────────────────────
 
 _MEETING_OUTCOME_CALLBACK_ID = "meeting_outcome_modal"
 
@@ -608,10 +609,11 @@ def _meeting_outcome_modal_view(contact_id: str, meeting_occurred_at: str) -> di
 
 
 async def open_meeting_outcome_modal(*, trigger_id: str, contact_id: str, meeting_occurred_at: str) -> bool:
-	"""THE entry point into the post-meeting form — exported for Dev 3's
-	booking-confirmation card handler to call from its "Log Outcome"
-	button. There is deliberately no slash command and no other trigger
-	(see this task's design note): Dev 3's card is the only way in.
+	"""THE entry point into the post-meeting form — exported for the
+	Outbound Sequencer & Booking Engine's booking-confirmation card handler
+	to call from its "Log Outcome" button. There is deliberately no slash
+	command and no other trigger (see this task's design note): that card
+	is the only way in.
 
 	trigger_id comes from the Slack interaction that is opening this modal
 	and expires ~3 seconds after it — call this immediately on the click,
@@ -701,11 +703,11 @@ async def handle_meeting_outcome_submit(ack, body, view):
 		return
 
 	if attendance == "No-Show":
-		# TODO(dev3-no-show): the real outbound-sequence pause lives in Dev
-		# 3's Subtask 3.2.3 no-show handler, which does not exist on this
-		# branch yet — this notice is a visible flag of that gap, not a
-		# substitute for the real pause.
+		# TODO(no-show-pause): the real outbound-sequence pause lives in the
+		# Outbound Sequencer & Booking Engine's Subtask 3.2.3 no-show
+		# handler, which does not exist on this branch yet — this notice is
+		# a visible flag of that gap, not a substitute for the real pause.
 		await post.post_notice(
 			channel_key="setter",
-			text=f":warning: No-show recorded for contact `{meta['contact_id']}` by <@{user_id}> — outbound sequence pause is Dev 3's no-show handler (Subtask 3.2.3), not yet wired here.",
+			text=f":warning: No-show recorded for contact `{meta['contact_id']}` by <@{user_id}> — outbound sequence pause is the Booking Engine's no-show handler (Subtask 3.2.3), not yet wired here.",
 		)
