@@ -22,3 +22,8 @@ slack-bolt>=1.18
 aiohttp>=3.13
 fakeredis>=2.0
 
+# Owner Visibility Score engine (Dev 2)
+beautifulsoup4>=4.12
+lxml>=5.0
+googlemaps>=4.10
+

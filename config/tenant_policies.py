@@ -37,6 +37,14 @@ TENANT_POLICIES = {
 	"sending_domains": {"mode": "direct", "column": "client_id"},
 	"mailboxes": {"mode": "direct", "column": "client_id"},
 	"agent_work_orders": {"mode": "direct", "column": "client_id"},
+	# owner_visibility_scores has no client_id column of its own — scoped through
+	# companies.owning_client_id via company_id FK, same join pattern as contacts.
+	"owner_visibility_scores": {
+		"mode": "join",
+		"join_table": "companies",
+		"join_on": "company_id",
+		"join_column": "owning_client_id",
+	},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

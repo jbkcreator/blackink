@@ -152,6 +152,11 @@ class AppSettings(BaseSettings):
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 
+	# ── Owner Visibility Score (Dev 2) ────────────────────────────────────────
+	# When absent the stub provider is used — max achievable score is 42/100
+	# (38 website + 4 DBPR). Set to enable live Google Places API calls.
+	google_places_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_PLACES_API_KEY")
+
 
 @lru_cache
 def get_settings() -> AppSettings:
