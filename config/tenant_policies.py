@@ -29,6 +29,12 @@ TENANT_POLICIES = {
 		"join_on": "company_id",
 		"join_column": "owning_client_id",
 	},
+	"pm_profiles": {
+		"mode": "join",
+		"join_table": "companies",
+		"join_on": "company_id",
+		"join_column": "owning_client_id",
+	},
 	"clients": {"mode": "direct", "column": "client_id"},
 	"county_allocations": {"mode": "direct", "column": "client_id"},
 	"client_pm_books": {"mode": "direct", "column": "client_id"},

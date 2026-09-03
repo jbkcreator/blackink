@@ -55,6 +55,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_relay_halts.py
           PYTHONPATH=. python migrations/apply_companies.py
           PYTHONPATH=. python migrations/apply_contacts.py
+          PYTHONPATH=. python migrations/apply_pm_profiles.py
           PYTHONPATH=. python migrations/apply_owner_entities.py
           PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
           PYTHONPATH=. python migrations/apply_events.py

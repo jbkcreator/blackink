@@ -59,7 +59,9 @@ DDL = [
 		id                  BIGSERIAL    PRIMARY KEY,
 		company_ref_id       BIGINT       NOT NULL REFERENCES raw_prospect_companies(id),
 		role                 VARCHAR(20)  NOT NULL,
-		name                 VARCHAR(200),
+		first_name           VARCHAR(100),
+		last_name            VARCHAR(100),
+		title                VARCHAR(150),
 		email                VARCHAR(255),
 		phone                VARCHAR(20),
 		source               VARCHAR(100),
@@ -74,6 +76,13 @@ DDL = [
 		)
 	)
 	""",
+	# Week 1 Subtask 1.1.3: staging now captures first/last/title separately
+	# instead of one free-text `name` — self-correcting for tables created
+	# before this change (ADD/DROP are each idempotent, safe to re-run).
+	"ALTER TABLE raw_prospect_contacts ADD COLUMN IF NOT EXISTS first_name VARCHAR(100)",
+	"ALTER TABLE raw_prospect_contacts ADD COLUMN IF NOT EXISTS last_name VARCHAR(100)",
+	"ALTER TABLE raw_prospect_contacts ADD COLUMN IF NOT EXISTS title VARCHAR(150)",
+	"ALTER TABLE raw_prospect_contacts DROP COLUMN IF EXISTS name",
 	"CREATE INDEX IF NOT EXISTS ix_raw_prospect_contacts_company_ref ON raw_prospect_contacts (company_ref_id)",
 	"GRANT SELECT, INSERT, UPDATE ON raw_prospect_contacts TO blackink_app",
 	"GRANT SELECT, UPDATE ON raw_prospect_contacts TO blackink_system",
