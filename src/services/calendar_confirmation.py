@@ -101,7 +101,7 @@ def send_confirmation_for_booking(session: Session, booking_id: int) -> None:
 		return
 
 	try:
-		send_booking_confirmation_email(
+		message_id = send_booking_confirmation_email(
 			session,
 			client_id=booking.client_id,
 			booking_id=booking_id,
@@ -127,6 +127,18 @@ def send_confirmation_for_booking(session: Session, booking_id: int) -> None:
 				session, booking_id, "FAILED", error=str(exc),
 				next_retry_at=datetime.now(timezone.utc) + timedelta(minutes=backoff_minutes),
 			)
+		return
+
+	if message_id is None:
+		# send_booking_confirmation_email returns None specifically for the
+		# disabled/misconfigured case (email_sending_enabled=False, no
+		# mailbox, unvalidated domain) — it already logged
+		# booking_confirmation_blocked itself. That is NOT a successful
+		# send: falling through to SENT here would silently mark bookings
+		# as confirmed when nothing was actually delivered. Revert the
+		# claim back to PENDING so the next tick retries once the
+		# blocking condition (e.g. EMAIL_SENDING_ENABLED) is fixed.
+		_mark(session, booking_id, "PENDING")
 		return
 
 	_mark(session, booking_id, "SENT")

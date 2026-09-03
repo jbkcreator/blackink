@@ -36,6 +36,17 @@ def _webhook_url(provider: str) -> str:
 
 
 def run_renewal_sweep() -> int:
+	if get_settings().skip_calendar_watch_registration:
+		# The whole point of this task is renewing a *real* push
+		# subscription — a connection created via the local-testing skip
+		# flag never got one (expires_at stays NULL), so it would always
+		# look "due" here and this task would repeatedly attempt a real
+		# register_watch()/register_subscription() call against a
+		# non-public callback URL, fail, and flip the connection to
+		# NEEDS_RECONNECT on every tick. Skip entirely in that mode.
+		logger.info("calendar_subscription_renewal: SKIP_CALENDAR_WATCH_REGISTRATION is set, sweep is a no-op")
+		return 0
+
 	renewed = 0
 	with get_system_db_context() as session:
 		due = session.execute(

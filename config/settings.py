@@ -193,6 +193,15 @@ class AppSettings(BaseSettings):
 		default="http://localhost:8000", env="CALENDAR_WEBHOOK_BASE_URL",
 		description="Public base URL the providers POST notifications to — must be internet-reachable in prod.",
 	)
+	# Local-testing-only escape hatch: Google/Microsoft's watch()/subscription
+	# registration calls reject a non-public, non-domain-verified callback
+	# URL (localhost) at registration time — this lets the OAuth callback
+	# complete anyway (real token exchange + real baseline sync still run),
+	# just without a live push subscription. Never set True outside local
+	# dev — a connection created this way never receives real-time webhook
+	# notifications, only whatever calendar_sync_worker's periodic safety
+	# sweep picks up.
+	skip_calendar_watch_registration: bool = Field(default=False, env="SKIP_CALENDAR_WATCH_REGISTRATION")
 
 	# ── Booking confirmation email (Subtask 3.2.1) ──────────────────────────
 	# Default False: per explicit instruction, a missing/disabled real
