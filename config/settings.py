@@ -152,6 +152,10 @@ class AppSettings(BaseSettings):
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 
+	# ── Oxylabs residential proxy ────────────────────────────────────────────
+	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
+	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
+
 	# ── Owner Visibility Score (Dev 2) ────────────────────────────────────────
 	# When absent the stub provider is used — max achievable score is 42/100
 	# (38 website + 4 DBPR). Set to enable live Google Places API calls.

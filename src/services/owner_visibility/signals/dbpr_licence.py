@@ -2,11 +2,13 @@
 
 Signal: dbpr_active_licence  4 pts
 
-Reads a manually-downloaded CSV from data/dbpr/florida_brokers.csv.
-The CSV is not committed to the repo (it's a public-record download, not
-PII, but it's large and changes monthly). The sweep task logs a warning and
-returns MISSING_DATA for all companies if the file is absent, so missing
-the CSV degrades gracefully without crashing the run.
+Reads data/dbpr/florida_brokers.csv. If the file is absent, _ensure_csv()
+downloads it automatically from the FL DBPR public extract URL — no manual
+step required. The file is re-used across calls (module-level cache) and
+should be refreshed monthly (delete the file to trigger a fresh download).
+
+Download source (public record, no auth required):
+  https://www2.myfloridalicense.com/sto/file_download/extracts/REALESTATE2501LICENSE_1.csv
 
 Name matching uses rapidfuzz token_sort_ratio (>= 85 threshold) against
 the company_name field. This is intentionally conservative — a false
@@ -16,16 +18,14 @@ threshold was chosen to handle "ABC Property Management LLC" vs
 
 Expected CSV columns (case-insensitive): name, license_number, status,
 license_type. Any extra columns are ignored.
-
-    data/dbpr/florida_brokers.csv  — download from
-    https://www.myfloridalicense.com/DBPR/os/documents/DataDownload.zip
-    (RE broker / RE broker associate export, unzip and rename)
 """
 
 import csv
 import logging
 import pathlib
 from typing import Any
+
+import requests
 
 from rapidfuzz import fuzz
 
@@ -39,14 +39,57 @@ from src.services.owner_visibility.signals.base import (
 logger = logging.getLogger(__name__)
 
 _DBPR_CSV_PATH = pathlib.Path("data/dbpr/florida_brokers.csv")
+_DBPR_DOWNLOAD_URL = (
+    "https://www2.myfloridalicense.com/sto/file_download/extracts/REALESTATE2501LICENSE_1.csv"
+)
 _MATCH_THRESHOLD = 85  # rapidfuzz token_sort_ratio
 _ACTIVE_STATUSES = {"current active", "current,active", "active"}
 
 
+def _ensure_csv() -> bool:
+    """Download the DBPR CSV if it doesn't exist locally. Returns True on success."""
+    if _DBPR_CSV_PATH.exists():
+        return True
+    _DBPR_CSV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("dbpr_licence: CSV not found — downloading from DBPR extract URL")
+    try:
+        from config.settings import get_settings
+        s = get_settings()
+        proxies = None
+        if s.oxylabs_username and s.oxylabs_password:
+            pwd = s.oxylabs_password.get_secret_value()
+            proxy_url = f"http://{s.oxylabs_username}:{pwd}@pr.oxylabs.io:7777"
+            proxies = {"http": proxy_url, "https": proxy_url}
+            logger.info("dbpr_licence: using Oxylabs residential proxy for download")
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www2.myfloridalicense.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = requests.get(
+            _DBPR_DOWNLOAD_URL, timeout=60, stream=True, headers=headers, proxies=proxies
+        )
+        resp.raise_for_status()
+        with _DBPR_CSV_PATH.open("wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                fh.write(chunk)
+        size_mb = _DBPR_CSV_PATH.stat().st_size / (1024 * 1024)
+        logger.info("dbpr_licence: downloaded %.1f MB to %s", size_mb, _DBPR_CSV_PATH)
+        return True
+    except Exception as exc:
+        logger.warning("dbpr_licence: auto-download failed (%s) — DBPR signals will be MISSING_DATA", exc)
+        # Remove partial file so next call retries cleanly.
+        _DBPR_CSV_PATH.unlink(missing_ok=True)
+        return False
+
+
 def _load_csv(path: pathlib.Path) -> list[dict[str, str]]:
-    """Load and normalise CSV rows. Returns empty list if file is absent."""
-    if not path.exists():
-        return []
+    """Load and normalise CSV rows."""
     rows: list[dict[str, str]] = []
     with path.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
@@ -64,7 +107,10 @@ _csv_cache: list[dict[str, str]] | None = None
 def _get_records() -> list[dict[str, str]]:
     global _csv_cache
     if _csv_cache is None:
-        _csv_cache = _load_csv(_DBPR_CSV_PATH)
+        if _ensure_csv():
+            _csv_cache = _load_csv(_DBPR_CSV_PATH)
+        else:
+            _csv_cache = []
     return _csv_cache
 
 
@@ -101,16 +147,10 @@ class DbprLicenceSignalProvider(SignalProvider):
 
         records = _get_records()
         if not records:
-            logger.warning(
-                "dbpr_licence: %s not found — DBPR signals will be MISSING_DATA for all companies. "
-                "Download from MyFloridaLicense.com and place at %s",
-                _DBPR_CSV_PATH,
-                _DBPR_CSV_PATH,
-            )
             return [
                 SignalResult(
                     "dbpr_active_licence", 0, 4, MISSING_DATA,
-                    f"DBPR CSV not found at {_DBPR_CSV_PATH}",
+                    "DBPR CSV unavailable (download failed or empty)",
                 )
             ]
 
