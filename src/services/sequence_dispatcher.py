@@ -93,6 +93,37 @@ def mark_failed(
     logger.warning("sequence_dispatcher: dispatch_id=%s FAILED reason=%s", dispatch_id, reason)
 
 
+def complete_run_with_cooling(
+    session: Session,
+    client_id: str,
+    run_id: str,
+    cooling_days: int = 30,
+) -> None:
+    """Mark a run COMPLETED and stamp a cooling_until = now + cooling_days.
+
+    Called when the final touch dispatches. The 30-day cooling window lives on
+    the run (wayfinder ticket 07), and may_enroll honours it to block premature
+    re-enrollment of the same contact. Guarded WHERE status='ACTIVE' so a
+    double-fire can't overwrite an already-completed run's timestamp."""
+    session.execute(
+        text(
+            "UPDATE sequence_runs "
+            "SET status = 'COMPLETED', completed_at = :now, "
+            "    cooling_until = :now + make_interval(days => :days), updated_at = :now "
+            "WHERE run_id = :run_id AND client_id = :client_id AND status = 'ACTIVE'"
+        ),
+        {
+            "now": datetime.now(timezone.utc),
+            "days": cooling_days,
+            "run_id": run_id,
+            "client_id": client_id,
+        },
+    )
+    logger.info(
+        "sequence_dispatcher: run_id=%s COMPLETED, cooling %dd", run_id, cooling_days,
+    )
+
+
 def find_stuck_dispatches(session: Session, older_than_minutes: int = 30) -> list:
     """Rows stuck in SENDING past the reclaim window — a worker died between
     claim and mark_sent/mark_failed. These are NOT auto-retried (ticket 22:

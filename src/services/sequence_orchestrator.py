@@ -14,16 +14,25 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from src.services.compliance_gate import evaluate_touch_gate
-from src.services.email_sender import EmailSender, StubEmailSender
+from src.services.email_sender import EmailSender, build_email_sender
 from src.services.mailbox_dispatcher import (
     AllMailboxesCapped,
     NoMailboxAvailable,
     get_active_mailbox_for_client,
 )
-from src.services.sequence_dispatcher import claim_touch, mark_failed, mark_sent
+from src.services.sequence_dispatcher import (
+    claim_touch,
+    complete_run_with_cooling,
+    mark_failed,
+    mark_sent,
+)
 from src.services.events import log_touch_dispatched
 
 logger = logging.getLogger(__name__)
+
+# Highest touch step in the sequence — dispatching it completes the run and
+# opens the 30-day cooling window (wayfinder ticket 07).
+_FINAL_TOUCH_STEP = 5
 
 
 @dataclass(frozen=True)
@@ -54,7 +63,7 @@ def dispatch_touch(
     sender: EmailSender | None = None,
 ) -> TouchResult:
     """Run compliance, pick an under-cap mailbox, claim the slot, send, resolve."""
-    sender = sender or StubEmailSender()
+    sender = sender or build_email_sender()
 
     gate = evaluate_touch_gate(session, contact, client_id)
     if not gate.ready:
@@ -114,6 +123,9 @@ def dispatch_touch(
         sending_domain=mailbox.sending_domain,
         template_version=template_version,
     )
+
+    if touch_step >= _FINAL_TOUCH_STEP and run_id:
+        complete_run_with_cooling(session, client_id, run_id)
 
     return TouchResult(
         contact_id=contact.contact_id,

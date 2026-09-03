@@ -33,12 +33,17 @@ DDL = [
         status       VARCHAR(20)  NOT NULL DEFAULT 'ACTIVE',
         enrolled_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         completed_at TIMESTAMPTZ,
+        cooling_until TIMESTAMPTZ,
         created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         updated_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         CONSTRAINT chk_sequence_runs_status
             CHECK (status IN ('ACTIVE', 'COMPLETED', 'CANCELLED'))
     )
     """,
+    # cooling_until: 30-day post-sequence cooling window, written when the final
+    # touch dispatches (wayfinder ticket 07 — cooling lives on the run). ADD
+    # COLUMN IF NOT EXISTS so this is idempotent on an already-created table.
+    "ALTER TABLE sequence_runs ADD COLUMN IF NOT EXISTS cooling_until TIMESTAMPTZ",
     # Cross-client uniqueness: one ACTIVE run per contact, globally.
     # Deliberately not filtered by client_id — see module docstring.
     """

@@ -29,6 +29,7 @@ PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
+PYTHONPATH=. python migrations/apply_mailbox_last_used.py    # adds mailboxes.last_used_at (LRU rotation) — after sending_domains
 PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
 PYTHONPATH=. python migrations/apply_sequence_runs.py       # Dev 3 — after agent_work_orders
 PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py  # Dev 3 — after sequence_runs

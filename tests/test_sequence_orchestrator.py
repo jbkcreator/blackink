@@ -132,6 +132,35 @@ def test_happy_path_sends_and_marks_sent():
     mock_log.assert_called_once()
 
 
+def test_final_touch_completes_run_with_cooling():
+    session = MagicMock()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+        patch("src.services.sequence_orchestrator.complete_run_with_cooling") as mock_cool,
+    ):
+        result = dispatch_touch(session, _contact(), "client_a", touch_step=5, run_id="run-1", sender=_Sender())
+    assert result.outcome == "SENT"
+    mock_cool.assert_called_once_with(session, "client_a", "run-1")
+
+
+def test_non_final_touch_does_not_complete_run():
+    session = MagicMock()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+        patch("src.services.sequence_orchestrator.complete_run_with_cooling") as mock_cool,
+    ):
+        dispatch_touch(session, _contact(), "client_a", touch_step=3, run_id="run-1", sender=_Sender())
+    mock_cool.assert_not_called()
+
+
 def test_send_failure_marks_failed_and_returns_send_failed():
     session = MagicMock()
     sender = _Sender(raises=RuntimeError("smtp down"))
