@@ -60,6 +60,18 @@ class County(Base):
 	state: Mapped[str] = mapped_column(String(2), nullable=False)
 
 
+class UsAreaCodeTimezone(Base):
+	"""US NANP phone area code -> IANA timezone, used to compute quiet hours
+	(9pm-8am recipient local time, Week 1 Subtask 1.2.2). Representative
+	seed set, not the full ~300-code NANP list — an area code missing here
+	fails closed (SMS withheld) rather than assumed clear."""
+
+	__tablename__ = "us_area_code_timezones"
+
+	area_code: Mapped[str] = mapped_column(String(3), primary_key=True)
+	iana_timezone: Mapped[str] = mapped_column(String(50), nullable=False)
+
+
 class Client(Base):
 	"""Tenant registry. Deny-by-default config resolution (get_client_config)
 	reads is_active/suspended_at here — see src/services/client_config.py."""
@@ -263,6 +275,11 @@ class Contact(Base):
 	last_outbound_touch_at: Mapped[Optional[datetime]] = mapped_column(
 		DateTime(timezone=True), nullable=True
 	)
+	# Week 1 Subtask 1.2.2 (Warm-Channel Waterfall) — literal field names from
+	# the master blueprint's CI-enforced predicate (§3.0.4): SMS eligibility
+	# requires inbound_sms_count > 0 OR booked_appointment_id IS NOT NULL.
+	booked_appointment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	inbound_sms_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

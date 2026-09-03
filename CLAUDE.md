@@ -20,6 +20,7 @@ uvicorn src.api.main:app --reload --port 8000
 # Migrations (idempotent scripts, no Alembic) — run in this order:
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
+PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py

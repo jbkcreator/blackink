@@ -85,6 +85,14 @@ DDL = [
 		ADD CONSTRAINT contacts_company_id_fkey
 		FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
 	""",
+	# Week 1 Subtask 1.2.2 (Warm-Channel Waterfall) retrofit — no appointments
+	# table exists yet, so booked_appointment_id is a forward-compatible
+	# marker only, no FK. Field names are literal from the master blueprint
+	# (Project Blackink — Complete Implementation Blueprint, §3.0.4's
+	# CI-enforced predicate: inbound_sms_count == 0 AND
+	# booked_appointment_id IS NULL blocks SMS eligibility).
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS booked_appointment_id VARCHAR(64)",
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS inbound_sms_count INTEGER NOT NULL DEFAULT 0",
 	"GRANT SELECT, INSERT, UPDATE ON contacts TO blackink_app",
 	"GRANT USAGE ON SEQUENCE contacts_contact_id_seq TO blackink_app",
 	# promotion_sweep.py runs as blackink_system and promotes contacts
