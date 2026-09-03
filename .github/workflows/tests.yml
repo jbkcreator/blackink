@@ -23,11 +23,21 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     env:
       DATABASE_URL: postgresql://blackink_owner:test_only_password@localhost:5432/blackink_test
       BLACKINK_APP_DB_PASSWORD: test_only_password
       BLACKINK_SYSTEM_DB_PASSWORD: test_only_password
       AKRASH_INGEST_DB_PASSWORD: test_only_password
+      REDIS_URL: redis://localhost:6379/0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
