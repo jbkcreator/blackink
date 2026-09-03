@@ -27,7 +27,11 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_CLIENT_ID = "DEMO_FRIDAY_SANDBOX"
 
-_COUNTIES = ["hillsborough_fl", "pinellas_fl", "orange_fl", "miami_dade_fl"]
+# v2 spec correction: sandbox scope narrowed from all 4 target counties to
+# Hillsborough and Pinellas only (Tasks/Updated_client spec/Week1_Tasks_Dev_
+# Split_v2.md, Subtask 4.1.1). _METRO_BY_COUNTY below is unused dead code
+# independent of this change (a pre-existing, separately-flagged minor).
+_COUNTIES = ["hillsborough_fl", "pinellas_fl"]
 _METRO_BY_COUNTY = {
     "hillsborough_fl": "Tampa",
     "pinellas_fl": "St Petersburg",

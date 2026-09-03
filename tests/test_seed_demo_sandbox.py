@@ -21,7 +21,9 @@ def test_builds_enough_companies_to_exceed_the_50_contact_requirement():
     names = [c["company_name"] for c in companies]
     assert not any(n.lower().startswith("test company") for n in names)
     assert len(set(c["domain"] for c in companies)) == len(companies)  # domain is UNIQUE in companies
-    assert all(c["county_slug"] in {"hillsborough_fl", "pinellas_fl", "orange_fl", "miami_dade_fl"} for c in companies)
+    assert all(c["county_slug"] in {"hillsborough_fl", "pinellas_fl"} for c in companies)
+    # v2 spec correction: sandbox scope narrowed from 4 counties to 2.
+    assert not any(c["county_slug"] in {"orange_fl", "miami_dade_fl"} for c in companies)
     assert all(15 <= c["door_count_est"] <= 400 for c in companies)
 
 
