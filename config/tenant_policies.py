@@ -38,6 +38,7 @@ TENANT_POLICIES = {
 	"mailboxes": {"mode": "direct", "column": "client_id"},
 	"agent_work_orders": {"mode": "direct", "column": "client_id"},
 	"sequence_runs": {"mode": "direct", "column": "client_id"},
+	"sequence_touch_dispatches": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

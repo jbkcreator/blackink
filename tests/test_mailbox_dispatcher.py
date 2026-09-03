@@ -54,17 +54,19 @@ def _session_with_mailbox(
     return session
 
 
-def _session_no_mailbox(warmed_count=0, any_count=0):
-    """Session where the JOIN finds nothing (domain quarantined or no mailboxes).
+def _session_no_mailbox(warmed_count=0, any_count=0, warmed_active_count=0):
+    """Session where the (warmed + active + under-cap) JOIN finds nothing.
 
     execute() call order:
       1. COUNT warmed mailboxes
-      2. SELECT ... JOIN → None
-      3. COUNT all mailboxes (only reached if warmed_count == 0)
+      2. SELECT ... JOIN (cap-filtered) → None
+      3. COUNT warmed + active mailboxes (ignoring cap) — distinguishes "all
+         capped" from "all quarantined"
+      4. COUNT all mailboxes (only reached if not capped and warmed_count == 0)
     """
     session = MagicMock()
-    calls = [_scalar(warmed_count), _fetchone(None)]
-    if warmed_count == 0:
+    calls = [_scalar(warmed_count), _fetchone(None), _scalar(warmed_active_count)]
+    if warmed_active_count == 0 and warmed_count == 0:
         calls.append(_scalar(any_count))
     session.execute.side_effect = calls
     return session
@@ -128,6 +130,20 @@ def test_all_mailboxes_quarantined_is_subclass_of_no_mailbox_available():
         get_active_mailbox_for_client(session, "client_a")
 
 
+def test_raises_all_mailboxes_capped_when_warmed_active_all_at_cap():
+    """Warmed, un-quarantined mailboxes exist but all at 24h cap → AllMailboxesCapped."""
+    from src.services.mailbox_dispatcher import AllMailboxesCapped
+    session = _session_no_mailbox(warmed_count=2, warmed_active_count=2)
+    with pytest.raises(AllMailboxesCapped):
+        get_active_mailbox_for_client(session, "client_a")
+
+
+def test_all_mailboxes_capped_is_subclass_of_no_mailbox_available():
+    session = _session_no_mailbox(warmed_count=2, warmed_active_count=2)
+    with pytest.raises(NoMailboxAvailable):
+        get_active_mailbox_for_client(session, "client_a")
+
+
 def test_raises_no_warmed_mailbox_when_unwarmed_mailboxes_exist():
     """Mailboxes provisioned but none warmed → specific error."""
     session = _session_no_mailbox(warmed_count=0, any_count=3)
@@ -145,9 +161,10 @@ def test_no_update_when_no_mailbox():
     session = _session_no_mailbox(warmed_count=0, any_count=0)
     with pytest.raises(NoMailboxAvailable):
         get_active_mailbox_for_client(session, "client_a")
+    # Match the real last_used_at write, not the SELECT's "FOR UPDATE" clause.
     update_calls = [
         c for c in session.execute.call_args_list
-        if "UPDATE" in str(c[0][0]).upper()
+        if "SET LAST_USED_AT" in str(c[0][0]).upper()
     ]
     assert len(update_calls) == 0
 

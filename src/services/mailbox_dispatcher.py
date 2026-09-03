@@ -40,6 +40,15 @@ class AllMailboxesQuarantined(NoMailboxAvailable):
     deliverability_sentinel should promote a reserve domain shortly."""
 
 
+class AllMailboxesCapped(NoMailboxAvailable):
+    """Warmed, un-quarantined mailboxes exist but every one has hit its
+    rolling-24h send cap. Not a failure — the caller should DEFER the touch
+    (push due_at forward), not dead-letter it (wayfinder ticket 08)."""
+
+
+DEFAULT_DAILY_SEND_CAP = 50
+
+
 @dataclass(frozen=True)
 class MailboxAssignment:
     mailbox_id: int
@@ -52,17 +61,24 @@ class MailboxAssignment:
 def get_active_mailbox_for_client(
     session: Session,
     client_id: str,
+    daily_send_cap: int = DEFAULT_DAILY_SEND_CAP,
 ) -> MailboxAssignment:
-    """Pick the least-recently-used warmed+active mailbox for this client.
+    """Pick the least-recently-used warmed+active+under-cap mailbox for this client.
 
     Joins sending_domains to enforce domain-level quarantine — the sentinel
     quarantines sending_domains rows, not mailboxes rows directly, so checking
     only mailboxes.quarantine_state misses a quarantined domain entirely.
 
+    The rolling-24h send cap is enforced HERE, inside the picker, so a capped
+    mailbox is never handed out and last_used_at is never bumped for a mailbox
+    that can't send (wayfinder ticket 08). Sends are counted against
+    sequence_touch_dispatches (SENDING + SENT rows in the last 24h).
+
     Uses SELECT FOR UPDATE SKIP LOCKED so concurrent dispatch workers never
     double-pick the same mailbox. Updates last_used_at in the same transaction.
 
     Raises:
+        AllMailboxesCapped: warmed, un-quarantined mailboxes exist but all are at cap.
         AllMailboxesQuarantined: warmed mailboxes exist but all domains are quarantined.
         NoWarmedMailbox: no mailbox has completed warmup yet.
         NoMailboxAvailable: no mailboxes provisioned at all.
@@ -77,6 +93,9 @@ def get_active_mailbox_for_client(
         {"client_id": client_id},
     ).scalar() or 0
 
+    # Per-mailbox rolling-24h send count is a correlated subquery so the cap
+    # filter is part of the same atomic pick — no capped mailbox is selected,
+    # and its last_used_at is left untouched (keeps LRU rotation honest).
     row = session.execute(
         text(
             "SELECT m.id, m.mailbox_address, m.instantly_account_email, m.client_id, sd.domain "
@@ -85,14 +104,42 @@ def get_active_mailbox_for_client(
             "WHERE m.client_id = :client_id "
             "  AND m.warmup_status = 'warmed' "
             "  AND sd.quarantine_state = 'active' "
+            "  AND ( "
+            "    SELECT COUNT(*) FROM sequence_touch_dispatches d "
+            "    WHERE d.mailbox_id = m.id "
+            "      AND d.status IN ('SENDING', 'SENT') "
+            "      AND d.created_at >= NOW() - INTERVAL '24 hours' "
+            "  ) < :cap "
             "ORDER BY m.last_used_at ASC NULLS FIRST "
             "LIMIT 1 "
             "FOR UPDATE OF m SKIP LOCKED"
         ),
-        {"client_id": client_id},
+        {"client_id": client_id, "cap": daily_send_cap},
     ).fetchone()
 
     if row is None:
+        # Distinguish "all capped" from "all quarantined" from "none warmed":
+        # count warmed + un-quarantined mailboxes regardless of cap. If any
+        # exist, the picker only skipped them because they were all at cap.
+        warmed_active_count = session.execute(
+            text(
+                "SELECT COUNT(*) FROM mailboxes m "
+                "JOIN sending_domains sd ON sd.id = m.domain_id "
+                "WHERE m.client_id = :client_id "
+                "  AND m.warmup_status = 'warmed' "
+                "  AND sd.quarantine_state = 'active'"
+            ),
+            {"client_id": client_id},
+        ).scalar() or 0
+        if warmed_active_count > 0:
+            logger.warning(
+                "mailbox_dispatcher: %d warmed/active mailbox(es) for client_id=%s but all at 24h cap=%d",
+                warmed_active_count, client_id, daily_send_cap,
+            )
+            raise AllMailboxesCapped(
+                f"{warmed_active_count} warmed/active mailbox(es) for client_id={client_id} "
+                f"but all have hit the rolling-24h send cap of {daily_send_cap}. Defer the touch."
+            )
         if warmed_count > 0:
             logger.error(
                 "mailbox_dispatcher: %d warmed mailbox(es) for client_id=%s but all domains quarantined",

@@ -194,6 +194,18 @@ def cmd_sweep(client_id: str) -> int:
 			failed += 1
 			continue
 
+		if receipt.get("defer"):
+			from datetime import timedelta
+			until = datetime.now(timezone.utc) + timedelta(hours=1)
+			deferred_row = wo.defer_execution(claimed.client_id, claimed.action_id, until=until)
+			if deferred_row is None:
+				_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT during defer — alert #blackink-qa")
+				failed += 1
+			else:
+				_line(f"action_id={claimed.action_id} DEFERRED (mailboxes at 24h cap) -> SNOOZED until {until.isoformat()}")
+				deferred += 1
+			continue
+
 		finalised = wo.record_execution_result(claimed.client_id, claimed.action_id, success=True, receipt=receipt)
 		if finalised is None:
 			# None means row was reclaimed mid-flight — alert #blackink-qa
