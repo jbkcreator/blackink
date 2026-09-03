@@ -41,10 +41,20 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"outbound_touch_dispatched": frozenset(
 		{"touch_step", "channel", "recipient_email", "template_version", "sending_domain", "mailbox_id"}
 	),
-	"ghost_shopper_audit": frozenset({"ghost_shopper_submitted_at", "target_domain"}),
+	"owner_score_generated": frozenset(
+		{"score_total", "county", "data_coverage_pct", "county_rank"}
+	),
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	# ghost_shopper_audit is deliberately ABSENT: the client spec update
+	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
+	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is
+	# permanently deferred, replaced by owner_score_generated above — not
+	# "on hold", genuinely never coming back. A registry entry for an
+	# event type nothing will ever emit is dead config, same reasoning as
+	# the rentbot_* entries below.
+	#
 	# The rentbot_* event types (rentbot_address_received, rentbot_fallback_used,
 	# rentbot_demo_optin, rentbot_keyword_received) are deliberately ABSENT:
 	# the Rent Analysis Bot is deferred to Q1 by client instruction, so nothing

@@ -4,13 +4,31 @@ from unittest.mock import MagicMock, patch
 from src.services.events import log_event, MalformedEventError, REQUIRED_PAYLOAD_FIELDS
 
 
-def test_required_fields_registry_has_outbound_touch_and_ghost_shopper():
+def test_required_fields_registry_has_outbound_touch_and_owner_score():
 	assert REQUIRED_PAYLOAD_FIELDS["outbound_touch_dispatched"] == frozenset(
 		{"touch_step", "channel", "recipient_email", "template_version", "sending_domain", "mailbox_id"}
 	)
-	assert REQUIRED_PAYLOAD_FIELDS["ghost_shopper_audit"] == frozenset(
-		{"ghost_shopper_submitted_at", "target_domain"}
+	assert REQUIRED_PAYLOAD_FIELDS["owner_score_generated"] == frozenset(
+		{"score_total", "county", "data_coverage_pct", "county_rank"}
 	)
+
+
+def test_ghost_shopper_audit_is_not_in_the_registry():
+	"""Ghost-Shopper is permanently deferred, replaced by the Owner
+	Visibility Score engine (v2 blueprint §3.1.3) — a live registry entry
+	for an event type nothing will ever emit again is dead config."""
+	assert "ghost_shopper_audit" not in REQUIRED_PAYLOAD_FIELDS
+
+
+def test_log_event_raises_on_missing_owner_score_field():
+	with pytest.raises(MalformedEventError):
+		log_event(
+			"acme_pm",
+			"owner_score_generated",
+			entity_type="company",
+			entity_id="c1",
+			payload={"score_total": 82, "county": "hillsborough_fl", "data_coverage_pct": 91},  # missing county_rank
+		)
 
 
 def test_log_event_raises_on_missing_required_field():
