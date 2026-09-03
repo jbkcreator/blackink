@@ -22,6 +22,7 @@ PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
+PYTHONPATH=. python migrations/apply_relay_halts.py   # Dev 2 — not tenant-bearing, any time after clients
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py
 PYTHONPATH=. python migrations/apply_pm_profiles.py
@@ -32,6 +33,7 @@ PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
 PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
+PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -39,6 +41,7 @@ PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
+python -m src.tasks.hunter_nightly_sweep
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most

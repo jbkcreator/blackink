@@ -43,6 +43,7 @@ TENANT_POLICIES = {
 	"sms_dispatch_log": {"mode": "direct", "column": "client_id"},
 	"sending_domains": {"mode": "direct", "column": "client_id"},
 	"mailboxes": {"mode": "direct", "column": "client_id"},
+	"agent_work_orders": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

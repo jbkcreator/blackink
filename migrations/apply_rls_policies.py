@@ -13,7 +13,7 @@ docs/adr/0001-tenant-isolation-rls-plus-app-layer.md and the Dev 1 plan's
 Run LAST, after every tenant table exists (migrations 1-10 must already
 be applied). Safely re-runnable: DROP POLICY IF EXISTS then recreate.
 
-The verification step at the end queries pg_tables/pg_policies and FAILS
+The verification step at the end queries pg_class/pg_policies and FAILS
 LOUDLY if any table registered in TENANT_POLICIES lacks
 rowsecurity=true AND forcerowsecurity=true — this is what closes the exact
 gap that let Forced Action ship with zero enforcement silently: a new
@@ -63,6 +63,29 @@ def _policy_sql(table: str, policy: dict) -> str:
 
 def main() -> int:
 	with get_owner_db_context() as db:
+		# ── Preflight: every registered table must actually exist ───────────
+		# This script is documented to run LAST, so a table in TENANT_POLICIES
+		# with no table in the DB means its own migration was never run —
+		# in practice, a CI workflow or runbook whose migration list drifted
+		# behind the registry (config/tenant_policies.py's docstring calls out
+		# that there is no automatic net for this). Without this check the
+		# first ALTER TABLE just raises psycopg2 UndefinedTable, which reads
+		# like a broken schema rather than a missing step, and names only the
+		# first offender.
+		missing = [
+			t for t in TENANT_POLICIES
+			if not db.execute(text("SELECT to_regclass(:qualified)"), {"qualified": f"public.{t}"}).scalar()
+		]
+		if missing:
+			print(
+				"apply_rls_policies: ABORTED — these tables are registered in "
+				f"config/tenant_policies.py but do not exist: {missing}.\n"
+				"Run their migrations first (see CLAUDE.md's migration order). "
+				"No RLS policy was applied, so nothing is half-enforced.",
+				file=sys.stderr,
+			)
+			return 1
+
 		for table, policy in TENANT_POLICIES.items():
 			t = _quote_ident(table)
 			db.execute(text(f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"))
@@ -78,9 +101,11 @@ def main() -> int:
 		# columns come from one consistent source.
 		rows = db.execute(
 			text(
-				"SELECT c.relname AS tablename, c.relrowsecurity AS rowsecurity, "
-				"c.relforcerowsecurity AS forcerowsecurity "
-				"FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+				"SELECT c.relname AS tablename, "
+				"       c.relrowsecurity AS rowsecurity, "
+				"       c.relforcerowsecurity AS forcerowsecurity "
+				"FROM pg_class c "
+				"JOIN pg_namespace n ON n.oid = c.relnamespace "
 				"WHERE n.nspname = 'public' AND c.relname = ANY(:tables)"
 			),
 			{"tables": list(TENANT_POLICIES.keys())},
