@@ -29,6 +29,11 @@ class SendResult:
     message_id: str
 
 
+# An attachment is (filename, content_bytes, mime_type) e.g.
+# ("owner_visibility_score.pdf", b"...", "application/pdf").
+Attachment = tuple[str, bytes, str]
+
+
 class EmailSender(Protocol):
     def send(
         self,
@@ -39,6 +44,7 @@ class EmailSender(Protocol):
         body: str,
         sending_domain: str,
         in_reply_to: Optional[str] = None,
+        attachments: Optional[list[Attachment]] = None,
     ) -> SendResult: ...
 
 
@@ -54,12 +60,14 @@ class StubEmailSender:
         body: str,
         sending_domain: str,
         in_reply_to: Optional[str] = None,
+        attachments: Optional[list[Attachment]] = None,
     ) -> SendResult:
         message_id = make_msgid(domain=sending_domain)
         logger.info(
             "STUB email send from=%s to=%s domain=%s in_reply_to=%s message_id=%s "
-            "(no vendor contracted — nothing transmitted)",
+            "attachments=%s (no vendor contracted — nothing transmitted)",
             from_address, to_address, sending_domain, in_reply_to, message_id,
+            [a[0] for a in (attachments or [])],
         )
         return SendResult(message_id=message_id)
 
@@ -102,6 +110,7 @@ class SmtpEmailSender:
         body: str,
         sending_domain: str,
         in_reply_to: Optional[str] = None,
+        attachments: Optional[list[Attachment]] = None,
     ) -> SendResult:
         message_id = make_msgid(domain=sending_domain)
         login = self._username or from_address
@@ -120,6 +129,9 @@ class SmtpEmailSender:
         if self._bcc:
             rcpts.append(self._bcc)
         msg.set_content(body)
+        for filename, content, mime in (attachments or []):
+            maintype, _, subtype = mime.partition("/")
+            msg.add_attachment(content, maintype=maintype, subtype=subtype or "octet-stream", filename=filename)
 
         with smtplib.SMTP(self._host, self._port, timeout=self._timeout) as smtp:
             if self._use_tls:

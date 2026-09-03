@@ -27,6 +27,19 @@ Usage (run in order):
 
 Shortcut for the non-Slack path (skip the human click by approving in SQL):
   PYTHONPATH=. python scripts/e2e_approval_gate.py approve-sql
+
+REAL DELIVERY (--real): append --real to any command to swap the fake .test
+sender/recipient for a Mandrill-verified sending domain and a real inbox, and
+to load SMTP creds from .env.test so build_email_sender() returns the real
+SmtpEmailSender. Runs under an ISOLATED client_id (_e2e_real) so it never
+mingles with the stub-mode rows. `execute --real` refuses to run unless SMTP
+is actually configured, so it can never silently stub-send while claiming SENT.
+  PYTHONPATH=. python scripts/e2e_approval_gate.py seed --real
+  PYTHONPATH=. python scripts/e2e_approval_gate.py enroll --real
+  PYTHONPATH=. python scripts/e2e_approval_gate.py approve-sql --real   # or post-cards + real click
+  PYTHONPATH=. python scripts/e2e_approval_gate.py execute --real       # delivers to lesly.vj@heu.ai
+  PYTHONPATH=. python scripts/e2e_approval_gate.py verify --real
+  PYTHONPATH=. python scripts/e2e_approval_gate.py teardown --real
 """
 
 import sys
@@ -34,17 +47,56 @@ import sys
 sys.path.insert(0, ".")
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+# --real must be detected and .env.test loaded BEFORE any import that builds
+# the @lru_cache'd settings singleton (config.settings runs get_settings() at
+# import time). Loading the dotenv here means get_settings() caches the Mandrill
+# SMTP creds from the first build; doing it later would be too late.
+_REAL = "--real" in sys.argv[1:]
+if _REAL:
+    from dotenv import load_dotenv
+
+    load_dotenv(".env.test", override=True)  # override any pre-existing .env / shell vars
+
 from sqlalchemy import text
 
 from src.core.database import get_db_context, get_owner_db_context, get_system_db_context
 from src.loaders.base import BaseIngestLoader
 
-_CLIENT_ID = "_e2e_approval"
+# ── Mode constants ────────────────────────────────────────────────────────────
+# Stub mode (default): fake .test addresses, no real delivery. Real mode
+# (--real): a Mandrill-verified sending domain + a real inbox, under a distinct
+# client_id + prospect domain so real-mode rows never collide with stub-mode
+# rows (company_id is sha256(domain)).
 _COUNTY = "hillsborough_fl"
-_DOMAIN = "acme-e2e.test"                # prospect company domain
-_SENDING_DOMAIN = "outreach-e2e.test"    # our warmed sending domain
-_MAILBOX = "rep@outreach-e2e.test"
-_CONTACT_EMAIL = "owner@acme-e2e.test"
+if _REAL:
+    _CLIENT_ID = "_e2e_real"
+    _DOMAIN = "acme-real.test"                    # distinct company_id vs stub mode
+    _SENDING_DOMAIN = "forcedactionleads.com"     # Mandrill-verified sending domain
+    _MAILBOX = "noreply@forcedactionleads.com"    # From address
+    _CONTACT_EMAIL = "lesly.vj@heu.ai"            # real inbox that receives the test send
+else:
+    _CLIENT_ID = "_e2e_approval"
+    _DOMAIN = "acme-e2e.test"                # prospect company domain
+    _SENDING_DOMAIN = "outreach-e2e.test"    # our warmed sending domain
+    _MAILBOX = "rep@outreach-e2e.test"
+    _CONTACT_EMAIL = "owner@acme-e2e.test"
+
+
+def _assert_smtp_configured() -> None:
+    """Abort a real-mode execute if SMTP isn't actually wired, so we never mark
+    a dispatch SENT off the stub sender while pretending it was delivered."""
+    from config.settings import get_settings
+
+    s = get_settings()
+    if not (s.smtp_host and s.smtp_password):
+        print(
+            "ERROR: --real execute but SMTP is not configured (SMTP_HOST / "
+            "SMTP_PASSWORD unset). build_email_sender() would return the stub "
+            "and transmit nothing. Check .env.test key names are SMTP_USERNAME / "
+            "SMTP_PASSWORD (not USER/PASS)."
+        )
+        raise SystemExit(3)
+    print(f"real-mode SMTP: host={s.smtp_host} username={s.smtp_username} → sending as {_MAILBOX}")
 
 
 def seed() -> int:
@@ -140,6 +192,8 @@ def approve_sql() -> int:
 
 
 def execute() -> int:
+    if _REAL:
+        _assert_smtp_configured()
     from src.services.work_orders.__main__ import cmd_sweep
     return cmd_sweep(_CLIENT_ID)
 
@@ -196,10 +250,13 @@ _CMDS = {
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in _CMDS:
-        print("usage: e2e_approval_gate.py {" + "|".join(_CMDS) + "}")
+    # --real is handled at import time (see top of module); here we only pick
+    # the command out of the positional args.
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(positional) != 1 or positional[0] not in _CMDS:
+        print("usage: e2e_approval_gate.py {" + "|".join(_CMDS) + "} [--real]")
         return 2
-    return _CMDS[sys.argv[1]]()
+    return _CMDS[positional[0]]()
 
 
 if __name__ == "__main__":
