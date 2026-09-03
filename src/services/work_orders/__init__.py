@@ -373,6 +373,28 @@ def approved_batch(client_id: Optional[str] = None, *, limit: int = 50) -> list:
 	return [_row_to_order(dict(r)) for r in rows]
 
 
+def due_batch(client_id: Optional[str] = None, *, limit: int = 50) -> list:
+	"""QUEUED rows whose due_at has arrived, oldest first — what the sequencer's
+	timer loop reads to trigger scheduled touches. client_id=None aggregates
+	across all tenants via get_system_db_context() — batch-only, never src/api/."""
+	now = datetime.now(timezone.utc)
+	where = ["status = 'QUEUED'", "due_at IS NOT NULL", "due_at <= :now"]
+	params: dict = {"now": now, "limit": limit}
+	if client_id is not None:
+		where.append("client_id = :client_id")
+		params["client_id"] = client_id
+
+	sql = f"SELECT {_COLUMNS_SQL} FROM agent_work_orders WHERE {' AND '.join(where)} ORDER BY due_at ASC LIMIT :limit"
+
+	if client_id is not None:
+		with get_db_context(client_id=client_id) as session:
+			rows = session.execute(text(sql), params).mappings().all()
+	else:
+		with get_system_db_context() as session:
+			rows = session.execute(text(sql), params).mappings().all()
+	return [_row_to_order(dict(r)) for r in rows]
+
+
 def requeue_due_snoozed(client_id: str) -> list:
 	"""SNOOZED rows whose due_at has passed -> QUEUED, so a snooze actually
 	expires. Returns the revived orders (callers re-post their cards).
