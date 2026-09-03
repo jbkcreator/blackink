@@ -49,27 +49,20 @@ _OWNER_PAGE_SLUGS = ["/owner", "/landlord", "/property-owner", "/for-owners", "/
 def _fetch(url: str) -> tuple[requests.Response | None, bool]:
     """Return (response, ssl_ok). ssl_ok=False means we fell back to non-TLS."""
     headers = {"User-Agent": "BlackInkBot/1.0 (property-management research)"}
+
+    def _get(target: str) -> requests.Response:
+        # max_redirects is a Session attribute, not a kwarg on requests.get().
+        s = requests.Session()
+        s.max_redirects = _MAX_REDIRECTS
+        return s.get(target, timeout=_REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
+
     try:
-        resp = requests.get(
-            url,
-            timeout=_REQUEST_TIMEOUT,
-            allow_redirects=True,
-            max_redirects=_MAX_REDIRECTS,
-            headers=headers,
-        )
-        return resp, True
+        return _get(url), True
     except requests.exceptions.SSLError:
         # Try without TLS so other signals can still be evaluated.
         http_url = url.replace("https://", "http://", 1)
         try:
-            resp = requests.get(
-                http_url,
-                timeout=_REQUEST_TIMEOUT,
-                allow_redirects=True,
-                max_redirects=_MAX_REDIRECTS,
-                headers=headers,
-            )
-            return resp, False
+            return _get(http_url), False
         except requests.RequestException:
             return None, False
     except requests.RequestException:
