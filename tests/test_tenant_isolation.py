@@ -685,9 +685,15 @@ def test_dispatch_sms_application_layer_blocks_cold_contact_before_provider_call
 		_cleanup_cold_sms_events(contact_id)
 
 
-def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(canary_tenants):
+def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(canary_tenants, monkeypatch):
 	"""DoD: a legitimately consented contact successfully passes all three
 	layers and reaches the (stubbed) Twilio call."""
+	import src.services.campaign_readiness_gate as gate_module
+
+	# Otherwise this test's pass/fail depends on the real wall-clock hour in
+	# America/New_York (813 area code) when CI happens to run it — it must
+	# not go quiet-hours-withheld just because CI ran at 2am Eastern.
+	monkeypatch.setattr(gate_module, "_local_hour", lambda tz_name: 14)  # 2pm — outside quiet hours
 	contact_id = canary_tenants[CANARY_B]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
@@ -728,11 +734,16 @@ def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(can
 		_cleanup_cold_sms_events(contact_id)
 
 
-def test_dispatch_sms_writes_a_unique_idempotency_key_before_sending(canary_tenants):
+def test_dispatch_sms_writes_a_unique_idempotency_key_before_sending(canary_tenants, monkeypatch):
 	"""PR #10 review fixup: the PENDING outbox row (and its idempotency_key)
 	must exist and be committed independently of the SENT row's own
 	transaction — proven end to end here against a real Postgres, not just
 	the mocked open_outbox_session unit tests in test_sms_dispatch.py."""
+	import src.services.campaign_readiness_gate as gate_module
+
+	# See test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider
+	# above for why this must not depend on the real wall-clock hour.
+	monkeypatch.setattr(gate_module, "_local_hour", lambda tz_name: 14)  # 2pm — outside quiet hours
 	contact_id = canary_tenants[CANARY_A]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
