@@ -554,14 +554,18 @@ class SmsDispatchLog(Base):
 	booked_appointment_id_at_send: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 	status: Mapped[str] = mapped_column(String(20), nullable=False, default="SENT")
 	provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 	__table_args__ = (
-		CheckConstraint("status IN ('SENT','BLOCKED')", name="ck_sms_dispatch_log_status"),
+		CheckConstraint(
+			"status IN ('PENDING','SENT','FAILED','BLOCKED','UNKNOWN')", name="ck_sms_dispatch_log_status"
+		),
 		CheckConstraint(
 			"inbound_sms_count_at_send > 0 OR booked_appointment_id_at_send IS NOT NULL",
 			name="ck_sms_dispatch_log_not_cold",
 		),
+		UniqueConstraint("client_id", "idempotency_key", name="uq_sms_dispatch_log_client_idempotency_key"),
 	)
 
 

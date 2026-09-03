@@ -22,7 +22,12 @@ import pytest
 
 import src.services.sms_dispatch as sms_dispatch_module
 from src.services.campaign_readiness_gate import FullReadinessResult
-from src.services.sms_dispatch import ColdSMSBlockedError, SmsProvider, dispatch_sms
+from src.services.sms_dispatch import (
+    ColdSMSBlockedError,
+    SmsDispatchNeedsReconciliationError,
+    SmsProvider,
+    dispatch_sms,
+)
 
 
 class _CountingSmsProvider(SmsProvider):
@@ -30,8 +35,8 @@ class _CountingSmsProvider(SmsProvider):
         self.calls = []
         self._raise_error = raise_error
 
-    def send(self, phone, message):
-        self.calls.append((phone, message))
+    def send(self, phone, message, idempotency_key):
+        self.calls.append((phone, message, idempotency_key))
         if self._raise_error:
             raise self._raise_error
         return "stub-message-id"
@@ -45,21 +50,41 @@ class _FakeResult:
     def one(self):
         return self._row
 
+    def one_or_none(self):
+        return self._row
+
     def scalar(self):
         return self._scalar
 
 
+_NO_DISPATCH_ROWS = object()
+
+
 class _FakeSession:
     """The caller-supplied `session` — dispatch_sms only touches it for the
-    post-readiness SELECT phone/inbound_sms_count/booked_appointment_id,
-    since evaluate_full_readiness() itself is monkeypatched below."""
+    optional pre-dispatch idempotency-key lookup(s) (routed by SELECTing
+    from sms_dispatch_log) and the post-readiness SELECT phone/
+    inbound_sms_count/booked_appointment_id from contacts, since
+    evaluate_full_readiness() itself is monkeypatched below.
 
-    def __init__(self, contact_row):
+    `existing_dispatch_rows` scripts each successive sms_dispatch_log
+    lookup dispatch_sms() makes — the initial idempotency check, and (on
+    the ON CONFLICT race path) the re-check after a losing INSERT. A bare
+    (non-list) value is treated as the single row returned to every such
+    lookup."""
+
+    def __init__(self, contact_row, existing_dispatch_rows=_NO_DISPATCH_ROWS):
         self._contact_row = contact_row
+        if existing_dispatch_rows is _NO_DISPATCH_ROWS or isinstance(existing_dispatch_rows, list):
+            self._dispatch_rows = existing_dispatch_rows
+        else:
+            self._dispatch_rows = [existing_dispatch_rows]
         self.executed = []
 
     def execute(self, stmt, params=None):
         self.executed.append((str(stmt), params))
+        if self._dispatch_rows is not _NO_DISPATCH_ROWS and "sms_dispatch_log" in str(stmt) and "SELECT" in str(stmt):
+            return _FakeResult(row=self._dispatch_rows.pop(0))
         return _FakeResult(row=self._contact_row)
 
 
@@ -265,9 +290,9 @@ def test_pending_row_committed_before_provider_is_called(monkeypatch):
             return super().__exit__(exc_type, exc, tb)
 
     class _OrderTrackingProvider(_CountingSmsProvider):
-        def send(self, phone, message):
+        def send(self, phone, message, idempotency_key):
             order.append("provider_send")
-            return super().send(phone, message)
+            return super().send(phone, message, idempotency_key)
 
     session = _FakeSession(_engaged_contact())
     provider = _OrderTrackingProvider()
@@ -360,15 +385,20 @@ def test_commit_failure_after_provider_acceptance_propagates_without_retry(monke
     )
 
 
-def test_provider_failure_marks_dispatch_failed_and_reraises(monkeypatch):
+def test_provider_failure_marks_dispatch_unknown_and_reraises(monkeypatch):
+    """A provider-call exception means the delivery outcome is genuinely
+    unknown (did the carrier accept it before the connection dropped?), not
+    a known-failed send — must land on UNKNOWN, not FAILED, so a retry with
+    the same idempotency_key is routed through reconciliation instead of
+    being treated as safe to blindly resend (PR #10 2nd review fixup)."""
     monkeypatch.setattr(
         sms_dispatch_module, "evaluate_full_readiness", lambda *a, **k: _eligible_result()
     )
     session = _FakeSession(_engaged_contact())
     provider = _CountingSmsProvider(raise_error=ConnectionError("provider unreachable"))
-    failed_session = _FakeOutboxSession()
+    unknown_session = _FakeOutboxSession()
     outbox = _ScriptedOutboxFactory(
-        [_FakeOutboxCM(_FakeOutboxSession(insert_returns=5)), _FakeOutboxCM(failed_session)]
+        [_FakeOutboxCM(_FakeOutboxSession(insert_returns=5)), _FakeOutboxCM(unknown_session)]
     )
 
     with pytest.raises(ConnectionError, match="provider unreachable"):
@@ -376,7 +406,8 @@ def test_provider_failure_marks_dispatch_failed_and_reraises(monkeypatch):
             session, contact_id=1, client_id="client_a", message="hi", sms_provider=provider, open_outbox_session=outbox
         )
 
-    assert any("'FAILED'" in stmt for stmt, _ in failed_session.executed)
+    assert any("'UNKNOWN'" in stmt for stmt, _ in unknown_session.executed)
+    assert not any("'FAILED'" in stmt for stmt, _ in unknown_session.executed)
 
 
 def test_engaged_and_compliant_contact_dispatches_and_writes_sent_status(monkeypatch):
@@ -395,9 +426,135 @@ def test_engaged_and_compliant_contact_dispatches_and_writes_sent_status(monkeyp
     )
 
     assert message_id == "stub-message-id"
-    assert provider.calls == [("+15551234567", "reminder")]
+    assert len(provider.calls) == 1
+    phone, sent_message, provider_key = provider.calls[0]
+    assert (phone, sent_message) == ("+15551234567", "reminder")
+    assert provider_key
     update_stmt, update_params = next(
         (stmt, params) for stmt, params in sent_session.executed if "SENT" in stmt
     )
     assert update_params["provider_message_id"] == "stub-message-id"
     assert update_params["dispatch_id"] == 1
+
+
+# ── 2nd PR #10 review fixup: idempotency-key reuse across retries ──
+
+
+def test_retry_with_sent_idempotency_key_returns_prior_result_without_calling_provider(monkeypatch):
+    monkeypatch.setattr(
+        sms_dispatch_module, "evaluate_full_readiness", lambda *a, **k: _eligible_result()
+    )
+    session = _FakeSession(
+        _engaged_contact(), existing_dispatch_rows=SimpleNamespace(status="SENT", provider_message_id="prior-id")
+    )
+    provider = _CountingSmsProvider()
+
+    message_id = dispatch_sms(
+        session,
+        contact_id=1,
+        client_id="client_a",
+        message="hi",
+        sms_provider=provider,
+        idempotency_key="stable-key-1",
+    )
+
+    assert message_id == "prior-id"
+    assert provider.calls == []
+
+
+@pytest.mark.parametrize("status", ["PENDING", "UNKNOWN"])
+def test_retry_with_unresolved_idempotency_key_raises_reconciliation_error(monkeypatch, status):
+    monkeypatch.setattr(
+        sms_dispatch_module, "evaluate_full_readiness", lambda *a, **k: _eligible_result()
+    )
+    session = _FakeSession(
+        _engaged_contact(), existing_dispatch_rows=SimpleNamespace(status=status, provider_message_id=None)
+    )
+    provider = _CountingSmsProvider()
+
+    with pytest.raises(SmsDispatchNeedsReconciliationError):
+        dispatch_sms(
+            session,
+            contact_id=1,
+            client_id="client_a",
+            message="hi",
+            sms_provider=provider,
+            idempotency_key="stable-key-1",
+        )
+
+    assert provider.calls == []
+
+
+def test_retry_with_failed_idempotency_key_is_safe_to_redispatch(monkeypatch):
+    monkeypatch.setattr(
+        sms_dispatch_module, "evaluate_full_readiness", lambda *a, **k: _eligible_result()
+    )
+    session = _FakeSession(
+        _engaged_contact(), existing_dispatch_rows=SimpleNamespace(status="FAILED", provider_message_id=None)
+    )
+    provider = _CountingSmsProvider()
+    outbox = _ScriptedOutboxFactory(
+        [_FakeOutboxCM(_FakeOutboxSession(insert_returns=8)), _FakeOutboxCM(_FakeOutboxSession())]
+    )
+
+    message_id = dispatch_sms(
+        session,
+        contact_id=1,
+        client_id="client_a",
+        message="hi",
+        sms_provider=provider,
+        open_outbox_session=outbox,
+        idempotency_key="stable-key-1",
+    )
+
+    assert message_id == "stub-message-id"
+    assert len(provider.calls) == 1
+    assert provider.calls[0][2] == "stable-key-1"
+
+
+def test_new_idempotency_key_passes_through_to_the_provider(monkeypatch):
+    monkeypatch.setattr(
+        sms_dispatch_module, "evaluate_full_readiness", lambda *a, **k: _eligible_result()
+    )
+    session = _FakeSession(_engaged_contact(), existing_dispatch_rows=[None])
+    provider = _CountingSmsProvider()
+    outbox = _ScriptedOutboxFactory(
+        [_FakeOutboxCM(_FakeOutboxSession(insert_returns=9)), _FakeOutboxCM(_FakeOutboxSession())]
+    )
+
+    dispatch_sms(
+        session,
+        contact_id=1,
+        client_id="client_a",
+        message="hi",
+        sms_provider=provider,
+        open_outbox_session=outbox,
+        idempotency_key="caller-supplied-key",
+    )
+
+    assert provider.calls[0][2] == "caller-supplied-key"
+
+
+def test_conflicting_insert_raises_reconciliation_error_instead_of_redispatching(monkeypatch):
+    """A concurrent call already inserted this exact idempotency_key between
+    our lookup and our INSERT (the ON CONFLICT DO NOTHING race) — must not
+    silently proceed to call the provider a second time."""
+    monkeypatch.setattr(
+        sms_dispatch_module, "evaluate_full_readiness", lambda *a, **k: _eligible_result()
+    )
+    session = _FakeSession(_engaged_contact(), existing_dispatch_rows=[None, None])
+    provider = _CountingSmsProvider()
+    outbox = _ScriptedOutboxFactory([_FakeOutboxCM(_FakeOutboxSession(insert_returns=None))])
+
+    with pytest.raises(SmsDispatchNeedsReconciliationError):
+        dispatch_sms(
+            session,
+            contact_id=1,
+            client_id="client_a",
+            message="hi",
+            sms_provider=provider,
+            open_outbox_session=outbox,
+            idempotency_key="racing-key",
+        )
+
+    assert provider.calls == []

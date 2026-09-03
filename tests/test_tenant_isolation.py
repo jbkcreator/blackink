@@ -28,7 +28,12 @@ from config.tenant_policies import TENANT_POLICIES
 from src.core.database import Database, get_db_context, get_owner_db_context, get_system_db_context
 from src.services.campaign_readiness_gate import evaluate_full_readiness
 from src.services.compliance_gate import DncProvider
-from src.services.sms_dispatch import ColdSMSBlockedError, SmsProvider, dispatch_sms
+from src.services.sms_dispatch import (
+	ColdSMSBlockedError,
+	SmsDispatchNeedsReconciliationError,
+	SmsProvider,
+	dispatch_sms,
+)
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
 
 
@@ -36,8 +41,8 @@ class _CountingSmsProvider(SmsProvider):
 	def __init__(self):
 		self.calls = []
 
-	def send(self, phone, message):
-		self.calls.append((phone, message))
+	def send(self, phone, message, idempotency_key):
+		self.calls.append((phone, message, idempotency_key))
 		return "stub-message-id"
 
 
@@ -726,7 +731,8 @@ def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(can
 				{"cid": contact_id},
 			).first()
 		assert message_id == "stub-message-id"
-		assert provider.calls == [("+18135550100", "your appointment is confirmed")]
+		assert len(provider.calls) == 1
+		assert provider.calls[0][:2] == ("+18135550100", "your appointment is confirmed")
 		assert log_row is not None, "sms_dispatch_log row not written for a successful send"
 		assert log_row.status == "SENT"
 		assert log_row.provider_message_id == "stub-message-id"
@@ -831,5 +837,91 @@ def test_dispatch_sms_blocked_audit_event_survives_exception_propagating_out_of_
 			"cold_sms_blocked audit event did not survive the caller's session_scope() rollback"
 		)
 		assert event.payload["layer"] == "APPLICATION"
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_retry_with_sent_idempotency_key_does_not_call_provider_again(canary_tenants, monkeypatch):
+	"""2nd PR #10 review fixup, end to end: retrying dispatch_sms() with the
+	SAME idempotency_key after a successful send must return the prior
+	provider_message_id and never touch the provider a second time —
+	proven against the real (client_id, idempotency_key) UNIQUE constraint,
+	not a mock."""
+	import src.services.campaign_readiness_gate as gate_module
+
+	monkeypatch.setattr(gate_module, "_local_hour", lambda tz_name: 14)
+	contact_id = canary_tenants[CANARY_B]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 WHERE contact_id = :cid"),
+			{"cid": contact_id},
+		)
+	provider = _CountingSmsProvider()
+	try:
+		with get_db_context(client_id=CANARY_B) as session:
+			first_message_id = dispatch_sms(
+				session,
+				contact_id,
+				CANARY_B,
+				"reminder",
+				sms_provider=provider,
+				dnc_provider=_FixedDnc(listed=False),
+				idempotency_key="retry-key-1",
+			)
+			second_message_id = dispatch_sms(
+				session,
+				contact_id,
+				CANARY_B,
+				"reminder",
+				sms_provider=provider,
+				dnc_provider=_FixedDnc(listed=False),
+				idempotency_key="retry-key-1",
+			)
+		assert first_message_id == second_message_id == "stub-message-id"
+		assert len(provider.calls) == 1, "the provider must be called exactly once across both attempts"
+	finally:
+		_cleanup_cold_sms_events(contact_id)
+
+
+def test_dispatch_sms_concurrent_same_idempotency_key_is_rejected_by_unique_constraint(canary_tenants, monkeypatch):
+	"""A second PENDING insert under the same (client_id, idempotency_key)
+	before the first has resolved to SENT must be rejected by
+	uq_sms_dispatch_log_client_idempotency_key and surfaced as
+	SmsDispatchNeedsReconciliationError, not a silent double-send."""
+	import src.services.campaign_readiness_gate as gate_module
+
+	monkeypatch.setattr(gate_module, "_local_hour", lambda tz_name: 14)
+	contact_id = canary_tenants[CANARY_A]["contact_id"]
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 WHERE contact_id = :cid"),
+			{"cid": contact_id},
+		)
+	try:
+		with get_owner_db_context() as owner_session:
+			owner_session.execute(
+				text(
+					"INSERT INTO sms_dispatch_log "
+					"(client_id, contact_id, inbound_sms_count_at_send, booked_appointment_id_at_send, "
+					"status, idempotency_key) "
+					"VALUES (:client_id, :contact_id, 1, NULL, 'PENDING', 'racing-key-1')"
+				),
+				{"client_id": CANARY_A, "contact_id": contact_id},
+			)
+			owner_session.commit()
+
+		provider = _CountingSmsProvider()
+		with get_db_context(client_id=CANARY_A) as session:
+			with pytest.raises(SmsDispatchNeedsReconciliationError):
+				dispatch_sms(
+					session,
+					contact_id,
+					CANARY_A,
+					"reminder",
+					sms_provider=provider,
+					dnc_provider=_FixedDnc(listed=False),
+					idempotency_key="racing-key-1",
+				)
+		assert provider.calls == [], "provider must never be called while the prior attempt is unresolved"
 	finally:
 		_cleanup_cold_sms_events(contact_id)

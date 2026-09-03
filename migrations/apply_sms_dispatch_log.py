@@ -27,6 +27,17 @@ can use instead of blindly retrying (which would double-send). UPDATE is
 granted to blackink_app so that same row can move PENDING -> SENT/FAILED
 after the provider call, in a transaction of its own.
 
+UNKNOWN status + the (client_id, idempotency_key) unique constraint (2nd
+PR #10 review fixup) close the remaining duplicate-send gap: a caller
+that retries dispatch_sms() with the SAME idempotency_key for the same
+logical send now hits this constraint instead of inserting a second
+PENDING row, and a provider-call exception now lands the row on UNKNOWN
+(delivery outcome genuinely unknown) rather than FAILED (which implies
+safe-to-retry) — see src/services/sms_dispatch.py's docstring. The
+constraint is scoped to (client_id, idempotency_key), not a bare global
+UNIQUE(idempotency_key), so two different clients can never collide on
+the same key.
+
 Idempotent: CREATE TABLE IF NOT EXISTS, self-correcting ADD COLUMN /
 DROP+ADD CONSTRAINT for the idempotency_key and status changes.
 
@@ -70,17 +81,24 @@ DDL = [
 	"""
 	ALTER TABLE sms_dispatch_log
 		ADD CONSTRAINT ck_sms_dispatch_log_status
-		CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'BLOCKED'))
+		CHECK (status IN ('PENDING', 'SENT', 'FAILED', 'BLOCKED', 'UNKNOWN'))
 	""",
 	# NULL-able + a plain UNIQUE constraint (Postgres allows any number of
 	# NULLs under UNIQUE) rather than NOT NULL, so this stays idempotent
 	# against a table that already has BLOCKED rows from before this
 	# column existed.
 	"ALTER TABLE sms_dispatch_log ADD COLUMN IF NOT EXISTS idempotency_key VARCHAR(64)",
+	# Scoped to (client_id, idempotency_key), not a bare global UNIQUE — a
+	# caller-supplied key only needs to be unique within its own tenant
+	# (PR #10 2nd review fixup: the original global UNIQUE(idempotency_key)
+	# was never actually load-bearing for dedup since sms_dispatch.py always
+	# generated a fresh random key per call; scoping it to the client is
+	# what makes a caller-supplied stable key a real duplicate-send guard).
 	"ALTER TABLE sms_dispatch_log DROP CONSTRAINT IF EXISTS uq_sms_dispatch_log_idempotency_key",
+	"ALTER TABLE sms_dispatch_log DROP CONSTRAINT IF EXISTS uq_sms_dispatch_log_client_idempotency_key",
 	"""
 	ALTER TABLE sms_dispatch_log
-		ADD CONSTRAINT uq_sms_dispatch_log_idempotency_key UNIQUE (idempotency_key)
+		ADD CONSTRAINT uq_sms_dispatch_log_client_idempotency_key UNIQUE (client_id, idempotency_key)
 	""",
 	"GRANT SELECT, INSERT, UPDATE ON sms_dispatch_log TO blackink_app",
 	"GRANT USAGE ON SEQUENCE sms_dispatch_log_dispatch_id_seq TO blackink_app",

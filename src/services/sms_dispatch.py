@@ -56,6 +56,46 @@ into any workflow at all before it existed.
 No SMS vendor is contracted yet — SmsProvider/StubSmsProvider mirrors
 DncProvider/StubDncProvider from compliance_gate.py.
 
+Idempotency (PR #10 2nd review fixup): a bare per-call random
+idempotency_key only proved the PENDING row *exists* before the provider
+call — it did nothing to stop a *retried* dispatch_sms() call (after a
+crash, a commit failure, or a caller-side timeout) from generating a new
+key and sending a second, duplicate SMS. Callers that may retry a given
+logical send MUST pass the SAME `idempotency_key` on every attempt for
+that send. With a key supplied, dispatch_sms() looks up any existing
+sms_dispatch_log row for (client_id, idempotency_key) — scoped to the
+client by the table's UNIQUE(client_id, idempotency_key) constraint —
+before doing anything else:
+  * SENT   -> returns the already-recorded provider_message_id; the
+             provider is never called again.
+  * PENDING/UNKNOWN -> raises SmsDispatchNeedsReconciliationError. The
+             prior attempt's outcome is not known (did the provider
+             accept it or not?), so retrying blindly could double-send;
+             a reconciliation worker (querying the provider's own
+             delivery status by idempotency_key, not built in this
+             subtask — no vendor is contracted) must resolve the row to
+             SENT/FAILED before another attempt is allowed.
+  * FAILED -> the only status that means "definitely not sent" (nothing
+             currently produces it, but a future provider integration
+             that can distinguish "rejected before send" from "unknown"
+             would use it); safe to retry.
+  * no row -> proceeds exactly as a fresh dispatch, using this key for
+             the new PENDING insert, and also passes it to
+             sms_provider.send() so a provider with its own native
+             idempotency-key support (most SMS/carrier APIs have one)
+             gets the same guarantee independently.
+A caller that omits `idempotency_key` gets a random one generated
+per-call, same as before — that remains correct for genuine one-shot
+sends, but such a call has no retry protection at all.
+
+A provider-call exception now marks the row UNKNOWN, not FAILED: once
+sms_provider.send() has been invoked, an exception (timeout, connection
+drop, 5xx) does not tell us whether the carrier actually accepted the
+message before failing — treating that as FAILED (implying "safe to
+retry") is exactly the bug this fixup closes. UNKNOWN correctly routes
+a retry attempt into the reconciliation-required path above instead of
+a silent second send.
+
 Transactional contract: the caller-supplied `session` is used only for the
 readiness re-evaluation (same "does not commit — caller's session_scope()
 owns the transaction" convention evaluate_full_readiness already has
@@ -87,10 +127,21 @@ class ColdSMSBlockedError(RuntimeError):
     by design — the caller must not retry, only re-evaluate the contact."""
 
 
+class SmsDispatchNeedsReconciliationError(RuntimeError):
+    """Raised when dispatch_sms() is called with an idempotency_key whose
+    prior attempt is still PENDING or UNKNOWN — its outcome isn't known, so
+    another attempt could double-send. Non-recoverable by design: the
+    caller must not retry with this key until a reconciliation job has
+    resolved the existing row to SENT or FAILED."""
+
+
 class SmsProvider(ABC):
     @abstractmethod
-    def send(self, phone: str, message: str) -> str:
-        """Send the SMS and return the provider's message id."""
+    def send(self, phone: str, message: str, idempotency_key: str) -> str:
+        """Send the SMS and return the provider's message id. Implementations
+        that talk to a carrier with native idempotency-key support should
+        pass it through, for a second guarantee independent of this
+        module's own outbox dedup."""
 
 
 class StubSmsProvider(SmsProvider):
@@ -98,7 +149,7 @@ class StubSmsProvider(SmsProvider):
     call means procurement hasn't landed; fail loudly rather than pretend
     to send."""
 
-    def send(self, phone: str, message: str) -> str:
+    def send(self, phone: str, message: str, idempotency_key: str) -> str:
         raise NotImplementedError("no SMS vendor contracted yet")
 
 
@@ -118,6 +169,16 @@ def _record_cold_sms_blocked(
     )
 
 
+def _existing_dispatch(session: Session, client_id: str, idempotency_key: str):
+    return session.execute(
+        text(
+            "SELECT status, provider_message_id FROM sms_dispatch_log "
+            "WHERE client_id = :client_id AND idempotency_key = :idempotency_key"
+        ),
+        {"client_id": client_id, "idempotency_key": idempotency_key},
+    ).one_or_none()
+
+
 def dispatch_sms(
     session: Session,
     contact_id: int,
@@ -126,14 +187,23 @@ def dispatch_sms(
     sms_provider: Optional[SmsProvider] = None,
     dnc_provider: Optional[DncProvider] = None,
     open_outbox_session: Optional[OutboxSessionFactory] = None,
+    idempotency_key: Optional[str] = None,
 ) -> str:
     """Re-evaluates full readiness and, only if it yields
     TRANSACTIONAL_SMS_ONLY, dispatches via a transactional outbox: a
     committed PENDING sms_dispatch_log row (with a unique idempotency_key)
-    before sms_provider is ever touched, then a committed SENT/FAILED
-    update after. Returns the provider's message id on success; raises
-    ColdSMSBlockedError (and durably logs cold_sms_blocked with
+    before sms_provider is ever touched, then a committed SENT/FAILED/
+    UNKNOWN update after. Returns the provider's message id on success;
+    raises ColdSMSBlockedError (and durably logs cold_sms_blocked with
     layer='APPLICATION') for any non-SMS-eligible contact.
+
+    Pass the SAME `idempotency_key` on every retry of a given logical send
+    — dispatch_sms() then looks up any prior sms_dispatch_log row for
+    (client_id, idempotency_key) first: SENT short-circuits to the
+    already-recorded message id (no second provider call), PENDING/UNKNOWN
+    raises SmsDispatchNeedsReconciliationError instead of risking a
+    duplicate send. Omitting it generates a random one-shot key with no
+    retry protection. See module docstring.
 
     `open_outbox_session` overrides how the independent outbox
     transactions are opened — defaults to a fresh get_db_context(client_id=
@@ -142,6 +212,19 @@ def dispatch_sms(
     """
     sms_provider = sms_provider or StubSmsProvider()
     open_outbox_session = open_outbox_session or (lambda: get_db_context(client_id=client_id))
+
+    if idempotency_key is not None:
+        existing = _existing_dispatch(session, client_id, idempotency_key)
+        if existing is not None:
+            if existing.status == "SENT":
+                return existing.provider_message_id
+            if existing.status in ("PENDING", "UNKNOWN"):
+                raise SmsDispatchNeedsReconciliationError(
+                    f"dispatch with idempotency_key {idempotency_key!r} is still "
+                    f"{existing.status} — resolve it before retrying"
+                )
+            # status == 'FAILED': known never to have reached the provider
+            # successfully, safe to fall through and redispatch below.
 
     readiness = evaluate_full_readiness(session, contact_id, client_id, dnc_provider=dnc_provider)
 
@@ -163,7 +246,7 @@ def dispatch_sms(
         {"contact_id": contact_id},
     ).one()
 
-    idempotency_key = uuid.uuid4().hex
+    resolved_key = idempotency_key or uuid.uuid4().hex
 
     with open_outbox_session() as outbox_session:
         dispatch_id = outbox_session.execute(
@@ -173,6 +256,7 @@ def dispatch_sms(
                 "status, idempotency_key) "
                 "VALUES (:client_id, :contact_id, :inbound_sms_count, :booked_appointment_id, "
                 "'PENDING', :idempotency_key) "
+                "ON CONFLICT (client_id, idempotency_key) DO NOTHING "
                 "RETURNING dispatch_id"
             ),
             {
@@ -180,16 +264,28 @@ def dispatch_sms(
                 "contact_id": contact_id,
                 "inbound_sms_count": contact.inbound_sms_count,
                 "booked_appointment_id": contact.booked_appointment_id,
-                "idempotency_key": idempotency_key,
+                "idempotency_key": resolved_key,
             },
         ).scalar()
 
+    if dispatch_id is None:
+        # A concurrent call won the race to insert this same key between our
+        # lookup above and this INSERT — re-check the row it created instead
+        # of silently re-dispatching.
+        existing = _existing_dispatch(session, client_id, resolved_key)
+        if existing is not None and existing.status == "SENT":
+            return existing.provider_message_id
+        raise SmsDispatchNeedsReconciliationError(
+            f"a concurrent dispatch with idempotency_key {resolved_key!r} is in progress or "
+            "unresolved — resolve it before retrying"
+        )
+
     try:
-        message_id = sms_provider.send(contact.phone, message)
+        message_id = sms_provider.send(contact.phone, message, idempotency_key=resolved_key)
     except Exception:
         with open_outbox_session() as outbox_session:
             outbox_session.execute(
-                text("UPDATE sms_dispatch_log SET status = 'FAILED' WHERE dispatch_id = :dispatch_id"),
+                text("UPDATE sms_dispatch_log SET status = 'UNKNOWN' WHERE dispatch_id = :dispatch_id"),
                 {"dispatch_id": dispatch_id},
             )
         raise
