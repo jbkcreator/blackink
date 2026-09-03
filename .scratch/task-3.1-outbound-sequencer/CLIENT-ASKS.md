@@ -17,6 +17,49 @@ directly.
 
 ---
 
+## 0. Further-3.1.1-build working decisions (go-with-leans, 2026-09-03 — ⚠ CONFIRM WITH CLIENT)
+
+3.1.1's machinery is done; the remaining build (real copy composition,
+attachment wiring, the live approval policy, config) is gated on the asks
+below. Pending client answers, we proceed on these **working assumptions** so
+the build isn't blocked. Each is reversible; none is client-confirmed yet.
+
+- **D6 — copy is a fixed merge-tag template, not per-prospect LLM.** For
+  September `_compose_touch` renders one approved Touch 1/3/5 template with
+  `{first_name}`/`{county}`/`{firm}` merge tags. Reason: deterministic,
+  one-time-approvable, matches the client's own "Lead agent runs on
+  deterministic templates" language, and keeps the "50 clean sends → autonomy"
+  model intact (per-prospect LLM copy makes every send a new unreviewed draft).
+  LLM generation deferred.
+- **D16 — Touch 1 forks ranked / unranked.** Top-25 firm: keep the rank hook
+  ("Reply YES to see where you rank in {county}"). Firm outside the top 25:
+  drop the rank claim (we may never publish a rank below 25), lead with the
+  score + weakest categories, micro-ask becomes "Reply YES for your Owner
+  Visibility breakdown for {county}." Firm **below the data floor**
+  (insufficient signals): **hold, do not mail** — no credible hook. Two
+  template variants, selected on the OVS result.
+- **O-07 — named approver pool, no time-based auto-approve, ever.** A small
+  setter pool (2–3 people) in `BLACKINK_GLOBAL_APPROVERS`; any global approver
+  is the fallback. If nobody is available, cards **persist** (the sequence
+  stalls) rather than auto-sending — the human gate is the whole point.
+  Business-hours/holiday schedule deferred (all Sept counties are ET; see D14).
+- **D4 — default cap 50, per-client configurable, warmup-ramped later.**
+  Matches the DoD test and the existing `DEFAULT_DAILY_SEND_CAP = 50`. Expose a
+  per-client override (reuse `clients.daily_send_ceiling` if it maps cleanly);
+  ramp with mailbox warmup age post-September.
+- **A5 / A6 / A13 — compliance stubs are DEMO-ONLY; hard pre-prod gate.** A real
+  cold send to real prospects legally needs a live DNC scrub (Tracerfy key, A5)
+  and email verification (A6/A13). Stubs are fine for the Sept 11 demo against
+  test data; **before any real prospect volume**, both must be live. Flag as a
+  compliance exposure, not a missing feature.
+- **A14 / A2 / A3 — client mailboxes/domains for real sends.** A client send
+  needs warmed Google Workspace/Outlook seats on the client's own
+  SPF/DKIM/DMARC-verified domains + SMTP creds — an onboarding runbook item. The
+  Mandrill / `forcedactionleads.com` creds used in testing are the parent
+  project's and **must not carry client volume**.
+
+---
+
 ## 1. Decisions and clarifications
 
 Questions where the source documents contradict themselves or go silent, and
