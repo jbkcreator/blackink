@@ -6,6 +6,9 @@
 # References (sprint docs, blueprints — local only)
 /references
 
+# Task docs/reports — local only, never push
+/Tasks
+
 # Python bytecode
 __pycache__/
 *.py[cod]
