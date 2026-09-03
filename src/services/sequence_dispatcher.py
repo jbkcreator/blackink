@@ -143,6 +143,19 @@ def find_stuck_dispatches(session: Session, older_than_minutes: int = 30) -> lis
     return list(rows)
 
 
+def get_touch_message_id(session: Session, run_id: str, touch_step: int) -> Optional[str]:
+    """Return the message_id of a SENT dispatch for run_id+touch_step, or None.
+    Used by the orchestrator to thread Touch 3 → Touch 1 and Touch 5 → Touch 3."""
+    row = session.execute(
+        text(
+            "SELECT message_id FROM sequence_touch_dispatches "
+            "WHERE run_id = :run_id AND touch_step = :touch_step AND status = 'SENT'"
+        ),
+        {"run_id": run_id, "touch_step": touch_step},
+    ).fetchone()
+    return row.message_id if row else None
+
+
 def daily_sends_for_mailbox(session: Session, mailbox_id: int, client_id: str) -> int:
     """Count SENDING/SENT dispatches for this mailbox in the last 24 hours."""
     count = session.execute(

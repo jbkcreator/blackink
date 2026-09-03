@@ -190,3 +190,60 @@ def test_reclaimed_mid_flight_returns_reclaimed():
         result = dispatch_touch(session, _contact(), "client_a", touch_step=1, sender=sender)
     assert result.outcome == "RECLAIMED"
     mock_log.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Touch-3 threading: In-Reply-To lookup
+# ---------------------------------------------------------------------------
+
+def test_touch3_passes_in_reply_to_from_touch1():
+    """Touch 3 should look up Touch 1's message_id and pass it as in_reply_to."""
+    session = MagicMock()
+    sender = _Sender(message_id="<touch3@acme-out.com>")
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.get_touch_message_id", return_value="<touch1@acme-out.com>") as mock_get_mid,
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+    ):
+        result = dispatch_touch(session, _contact(), "client_a", touch_step=3, run_id="run-1", sender=sender)
+    assert result.outcome == "SENT"
+    mock_get_mid.assert_called_once_with(session, "run-1", 1)  # looks up touch_step=1
+    assert sender.calls[0]["in_reply_to"] == "<touch1@acme-out.com>"
+
+
+def test_touch1_does_not_look_up_in_reply_to():
+    """Touch 1 is the first email — no threading lookup."""
+    session = MagicMock()
+    sender = _Sender()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.get_touch_message_id") as mock_get_mid,
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+    ):
+        dispatch_touch(session, _contact(), "client_a", touch_step=1, run_id="run-1", sender=sender)
+    mock_get_mid.assert_not_called()
+    assert sender.calls[0].get("in_reply_to") is None
+
+
+def test_touch5_threads_to_touch3():
+    """Touch 5 replies to Touch 3."""
+    session = MagicMock()
+    sender = _Sender()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.get_touch_message_id", return_value="<touch3@acme-out.com>") as mock_get_mid,
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+        patch("src.services.sequence_orchestrator.complete_run_with_cooling"),
+    ):
+        dispatch_touch(session, _contact(), "client_a", touch_step=5, run_id="run-1", sender=sender)
+    mock_get_mid.assert_called_once_with(session, "run-1", 3)  # looks up touch_step=3
+    assert sender.calls[0]["in_reply_to"] == "<touch3@acme-out.com>"

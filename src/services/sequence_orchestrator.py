@@ -23,6 +23,7 @@ from src.services.mailbox_dispatcher import (
 from src.services.sequence_dispatcher import (
     claim_touch,
     complete_run_with_cooling,
+    get_touch_message_id,
     mark_failed,
     mark_sent,
 )
@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
 # Highest touch step in the sequence — dispatching it completes the run and
 # opens the 30-day cooling window (wayfinder ticket 07).
 _FINAL_TOUCH_STEP = 5
+
+# Touch N threads to the reply chain of touch M (In-Reply-To + References).
+# Touch 3 replies to Touch 1; Touch 5 replies to Touch 3.
+_REPLY_TO_STEP: dict[int, int] = {3: 1, 5: 3}
 
 
 @dataclass(frozen=True)
@@ -89,6 +94,15 @@ def dispatch_touch(
 
     subject, body, template_version = _compose_touch(touch_step, contact)
 
+    # Look up the prior touch's Message-ID so email clients thread the reply.
+    in_reply_to: str | None = None
+    if run_id and touch_step in _REPLY_TO_STEP:
+        in_reply_to = get_touch_message_id(session, run_id, _REPLY_TO_STEP[touch_step])
+        if in_reply_to:
+            logger.debug(
+                "sequence_orchestrator: threading touch=%d in_reply_to=%s", touch_step, in_reply_to
+            )
+
     # INSERT SENDING (done) → send → UPDATE SENT/FAILED. The row is always
     # resolved before returning, so nothing is left stuck in SENDING by the
     # happy or the error path (ticket 22).
@@ -99,6 +113,7 @@ def dispatch_touch(
             subject=subject,
             body=body,
             sending_domain=mailbox.sending_domain,
+            in_reply_to=in_reply_to,
         )
     except Exception as exc:  # noqa: BLE001 — any send failure resolves the row
         mark_failed(session, client_id, dispatch_id, str(exc))

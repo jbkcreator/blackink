@@ -155,7 +155,21 @@ def _card_button_blocks(order: "wo.WorkOrder") -> list:
 
 
 def _card_text(order: "wo.WorkOrder") -> str:
-	subject = order.payload.get("subject") if isinstance(order.payload, dict) else None
+	payload = order.payload if isinstance(order.payload, dict) else {}
+
+	if order.action_class == "DISPATCH_EMAIL_TOUCH":
+		touch_step = payload.get("touch_step", "?")
+		run_id_short = str(payload.get("run_id", ""))[:8]
+		subject = payload.get("subject") or f"Touch {touch_step} — cold outreach sequence"
+		body_preview = payload.get("body_preview") or "(email copy generated at send time — placeholder pending Dev 2 assets)"
+		return (
+			f"*Email Touch {touch_step}* (`{order.action_id[:8]}`) — run `{run_id_short}`\n"
+			f"To: `{order.recipient or 'n/a'}`\n"
+			f"Subject: _{subject}_\n"
+			f"{body_preview}"
+		)
+
+	subject = payload.get("subject")
 	preview = subject or str(order.payload)[:120]
 	return (
 		f"*{order.action_class}* (`{order.action_id[:8]}`)\n"
