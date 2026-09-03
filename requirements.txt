@@ -26,4 +26,5 @@ fakeredis>=2.0
 beautifulsoup4>=4.12
 lxml>=5.0
 googlemaps>=4.10
+fpdf2>=2.7
 
