@@ -47,9 +47,54 @@ def test_main_is_idempotent_upsert_not_duplicate_insert():
          patch("src.tasks.seed_demo_sandbox.log_event") as mock_log:
         session = MagicMock()
         mock_ctx.return_value.__enter__.return_value = session
+        # No existing owner for any company — the collision check must not
+        # treat a bare MagicMock()'s auto-mocked (truthy) return as a real
+        # collision, so every company proceeds through the normal upsert path.
+        session.execute.return_value.mappings.return_value.first.return_value = None
         from src.tasks.seed_demo_sandbox import main
         main()
     executed_sql = "\n".join(str(c.args[0]) for c in session.execute.call_args_list if c.args)
     assert "ON CONFLICT" in executed_sql
     # 20 mock touches + 5 mock bookings, per the split doc's DoD.
     assert mock_log.call_count == 25
+
+
+def test_main_skips_company_and_contacts_already_owned_by_another_client():
+    """company_id = sha256(domain) is globally unique — if a seed domain
+    collides with a REAL customer's company, the seeder must not reassign
+    that company (or overwrite its contacts) to the demo tenant. This is
+    the fix for the PR review finding: silently upserting owning_client_id
+    on any conflict is a cross-tenant data-integrity bug."""
+    colliding = build_mock_companies()[0]
+    colliding_id = colliding["company_id"]
+
+    def fake_execute(_clause, params=None):
+        result = MagicMock()
+        if params and params.get("company_id") == colliding_id:
+            result.mappings.return_value.first.return_value = {"owning_client_id": "some_other_real_client"}
+        else:
+            result.mappings.return_value.first.return_value = None
+        return result
+
+    with patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
+         patch("src.tasks.seed_demo_sandbox.log_event") as mock_log:
+        session = MagicMock()
+        session.execute.side_effect = fake_execute
+        mock_ctx.return_value.__enter__.return_value = session
+        from src.tasks.seed_demo_sandbox import main
+        main()
+
+    for call in session.execute.call_args_list:
+        if not call.args:
+            continue
+        stmt = str(call.args[0])
+        params = call.args[1] if len(call.args) > 1 else None
+        if "INSERT INTO companies" in stmt or "INSERT INTO contacts" in stmt:
+            assert not (params and params.get("company_id") == colliding_id), (
+                f"seeder wrote to a collided company_id it does not own: {stmt}"
+            )
+
+    # The 39 non-colliding companies still seed their events; the colliding
+    # company's fake events must never be logged against a real customer's row.
+    for call in mock_log.call_args_list:
+        assert call.kwargs.get("entity_id") != colliding_id

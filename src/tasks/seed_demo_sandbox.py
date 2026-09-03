@@ -15,12 +15,15 @@ update but not wipe").
 from __future__ import annotations
 
 import hashlib
+import logging
 import random
 
 from sqlalchemy import text
 
 from src.core.database import get_system_db_context
 from src.services.events import log_event
+
+logger = logging.getLogger(__name__)
 
 SANDBOX_CLIENT_ID = "DEMO_FRIDAY_SANDBOX"
 
@@ -140,48 +143,87 @@ _UPSERT_CONTACT = """
         email = EXCLUDED.email, phone = EXCLUDED.phone
 """
 
+_SELECT_EXISTING_OWNER = """
+    SELECT owning_client_id FROM companies WHERE company_id = :company_id
+"""
+
+
+def _existing_owner(session, company_id: str) -> "str | None":
+    row = session.execute(text(_SELECT_EXISTING_OWNER), {"company_id": company_id}).mappings().first()
+    return row["owning_client_id"] if row else None
+
 
 def main() -> int:
+    """company_id is sha256(domain) — globally unique and deterministic. If
+    one of this seeder's 40 domains happens to collide with a REAL customer's
+    company (already owned by a different client_id), the upsert below must
+    NOT touch that row: touching it would silently reassign a real
+    customer's company (and let a real contact's email/phone be overwritten
+    by fake sandbox data) to the demo tenant — a cross-tenant data-integrity
+    and disclosure bug, not a cosmetic one. Every collision is skipped
+    entirely (company AND its contacts, never a partial write) and logged."""
     companies = build_mock_companies()
+    seeded: list[dict] = []
+    skipped_domains: list[str] = []
+
     with get_system_db_context() as session:
         session.execute(text(_UPSERT_CLIENT), {"client_id": SANDBOX_CLIENT_ID})
         for company in companies:
+            owner = _existing_owner(session, company["company_id"])
+            if owner is not None and owner != SANDBOX_CLIENT_ID:
+                skipped_domains.append(company["domain"])
+                continue
             session.execute(text(_UPSERT_COMPANY), dict(company, owning_client_id=SANDBOX_CLIENT_ID))
             for contact in build_mock_contacts_for_company(company):
                 session.execute(text(_UPSERT_CONTACT), contact)
+            seeded.append(company)
 
-    for i in range(20):
-        company = companies[i % len(companies)]
-        # Recipient matches the contact actually seeded for this company —
-        # a dashboard showing touches to owner@... while the contacts table
-        # holds marcus.delgado@... is exactly the kind of detail that gets
-        # noticed on a shared screen during a live demo.
-        owner_contact = build_mock_contacts_for_company(company)[0]
-        log_event(
-            SANDBOX_CLIENT_ID,
-            "outbound_touch_dispatched",
-            entity_type="company",
-            entity_id=company["company_id"],
-            payload={
-                "touch_step": (i % 5) + 1,
-                "channel": "email",
-                "recipient_email": owner_contact["email"],
-                "template_version": "v1.4_speed_audit_video",
-                "sending_domain": "growth-blackink.com",
-                "mailbox_id": f"mbx_{(i % 6) + 1:02d}",
-            },
-        )
-    for i in range(5):
-        company = companies[i]
-        log_event(
-            SANDBOX_CLIENT_ID,
-            "meeting_booked",
-            entity_type="company",
-            entity_id=company["company_id"],
-            payload={"door_count_est": company["door_count_est"], "source": "sandbox_seed"},
+    if skipped_domains:
+        logger.warning(
+            "seed_demo_sandbox: skipped %d domain collision(s) already owned by another client — "
+            "left untouched: %s",
+            len(skipped_domains),
+            skipped_domains,
         )
 
-    print(f"seed_demo_sandbox: done — {len(companies)} companies, {len(companies) * 2} contacts, 25 mock events")
+    if seeded:
+        for i in range(20):
+            company = seeded[i % len(seeded)]
+            # Recipient matches the contact actually seeded for this company —
+            # a dashboard showing touches to owner@... while the contacts table
+            # holds marcus.delgado@... is exactly the kind of detail that gets
+            # noticed on a shared screen during a live demo.
+            owner_contact = build_mock_contacts_for_company(company)[0]
+            log_event(
+                SANDBOX_CLIENT_ID,
+                "outbound_touch_dispatched",
+                entity_type="company",
+                entity_id=company["company_id"],
+                payload={
+                    "touch_step": (i % 5) + 1,
+                    "channel": "email",
+                    "recipient_email": owner_contact["email"],
+                    "template_version": "v1.4_speed_audit_video",
+                    "sending_domain": "growth-blackink.com",
+                    "mailbox_id": f"mbx_{(i % 6) + 1:02d}",
+                },
+            )
+        for i in range(min(5, len(seeded))):
+            company = seeded[i]
+            log_event(
+                SANDBOX_CLIENT_ID,
+                "meeting_booked",
+                entity_type="company",
+                entity_id=company["company_id"],
+                payload={"door_count_est": company["door_count_est"], "source": "sandbox_seed"},
+            )
+
+    events_logged = (20 + min(5, len(seeded))) if seeded else 0
+    print(
+        f"seed_demo_sandbox: done — {len(seeded)} companies, {len(seeded) * 2} contacts, "
+        f"{events_logged} mock events"
+        + (f", {len(skipped_domains)} collision(s) skipped" if skipped_domains else "")
+    )
     return 0
 
 
