@@ -1,5 +1,17 @@
 """Ink (Campaign Agent) — LangGraph node functions.
 
+# ============================================================
+# DEFERRED — Ghost Shopper, Sendspark, GIF Generator nodes
+# ============================================================
+# node_ghost_shopper (via make_node_ghost_shopper), node_wait_reply,
+# node_sendspark, node_gif_generator are deferred as of 2026-09-03.
+# They are preserved here for future reactivation.
+#
+# The active OVS pipeline replaces ghost_shopper + wait_reply with an
+# OVS score lookup. When reactivating, restore those nodes and update
+# the graph topology in graph.py.
+# ============================================================
+
 Each node receives the full GlobalState and returns a partial dict that
 LangGraph merges into the state. Nodes update `stage` as a side effect for
 observability; routing is driven by graph edges, not the stage field.

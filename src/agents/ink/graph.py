@@ -1,6 +1,21 @@
 """Ink (Campaign Agent) — LangGraph graph definition.
 
-Topology
+# ============================================================
+# DEFERRED — Ghost Shopper pipeline topology
+# ============================================================
+# Ghost Shopper, Sendspark, and GIF Generator stages were deferred on
+# 2026-09-03 (Source of Truth). This graph topology is preserved for future
+# reactivation.
+#
+# When reactivated, the active OVS pipeline (feature/owner-visibility-score-engine)
+# must be merged in and the following changes made to this graph:
+#   - Replace the ghost_shopper / wait_reply entry stages with an
+#     ovs_score_lookup node that reads from owner_visibility_scores
+#   - Remove the sendspark / gif_generator fan-out (or keep as deferred branches)
+#   - Update GlobalState fields accordingly (see state.py deferred note)
+# ============================================================
+
+Topology (Ghost Shopper pipeline — deferred)
 ────────
 START
   └─► ghost_shopper ──(SUBMITTED)──► wait_reply

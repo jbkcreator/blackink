@@ -1,5 +1,7 @@
 """Ghost Shopper — LangGraph node functions.
 
+# DEFERRED 2026-09-03 — see runner.py for full context and reactivation notes.
+
 Node execution order per crawl iteration:
 
   fetch_and_extract
