@@ -42,8 +42,8 @@ _DBPR_CSV_PATH = pathlib.Path("data/dbpr/florida_brokers.csv")
 _DBPR_DOWNLOAD_URL = (
     "https://www2.myfloridalicense.com/sto/file_download/extracts/REALESTATE2501LICENSE_1.csv"
 )
-_MATCH_THRESHOLD = 85  # rapidfuzz token_sort_ratio
-_ACTIVE_STATUSES = {"current active", "current,active", "active"}
+_MATCH_THRESHOLD = 82  # token_sort_ratio — handles "LLC" vs "L L C" and minor word variants
+_ACTIVE_STATUSES = {"current active"}  # cols[12]+" "+cols[13] lowercased
 
 
 def _ensure_csv() -> bool:
@@ -89,13 +89,30 @@ def _ensure_csv() -> bool:
 
 
 def _load_csv(path: pathlib.Path) -> list[dict[str, str]]:
-    """Load and normalise CSV rows."""
+    """Load and normalise CSV rows.
+
+    The FL DBPR real estate extract has no header row. Column positions:
+      1  — individual licensee name (LAST, FIRST)
+      11 — licence number (digits)
+      12 — status word 1 ("Current" / "Invol Inactive" / etc.)
+      13 — status word 2 ("Active" / "Inactive")
+      17 — full licence code (e.g. "BK468849")
+      19 — employer / business name (blank for solo practitioners)
+    """
     rows: list[dict[str, str]] = []
     with path.open(newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            # Normalise keys to lowercase so column name casing doesn't matter.
-            rows.append({k.strip().lower(): v.strip() for k, v in row.items()})
+        for cols in csv.reader(fh):
+            if len(cols) < 20:
+                continue
+            business = cols[19].strip()
+            if not business:
+                continue  # skip solo practitioners — no business name to match
+            rows.append({
+                "name":           business,
+                "licensee_name":  cols[1].strip(),
+                "license_number": cols[17].strip(),
+                "status":         f"{cols[12].strip()} {cols[13].strip()}".lower(),
+            })
     return rows
 
 
@@ -115,8 +132,20 @@ def _get_records() -> list[dict[str, str]]:
 
 
 def _is_active(row: dict[str, str]) -> bool:
-    status = row.get("status", "").lower().replace(" ", "")
-    return status in {s.replace(" ", "").replace(",", "") for s in _ACTIVE_STATUSES}
+    return row.get("status", "").strip().lower() in _ACTIVE_STATUSES
+
+
+def _first_word_compatible(query: str, candidate: str) -> bool:
+    """Guard against fuzzy ratio matching words that start differently.
+
+    Requires the first token of query to be a prefix of the first token of
+    candidate, or vice versa. This kills coincidental high scores where the
+    distinctive first word differs (e.g. 'Bay' vs 'Beam') while still
+    allowing abbreviation variants ('Rent' → 'Rental', 'Mgmt' → 'Management').
+    """
+    q0 = query.lower().split()[0] if query.split() else ""
+    c0 = candidate.lower().split()[0] if candidate.split() else ""
+    return c0.startswith(q0) or q0.startswith(c0)
 
 
 def _find_match(company_name: str, records: list[dict[str, str]]) -> dict[str, str] | None:
@@ -129,7 +158,7 @@ def _find_match(company_name: str, records: list[dict[str, str]]) -> dict[str, s
         if not candidate:
             continue
         score = fuzz.token_sort_ratio(name_lower, candidate)
-        if score > best_score:
+        if score > best_score and _first_word_compatible(name_lower, candidate):
             best_score = score
             best_row = row
     if best_score >= _MATCH_THRESHOLD:
