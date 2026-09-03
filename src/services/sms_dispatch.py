@@ -38,7 +38,14 @@ rather than redefining the eligibility rule — same literal predicates from
 the master blueprint, enforced here in the actual send path, independently
 by sms_dispatch_log's CHECK constraint at the DB layer
 (migrations/apply_sms_dispatch_log.py), and by this module's own tests
-running in the required CI suite (tests/test_tenant_isolation.py).
+(tests/test_sms_dispatch.py, pure-unit; tests/test_tenant_isolation.py,
+live-DB), both required by .github/workflows/tests.yml on every PR — the
+literal "CI/CD build test fails" layer from the master blueprint §3.0.4.
+A prior version of this docstring named test_tenant_isolation.py alone as
+"the required CI suite," which was inaccurate: no CI workflow ran either
+test file on every PR at the time that was written — only the separate,
+path-filtered tenant-leakage workflow ran test_tenant_isolation.py, and
+test_sms_dispatch.py wasn't wired into any workflow at all.
 
 No SMS vendor is contracted yet — SmsProvider/StubSmsProvider mirrors
 DncProvider/StubDncProvider from compliance_gate.py.
