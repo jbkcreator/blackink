@@ -41,11 +41,17 @@ by sms_dispatch_log's CHECK constraint at the DB layer
 (tests/test_sms_dispatch.py, pure-unit; tests/test_tenant_isolation.py,
 live-DB), both required by .github/workflows/tests.yml on every PR — the
 literal "CI/CD build test fails" layer from the master blueprint §3.0.4.
+
 A prior version of this docstring named test_tenant_isolation.py alone as
-"the required CI suite," which was inaccurate: no CI workflow ran either
-test file on every PR at the time that was written — only the separate,
-path-filtered tenant-leakage workflow ran test_tenant_isolation.py, and
-test_sms_dispatch.py wasn't wired into any workflow at all.
+"the required CI suite" — true for the PR that introduced it (that PR also
+touched apply_sms_dispatch_log.py, which triggers
+tenant_leakage_nightly.yml's path-filtered leakage-suite job, matching
+Subtask 1.2.3's own DoD sign-off), but not a durable guarantee: that
+workflow's path filter is scoped to models.py/migrations/database.py/
+tenant_policies.py, not src/services/**, so a later PR touching only this
+module's own logic would never have triggered it. tests.yml (no path
+filter, every PR) closes that gap; test_sms_dispatch.py was never wired
+into any workflow at all before it existed.
 
 No SMS vendor is contracted yet — SmsProvider/StubSmsProvider mirrors
 DncProvider/StubDncProvider from compliance_gate.py.
