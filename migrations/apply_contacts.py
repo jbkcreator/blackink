@@ -7,7 +7,10 @@ application convention. dnc_clean is nullable (NULL = never checked, distinct
 from FALSE) with dnc_checked_at driving the compliance gate's ABSTAIN-on-stale
 logic (see src/core/models.py's Contact docstring).
 
-Idempotent: CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS.
+Idempotent: CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS, plus a
+self-correcting DROP+ADD CONSTRAINT for company_id's ON DELETE CASCADE
+(added after the original table shipped without it — see Week 1 Subtask
+1.1.1 verification).
 
     PYTHONPATH=. python migrations/apply_contacts.py
 """
@@ -65,6 +68,31 @@ DDL = [
 		ON contacts (email) WHERE email IS NOT NULL
 	""",
 	"CREATE INDEX IF NOT EXISTS ix_contacts_company ON contacts (company_id)",
+	# Week 1 Subtask 1.1.1's idx_contacts_lookup requirement.
+	"""
+	CREATE INDEX IF NOT EXISTS idx_contacts_lookup
+		ON contacts (email, company_id, compliance_eligibility)
+	""",
+	# CREATE TABLE IF NOT EXISTS above does not retrofit a constraint change
+	# on an already-existing table — this table was originally created
+	# without ON DELETE CASCADE on company_id. Re-run on every apply so it's
+	# self-correcting regardless of what a prior version left in place.
+	# Constraint name matches Postgres's own default naming
+	# (<table>_<column>_fkey) since the original CREATE TABLE didn't name it.
+	"ALTER TABLE contacts DROP CONSTRAINT IF EXISTS contacts_company_id_fkey",
+	"""
+	ALTER TABLE contacts
+		ADD CONSTRAINT contacts_company_id_fkey
+		FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE CASCADE
+	""",
+	# Week 1 Subtask 1.2.2 (Warm-Channel Waterfall) retrofit — no appointments
+	# table exists yet, so booked_appointment_id is a forward-compatible
+	# marker only, no FK. Field names are literal from the master blueprint
+	# (Project Blackink — Complete Implementation Blueprint, §3.0.4's
+	# CI-enforced predicate: inbound_sms_count == 0 AND
+	# booked_appointment_id IS NULL blocks SMS eligibility).
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS booked_appointment_id VARCHAR(64)",
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS inbound_sms_count INTEGER NOT NULL DEFAULT 0",
 	"GRANT SELECT, INSERT, UPDATE ON contacts TO blackink_app",
 	"GRANT USAGE ON SEQUENCE contacts_contact_id_seq TO blackink_app",
 	# promotion_sweep.py runs as blackink_system and promotes contacts

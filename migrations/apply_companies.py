@@ -51,6 +51,10 @@ DDL = [
 	""",
 	"CREATE INDEX IF NOT EXISTS ix_companies_county_status ON companies (county_slug, status)",
 	"CREATE INDEX IF NOT EXISTS ix_companies_owning_client ON companies (owning_client_id)",
+	# Week 1 Subtask 1.1.1's idx_companies_domain requirement, named
+	# explicitly — domain already has a UNIQUE constraint (companies_domain_key,
+	# its own auto-named index) but the DoD checks for this literal name via \di.
+	"CREATE INDEX IF NOT EXISTS idx_companies_domain ON companies (domain)",
 	"GRANT SELECT, INSERT, UPDATE ON companies TO blackink_app",
 	# promotion_sweep.py and county_allocation_reassessment.py (src/tasks/)
 	# both run as blackink_system and write across every tenant's companies.

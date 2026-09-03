@@ -11,6 +11,7 @@ fastapi>=0.110
 uvicorn>=0.27
 pyjwt>=2.8
 pytest>=8.0
+tzdata>=2024.1
 pytest-asyncio>=0.24
 slack_sdk>=3.38
 slack-bolt>=1.18
