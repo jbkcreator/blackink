@@ -252,6 +252,12 @@ async def _finalize_terminal_decision(order: "wo.WorkOrder", *, decision: str, u
 		# work_orders.record_decision caught it. Not an error; just no-op.
 		await respond(response_type="ephemeral", text=":information_source: This was just decided by someone else.")
 		return
+	# Decrement Cora's approval backlog for human review decisions so the
+	# throttle can resume when the queue clears. SKIPPED/SNOOZED are not
+	# "reviewed" — only a genuine approve or reject counts as a resolved draft.
+	if decision in {"APPROVED", "REJECTED"}:
+		from src.agents.cora.throttle import notify_approval_resolved
+		notify_approval_resolved()
 	_log_event(order.client_id, "work_order_decided", entity_id=order.action_id, actor=f"slack:{user_id}", payload={"decision": decision})
 	if decided.slack_channel_id and decided.slack_message_ts:
 		await post.update_card(
