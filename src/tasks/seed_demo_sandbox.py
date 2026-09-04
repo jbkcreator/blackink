@@ -135,6 +135,7 @@ _UPSERT_COMPANY = """
     INSERT INTO companies (company_id, company_name, website, domain, county_slug, door_count_est, current_pm_software, status, owning_client_id)
     VALUES (:company_id, :company_name, :website, :domain, :county_slug, :door_count_est, :current_pm_software, 'CLIENT', :owning_client_id)
     ON CONFLICT (company_id) DO UPDATE SET
+        county_slug = EXCLUDED.county_slug,
         door_count_est = EXCLUDED.door_count_est,
         current_pm_software = EXCLUDED.current_pm_software,
         owning_client_id = EXCLUDED.owning_client_id

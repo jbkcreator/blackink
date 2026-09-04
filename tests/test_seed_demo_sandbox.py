@@ -100,3 +100,40 @@ def test_main_skips_company_and_contacts_already_owned_by_another_client():
     # company's fake events must never be logged against a real customer's row.
     for call in mock_log.call_args_list:
         assert call.kwargs.get("entity_id") != colliding_id
+
+
+def test_main_reassigns_county_for_already_seeded_sandbox_company():
+    """PR review finding: the v2 county-narrowing fix (4 counties -> 2) only
+    changes what build_mock_companies() generates going forward. A company
+    already seeded under the OLD 4-county list keeps its stale county_slug
+    forever, because ON CONFLICT previously updated door_count_est/
+    current_pm_software/owning_client_id but never county_slug. Simulates a
+    sandbox-owned company already sitting in orange_fl (pre-v2 data) and
+    confirms a re-run reassigns it to the new 2-county set."""
+    target = build_mock_companies()[0]
+    target_id = target["company_id"]
+
+    def fake_execute(_clause, params=None):
+        result = MagicMock()
+        if params and params.get("company_id") == target_id:
+            # Sandbox already owns this row -> not a collision -> upsert proceeds.
+            result.mappings.return_value.first.return_value = {"owning_client_id": SANDBOX_CLIENT_ID}
+        else:
+            result.mappings.return_value.first.return_value = None
+        return result
+
+    with patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
+         patch("src.tasks.seed_demo_sandbox.log_event"):
+        session = MagicMock()
+        session.execute.side_effect = fake_execute
+        mock_ctx.return_value.__enter__.return_value = session
+        from src.tasks.seed_demo_sandbox import main
+        main()
+
+    upsert_call = next(
+        call for call in session.execute.call_args_list
+        if call.args and "INSERT INTO companies" in str(call.args[0])
+        and call.args[1].get("company_id") == target_id
+    )
+    assert "county_slug = EXCLUDED.county_slug" in str(upsert_call.args[0])
+    assert upsert_call.args[1]["county_slug"] in {"hillsborough_fl", "pinellas_fl"}
