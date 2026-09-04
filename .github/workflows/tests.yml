@@ -34,6 +34,8 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgresql://blackink_owner:test_only_password@localhost:5432/blackink_test
+      DATABASE_URL_APP: postgresql://blackink_app:test_only_password@localhost:5432/blackink_test
+      DATABASE_URL_SYSTEM: postgresql://blackink_system:test_only_password@localhost:5432/blackink_test
       BLACKINK_APP_DB_PASSWORD: test_only_password
       BLACKINK_SYSTEM_DB_PASSWORD: test_only_password
       AKRASH_INGEST_DB_PASSWORD: test_only_password

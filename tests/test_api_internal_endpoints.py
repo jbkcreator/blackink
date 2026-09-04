@@ -213,13 +213,15 @@ class TestMeetingsEndpoint:
     def test_returns_list(self, client):
         token = _login(client)
         res = client.get("/api/meetings/outcomes", headers=_auth(token))
-        assert res.status_code == 200
+        assert res.status_code == 200, res.text
         assert isinstance(res.json(), list)
 
     def test_rows_have_expected_fields(self, client):
         token = _login(client)
         res = client.get("/api/meetings/outcomes", headers=_auth(token))
+        assert res.status_code == 200, res.text
         rows = res.json()
+        assert isinstance(rows, list), f"expected list, got {type(rows)}: {rows}"
         for row in rows[:5]:  # spot-check first five
             assert "attendance_status" in row
             assert "client_id" in row
