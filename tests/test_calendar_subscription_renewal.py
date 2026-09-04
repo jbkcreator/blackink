@@ -28,11 +28,11 @@ class _FakeGoogle:
 		self.session = session
 
 	def register_watch(self, connection, channel_id, webhook_url, verification_secret):
-		return {
-			"resource_id": "res-1",
-			"expires_at_ms": "1",
-			"expires_at": datetime.now(timezone.utc) + timedelta(days=7),
-		}
+		# Real epoch-ms string, as Google's API returns — the caller converts
+		# it via calendar_providers.expires_at_ms_to_datetime(), so a dummy
+		# value here would persist a 1970 expiry and look permanently due.
+		expires_ms = int((datetime.now(timezone.utc) + timedelta(days=7)).timestamp() * 1000)
+		return {"resource_id": "res-1", "expires_at_ms": str(expires_ms)}
 
 
 class _FakeMicrosoft:
@@ -191,12 +191,7 @@ def test_renewal_sweep_persists_google_watch_expiration(monkeypatch, canary_tena
     monkeypatch.setattr(
         GoogleCalendarClient, "register_watch",
         lambda self, connection, channel_id, webhook_url, verification_secret: {
-            "resource_id": "google-resource-id",
-            "expires_at_ms": str(new_expires_ms),
-            # register_watch converts the ms value itself (see
-            # calendar_providers.expires_at_ms_to_datetime) and the renewal
-            # sweep persists this key — the fake must return both.
-            "expires_at": datetime.now(timezone.utc) + timedelta(days=3),
+            "resource_id": "google-resource-id", "expires_at_ms": str(new_expires_ms),
         },
     )
 

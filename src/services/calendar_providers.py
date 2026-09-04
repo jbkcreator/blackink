@@ -161,15 +161,11 @@ class GoogleCalendarClient:
 		)
 		resp.raise_for_status()
 		body = resp.json()
-		# Google returns `expiration` as a Unix timestamp in MILLISECONDS,
-		# as a string — expires_at_ms_to_datetime() converts it for callers
-		# that want a real TIMESTAMPTZ; expires_at_ms rides along too for
-		# callers that already had a use for the raw value.
-		return {
-			"resource_id": body["resourceId"],
-			"expires_at_ms": body.get("expiration"),
-			"expires_at": expires_at_ms_to_datetime(body.get("expiration")),
-		}
+		# Google returns `expiration` as a Unix timestamp in MILLISECONDS, as a
+		# string. It is handed back raw; every caller converts it through
+		# expires_at_ms_to_datetime() before persisting expires_at — one
+		# conversion path, so a caller can't accidentally store the raw ms.
+		return {"resource_id": body["resourceId"], "expires_at_ms": body.get("expiration")}
 
 
 def _is_tagged_microsoft(item: dict) -> bool:

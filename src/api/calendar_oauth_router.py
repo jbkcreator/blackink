@@ -23,7 +23,11 @@ from src.core.token_crypto import encrypt_token
 from src.services import calendar_oauth
 from src.services.booking_ingest import sync_connection_locked
 from src.services.calendar_oauth import OAuthStateError
-from src.services.calendar_providers import GoogleCalendarClient, MicrosoftGraphClient
+from src.services.calendar_providers import (
+	GoogleCalendarClient,
+	MicrosoftGraphClient,
+	expires_at_ms_to_datetime,
+)
 
 router = APIRouter(prefix="/api/v1/calendar", tags=["calendar-oauth"])
 logger = logging.getLogger(__name__)
@@ -129,7 +133,7 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				# verbatim as X-Goog-Channel-ID — it IS the subscription_id,
 				# unlike Microsoft's server-issued one below.
 				watch_result = client.register_watch(existing_row, channel_id, _webhook_url(provider), verification_secret)
-				subscription_expires_at = watch_result.get("expires_at")
+				subscription_expires_at = expires_at_ms_to_datetime(watch_result.get("expires_at_ms"))
 		else:
 			me_calendar = requests.get(
 				"https://graph.microsoft.com/v1.0/me/calendar",

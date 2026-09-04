@@ -23,7 +23,11 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_system_db_context
-from src.services.calendar_providers import GoogleCalendarClient, MicrosoftGraphClient
+from src.services.calendar_providers import (
+	GoogleCalendarClient,
+	MicrosoftGraphClient,
+	expires_at_ms_to_datetime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +88,12 @@ def run_renewal_sweep() -> int:
 							"verification_secret = :secret, expires_at = :expires_at, updated_at = NOW() "
 							"WHERE connection_id = :id"
 						),
-						{"sub": new_channel_id, "secret": verification_secret, "expires_at": result.get("expires_at"), "id": connection.connection_id},
+						{
+							"sub": new_channel_id,
+							"secret": verification_secret,
+							"expires_at": expires_at_ms_to_datetime(result.get("expires_at_ms")),
+							"id": connection.connection_id,
+						},
 					)
 				elif row.provider == "MICROSOFT":
 					client = MicrosoftGraphClient(session)
