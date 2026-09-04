@@ -5,7 +5,6 @@ summary and the company rows in a single round-trip. Result is cached
 in-process for CACHE_TTL seconds — the view's underlying data only changes
 when the seeder runs or an event is logged, so a short TTL is acceptable.
 """
-import logging
 import time
 
 from fastapi import APIRouter, HTTPException
@@ -14,7 +13,6 @@ from sqlalchemy import text
 from src.core.database import get_db_context
 
 router = APIRouter(prefix="/api/sandbox", tags=["sandbox"])
-logger = logging.getLogger(__name__)
 
 _SANDBOX_CLIENT = "DEMO_FRIDAY_SANDBOX"
 _CACHE_TTL = 300  # 5 minutes
@@ -57,23 +55,16 @@ FROM data
 
 @router.get("/companies")
 def list_sandbox_companies():
-    t_start = time.monotonic()
+    now = time.monotonic()
 
-    if _cache["data"] is not None and t_start < _cache["expires_at"]:
-        t_total = (time.monotonic() - t_start) * 1000
-        logger.info("[sandbox] cache HIT  total=%.1f ms", t_total)
+    if _cache["data"] is not None and now < _cache["expires_at"]:
         return _cache["data"]
 
     try:
-        t_db_start = time.monotonic()
         with get_db_context(client_id=_SANDBOX_CLIENT) as session:
             row = session.execute(text(_SQL)).mappings().first()
-        t_db_ms = (time.monotonic() - t_db_start) * 1000
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    t_total = (time.monotonic() - t_start) * 1000
-    logger.info("[sandbox] cache MISS  db=%.1f ms  total=%.1f ms", t_db_ms, t_total)
 
     result = {
         "summary": {
@@ -85,7 +76,7 @@ def list_sandbox_companies():
     }
 
     _cache["data"] = result
-    _cache["expires_at"] = t_start + _CACHE_TTL
+    _cache["expires_at"] = time.monotonic() + _CACHE_TTL
     return result
 
 
@@ -93,5 +84,4 @@ def list_sandbox_companies():
 def clear_sandbox_cache():
     _cache["data"] = None
     _cache["expires_at"] = 0.0
-    logger.info("[sandbox] cache manually cleared")
     return {"cleared": True}
