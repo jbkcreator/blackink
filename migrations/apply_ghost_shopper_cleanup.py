@@ -64,8 +64,20 @@ DDL = [
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS audit_loss_dollars_est NUMERIC(10,2)",
 
     # ── pm_profiles: drop ghost-shopper speed-benchmark columns ───────────────
-    "ALTER TABLE pm_profiles DROP COLUMN IF EXISTS average_speed_to_lead_seconds",
-    "ALTER TABLE pm_profiles DROP COLUMN IF EXISTS top10_speed_to_lead_seconds",
+    # Guarded on the table's own existence, not just the columns' — belt
+    # and suspenders against apply_pm_profiles.py not yet having run
+    # (e.g. this migration invoked out of the documented CLAUDE.md order,
+    # or against a partially-provisioned database) rather than hard-
+    # failing with UndefinedTable in that case.
+    """
+    DO $$
+    BEGIN
+        IF to_regclass('public.pm_profiles') IS NOT NULL THEN
+            ALTER TABLE pm_profiles DROP COLUMN IF EXISTS average_speed_to_lead_seconds;
+            ALTER TABLE pm_profiles DROP COLUMN IF EXISTS top10_speed_to_lead_seconds;
+        END IF;
+    END $$
+    """,
 ]
 
 

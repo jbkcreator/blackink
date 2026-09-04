@@ -341,3 +341,188 @@ def test_confirmation_claim_and_send_marks_sent(calendar_connection, monkeypatch
 		final = session.execute(text("SELECT * FROM bookings WHERE booking_id = :id"), {"id": booking.booking_id}).one()
 		assert final.confirmation_status == "SENT"
 		assert fake_provider.sent == ["confirm@example.com"]
+
+
+# -- Subtask 3.2.2 -- Show-Rate Reminder Cascade --------------------------------
+# INTERNAL_SALES_DEMO-scope fixtures: a prospective PM firm booking a
+# sales-demo call with a Blackink sales rep, under the reserved
+# BLACKINK_INTERNAL_SALES client_id -- see booking_ingest.py's module
+# docstring and schedule_show_rate_reminders().
+
+_BLACKINK_INTERNAL_SALES = "BLACKINK_INTERNAL_SALES"
+
+
+@pytest.fixture
+def sales_demo_connection():
+	with get_system_db_context() as session:
+		row = session.execute(
+			text(
+				"INSERT INTO calendar_connections "
+				"(client_id, provider, connection_scope, external_calendar_id, subscription_id, "
+				" verification_secret, initial_sync_done) "
+				"VALUES (:cid, 'GOOGLE', 'INTERNAL_SALES_DEMO', 'rep-primary', 'sub-sales-demo', 'secret', TRUE) "
+				"RETURNING connection_id"
+			),
+			{"cid": _BLACKINK_INTERNAL_SALES},
+		).one()
+		connection_id = row.connection_id
+	yield connection_id
+	with get_owner_db_context() as session:
+		# booking_reminder_jobs has no DELETE grant for blackink_app/blackink_system
+		# in production (a reminder job is never deleted, only status-transitioned) --
+		# test cleanup goes through the owner/superuser context instead.
+		session.execute(text("DELETE FROM booking_reminder_jobs WHERE booking_id IN "
+							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
+	with get_system_db_context() as session:
+		session.execute(text("DELETE FROM bookings WHERE calendar_connection_id = :id"), {"id": connection_id})
+		session.execute(text("DELETE FROM calendar_connections WHERE connection_id = :id"), {"id": connection_id})
+	with get_owner_db_context() as session:
+		session.execute(text("DELETE FROM events WHERE client_id = :cid"), {"cid": _BLACKINK_INTERNAL_SALES})
+
+
+@pytest.fixture
+def sales_demo_target_contact():
+	"""A real companies/contacts row -- the OVS scores companies (PM firms),
+	so a sales-demo booking's target is matched against contacts.email,
+	never owner_contacts (see booking_ingest.py's _find_sales_demo_target)."""
+	with get_owner_db_context() as session:
+		company = session.execute(
+			text(
+				"INSERT INTO companies (company_id, company_name, domain, county_slug, status) "
+				"VALUES ('test-sales-demo-co', 'Test Sales Demo PM Co', 'salesdemo-test.example.com', "
+				"(SELECT county_slug FROM counties LIMIT 1), 'PROSPECTING') "
+				"ON CONFLICT (company_id) DO NOTHING RETURNING company_id"
+			)
+		).first()
+		company_id = company.company_id if company else "test-sales-demo-co"
+		session.execute(text("DELETE FROM contacts WHERE email = 'sam@salesdemo-test.example.com'"))
+		contact = session.execute(
+			text(
+				"INSERT INTO contacts (company_id, contact_role_type, first_name, last_name, email, phone) "
+				"VALUES (:cid, 'OWNER_BROKER_MD', 'Sam', 'Prospect', 'sam@salesdemo-test.example.com', '+14075551234') "
+				"RETURNING contact_id"
+			),
+			{"cid": company_id},
+		).one()
+	yield {"company_id": company_id, "contact_id": contact.contact_id, "email": "sam@salesdemo-test.example.com"}
+	with get_owner_db_context() as session:
+		session.execute(text("DELETE FROM contacts WHERE contact_id = :id"), {"id": contact.contact_id})
+		session.execute(text("DELETE FROM companies WHERE company_id = :id"), {"id": company_id})
+
+
+def test_sales_demo_booking_matches_via_contacts_not_owner_contacts(sales_demo_target_contact, sales_demo_connection):
+	target = sales_demo_target_contact
+	client = _FakeProviderClient(incremental_events=[_tagged_event("evt-sales-demo-match", owner_email=target["email"])])
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, client)
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-sales-demo-match'"),
+			{"id": sales_demo_connection},
+		).one()
+		assert booking.status == "MATCHED"
+		assert booking.target_company_id == target["company_id"]
+		assert booking.target_contact_id == target["contact_id"]
+		assert booking.owner_contact_id is None
+
+
+def test_new_sales_demo_booking_schedules_both_reminder_jobs(sales_demo_target_contact, sales_demo_connection):
+	target = sales_demo_target_contact
+	scheduled_at = datetime.now(timezone.utc) + timedelta(days=2)
+	client = _FakeProviderClient(incremental_events=[
+		_tagged_event("evt-schedule", owner_email=target["email"], scheduled_at=scheduled_at)
+	])
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, client)
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-schedule'"),
+			{"id": sales_demo_connection},
+		).one()
+		jobs = {
+			r.reminder_step: r for r in session.execute(
+				text("SELECT * FROM booking_reminder_jobs WHERE booking_id = :id"), {"id": booking.booking_id}
+			).fetchall()
+		}
+		assert set(jobs) == {"24h_email", "30min_email"}
+		assert jobs["24h_email"].status == "PENDING"
+		assert jobs["24h_email"].scheduled_for == scheduled_at - timedelta(hours=24)
+		assert jobs["30min_email"].status == "PENDING"
+		assert jobs["30min_email"].scheduled_for == scheduled_at - timedelta(minutes=30)
+
+
+def test_booking_less_than_24h_out_skips_only_the_24h_reminder(sales_demo_target_contact, sales_demo_connection):
+	target = sales_demo_target_contact
+	scheduled_at = datetime.now(timezone.utc) + timedelta(hours=2)
+	client = _FakeProviderClient(incremental_events=[
+		_tagged_event("evt-near-term", owner_email=target["email"], scheduled_at=scheduled_at)
+	])
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, client)
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-near-term'"),
+			{"id": sales_demo_connection},
+		).one()
+		jobs = {
+			r.reminder_step: r for r in session.execute(
+				text("SELECT * FROM booking_reminder_jobs WHERE booking_id = :id"), {"id": booking.booking_id}
+			).fetchall()
+		}
+		assert jobs["24h_email"].status == "SKIPPED"
+		assert jobs["30min_email"].status == "PENDING"
+
+
+def test_reschedule_updates_pending_reminder_jobs(sales_demo_target_contact, sales_demo_connection):
+	target = sales_demo_target_contact
+	original_time = datetime.now(timezone.utc) + timedelta(days=3)
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-resched", owner_email=target["email"], scheduled_at=original_time)
+		]))
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-resched'"),
+			{"id": sales_demo_connection},
+		).one()
+
+		new_time = original_time + timedelta(days=1)
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-resched", owner_email=target["email"], scheduled_at=new_time)
+		]))
+		jobs = {
+			r.reminder_step: r for r in session.execute(
+				text("SELECT * FROM booking_reminder_jobs WHERE booking_id = :id"), {"id": booking.booking_id}
+			).fetchall()
+		}
+		assert jobs["24h_email"].scheduled_for == new_time - timedelta(hours=24)
+		assert jobs["30min_email"].scheduled_for == new_time - timedelta(minutes=30)
+		assert jobs["24h_email"].status == "PENDING"
+
+
+def test_cancellation_leaves_zero_claimable_reminder_jobs(sales_demo_target_contact, sales_demo_connection):
+	target = sales_demo_target_contact
+	scheduled_at = datetime.now(timezone.utc) + timedelta(days=2)
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-cancel-reminders", owner_email=target["email"], scheduled_at=scheduled_at)
+		]))
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-cancel-reminders'"),
+			{"id": sales_demo_connection},
+		).one()
+
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-cancel-reminders", owner_email=target["email"], status="CANCELLED")
+		]))
+
+		claimable = session.execute(
+			text(
+				"SELECT * FROM booking_reminder_jobs WHERE booking_id = :id "
+				"AND status IN ('PENDING', 'FAILED', 'SENDING', 'BLOCKED')"
+			),
+			{"id": booking.booking_id},
+		).fetchall()
+		assert claimable == []
+
+		all_jobs = session.execute(
+			text("SELECT * FROM booking_reminder_jobs WHERE booking_id = :id"), {"id": booking.booking_id}
+		).fetchall()
+		assert len(all_jobs) == 2
+		assert all(j.status == "CANCELLED" for j in all_jobs)

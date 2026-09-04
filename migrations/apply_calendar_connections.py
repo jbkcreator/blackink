@@ -22,6 +22,9 @@ time-limited).
 
 Idempotent: CREATE TABLE IF NOT EXISTS.
 
+Extended for Subtask 3.2.2 (Show-Rate Reminder Cascade) with
+connection_scope — see the DDL block below for the full rationale.
+
     PYTHONPATH=. python migrations/apply_calendar_connections.py
 """
 import sys
@@ -70,6 +73,54 @@ DDL = [
 	# src/services/ghl_webhook.py) — the column stays NOT NULL for
 	# Google/Microsoft rows; GHL rows store a fixed placeholder.
 	"ALTER TABLE calendar_connections ALTER COLUMN external_calendar_id DROP NOT NULL",
+
+	# ── Subtask 3.2.2 — Show-Rate Reminder Cascade ───────────────────────────
+	# connection_scope distinguishes 3.2.1's original CLIENT_OWNER_BOOKING
+	# (a property owner booking on the PM-firm client's own calendar) from
+	# INTERNAL_SALES_DEMO (a prospective PM firm booking a sales-demo call
+	# on an authorized Blackink sales rep's own Google/Microsoft calendar —
+	# per W1-8, "Blackink never books into a Blackink calendar" governs
+	# CLIENT_OWNER_BOOKING; INTERNAL_SALES_DEMO still uses real,
+	# individually OAuth-authorized calendars belonging to real Blackink
+	# staff, never a shared/pooled one and never Calendly).
+	"ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS connection_scope VARCHAR(30) NOT NULL DEFAULT 'CLIENT_OWNER_BOOKING'",
+	"ALTER TABLE calendar_connections DROP CONSTRAINT IF EXISTS ck_calendar_connections_scope",
+	"""
+	ALTER TABLE calendar_connections
+		ADD CONSTRAINT ck_calendar_connections_scope CHECK (connection_scope IN ('CLIENT_OWNER_BOOKING', 'INTERNAL_SALES_DEMO'))
+	""",
+	# Reserved internal client row — INTERNAL_SALES_DEMO connections belong
+	# to this pseudo-tenant rather than a real paying client, reusing
+	# RLS/tenant-scoping as-is instead of special-casing "no client"
+	# throughout calendar_connections/bookings/booking_reminder_jobs.
+	"""
+	INSERT INTO clients (client_id, display_name, plan_tier, is_active)
+	VALUES ('BLACKINK_INTERNAL_SALES', 'Blackink Internal Sales', 'internal', TRUE)
+	ON CONFLICT (client_id) DO NOTHING
+	""",
+	# uq_calendar_connections_client_provider (client_id, provider) enforced
+	# "one connection per client per provider" for the original
+	# CLIENT_OWNER_BOOKING case — correct there (a PM firm connects at most
+	# one Google + one Microsoft calendar), but wrong for
+	# INTERNAL_SALES_DEMO, where multiple Blackink sales reps each hold
+	# their own connection under the same reserved client_id. Replaced with
+	# two partial unique indexes so each scope gets the uniqueness rule
+	# that's actually correct for it. NOTE: any ON CONFLICT (client_id,
+	# provider) clause elsewhere (calendar_oauth_router.py's callback,
+	# ghl_webhook.py's mint_ghl_webhook_credentials) must add
+	# "WHERE connection_scope = 'CLIENT_OWNER_BOOKING'" to keep matching a
+	# partial index — Postgres does not infer a partial index from a bare
+	# column-list ON CONFLICT clause.
+	"ALTER TABLE calendar_connections DROP CONSTRAINT IF EXISTS uq_calendar_connections_client_provider",
+	"""
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_calendar_connections_client_provider_owner
+		ON calendar_connections (client_id, provider) WHERE connection_scope = 'CLIENT_OWNER_BOOKING'
+	""",
+	"""
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_calendar_connections_client_provider_calendar_sales
+		ON calendar_connections (client_id, provider, external_calendar_id) WHERE connection_scope = 'INTERNAL_SALES_DEMO'
+	""",
+
 	"CREATE INDEX IF NOT EXISTS ix_calendar_connections_client ON calendar_connections (client_id)",
 	# DELETE granted alongside SELECT/INSERT/UPDATE — same convention as
 	# contacts/companies, needed for test-fixture teardown, not just
@@ -102,17 +153,36 @@ DDL = [
 	# system role — that role is never imported from src/api/, and this
 	# function returns only the minimal identity needed to then open a
 	# properly client_id-scoped session for everything else.
+	#
+	# Deliberately NO caller-scope check here (unlike
+	# resolve_sales_demo_target() in apply_bookings.py) — this function's
+	# whole purpose is bootstrapping identity from a pre-auth webhook
+	# request that has no client_id context to check yet. Its safety
+	# instead comes from the lookup key itself: (provider, subscription_id)
+	# is not a broad search parameter like an email — subscription_id is an
+	# unguessable secrets.token_urlsafe(24) value, so a caller would already
+	# need to know a real one, and the query only ever returns that single
+	# connection's own row, never an arbitrary scan.
+	#
+	# search_path/REVOKE/OWNER hardening matches is_claimed_by_other_client()'s
+	# established convention (apply_compliance_gate_audit.py) — the original
+	# version of this function in this branch's history had neither.
+	"DROP FUNCTION IF EXISTS resolve_calendar_connection(VARCHAR, VARCHAR)",
 	"""
 	CREATE OR REPLACE FUNCTION resolve_calendar_connection(p_provider VARCHAR, p_subscription_id VARCHAR)
 	RETURNS TABLE(connection_id BIGINT, client_id VARCHAR, verification_secret VARCHAR)
-	LANGUAGE sql SECURITY DEFINER
+	SECURITY DEFINER
+	SET search_path = public
+	LANGUAGE sql
 	AS $$
 		SELECT connection_id, client_id, verification_secret
-		FROM calendar_connections
+		FROM public.calendar_connections
 		WHERE provider = p_provider AND subscription_id = p_subscription_id AND status = 'ACTIVE'
 	$$
 	""",
+	"REVOKE EXECUTE ON FUNCTION resolve_calendar_connection(VARCHAR, VARCHAR) FROM PUBLIC",
 	"GRANT EXECUTE ON FUNCTION resolve_calendar_connection(VARCHAR, VARCHAR) TO blackink_app",
+	"ALTER FUNCTION resolve_calendar_connection(VARCHAR, VARCHAR) OWNER TO CURRENT_USER",
 ]
 
 

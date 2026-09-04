@@ -276,6 +276,61 @@ the identical booking/owner-matching/confirmation pipeline as Google/
 Microsoft via `booking_ingest._process_event` — one implementation, not
 three.
 
+### Show-Rate Reminder Cascade (Subtask 3.2.2)
+A second, distinct booking flow from 3.2.1 above:
+`calendar_connections.connection_scope` is `CLIENT_OWNER_BOOKING` (a
+property owner booking the PM-firm client's own calendar, 3.2.1) or
+`INTERNAL_SALES_DEMO` (a prospective PM firm booking a sales-demo call
+with an authorized Blackink sales rep's own Google/Microsoft calendar,
+under the reserved `client_id='BLACKINK_INTERNAL_SALES'` row). W1-8
+("Blackink never books into a Blackink calendar") governs
+`CLIENT_OWNER_BOOKING`; `INTERNAL_SALES_DEMO` still uses real,
+individually OAuth-authorized calendars belonging to real staff, never a
+shared/pooled one and never Calendly — the two scopes differ only in
+*whose* calendar receives the booking. An `INTERNAL_SALES_DEMO` booking
+matches its target against `contacts`/`companies` by work email (via the
+`resolve_sales_demo_target()` `SECURITY DEFINER` function — those tables
+are RLS-scoped through `companies.owning_client_id`, which is `NULL` for
+every unallocated prospect, so a session scoped to the internal-sales
+client_id can never see them directly), never `owner_contacts`; `bookings`
+carries `target_company_id`/`target_contact_id` for this scope instead of
+`owner_contact_id`.
+
+`booking_reminder_jobs` holds two rows per `INTERNAL_SALES_DEMO` booking
+(`24h_email`, `30min_email`), created/rescheduled/cancelled by
+`booking_ingest.schedule_show_rate_reminders()` on every insert,
+reschedule, *and* cancellation of such a booking (not gated on a
+new-insert check alone, or a reschedule would silently fail to move its
+jobs). Fire time is an absolute `TIMESTAMPTZ` offset from
+`bookings.scheduled_at` — no timezone math needed to decide *when* a job
+runs. `src/tasks/show_rate_reminder_sender.py`'s sweep claims due jobs via
+`src/services/show_rate_reminders.py`'s `SKIP LOCKED` pattern (mirroring
+`calendar_confirmation.py`), with the claim comparison taking an explicit
+`claim_time`/`as_of` parameter rather than SQL `NOW()` — what makes a
+fast-forward timing test possible without a real 24-hour wait, and what
+lets `send_show_rate_reminder()` refuse to send a reminder for a meeting
+that's already started (`as_of >= scheduled_at` → `SKIPPED`, never a
+stale send) regardless of why processing was delayed.
+
+The 30-minute pre-demo email attaches Dev 2's **stored** Owner
+Visibility Score PDF (`contacts.ovs_pdf_url`, fetched via `httpx`) —
+never regenerates one via `pdf_report.compile_pdf()` itself, which would
+produce a second, independently-generated report. If no
+`owner_visibility_scores` row or `ovs_pdf_url` exists yet for the target
+company (true today — `owner_visibility_sweep.py` doesn't populate
+`ovs_pdf_url`, only the compiler function exists), the job is marked
+`BLOCKED` (`MISSING_OVS_SCORE` / `MISSING_OVS_PDF`) rather than sending
+fabricated content; the sweep's self-heal step re-checks and auto-
+promotes those specific rows back to `PENDING` the moment the underlying
+data actually appears, no event-consumer plumbing required. `BLOCKED`
+rows (that reason, or `EMAIL_SENDING_DISABLED`) and `UNCERTAIN` rows are
+excluded from the claim query — never re-reclaimed every sweep tick.
+No self-serve reschedule mechanism exists anywhere in this repo or its
+provider contracts (Google's `htmlLink`/Microsoft's `webLink` are
+event-*view* links, not reschedule actions) — the 24h email may show a
+correctly-labelled "View calendar event" link, never a relabeled or
+fabricated reschedule link.
+
 ## Tooling Rules
 
 - **Language/runtime**: Python 3.11+.
