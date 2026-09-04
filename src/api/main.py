@@ -46,6 +46,7 @@ _QUEUE_DRAIN_INTERVAL_SECONDS = 10
 _SAFETY_SWEEP_INTERVAL_SECONDS = 300
 _CONFIRMATION_SWEEP_INTERVAL_SECONDS = 30
 _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS = 3600
+_SHOW_RATE_REMINDER_SWEEP_INTERVAL_SECONDS = 60
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -61,12 +62,17 @@ def _start_background_workers() -> None:
 	from src.tasks.booking_confirmation_sender import run_sweep
 	from src.tasks.calendar_subscription_renewal import run_renewal_sweep
 	from src.tasks.calendar_sync_worker import drain_queue, sweep_all_active_connections
+	from src.tasks.show_rate_reminder_sender import run_sweep as show_rate_reminder_sweep
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
 		("calendar_sync_worker.sweep_all_active_connections", _SAFETY_SWEEP_INTERVAL_SECONDS, sweep_all_active_connections),
 		("booking_confirmation_sender.run_sweep", _CONFIRMATION_SWEEP_INTERVAL_SECONDS, run_sweep),
 		("calendar_subscription_renewal.run_renewal_sweep", _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS, run_renewal_sweep),
+		# Subtask 3.2.2 — the show-rate reminder cascade's only sender. Without
+		# this the 24h/30min booking_reminder_jobs stay PENDING forever and the
+		# whole feature never emails anyone in the deployed app.
+		("show_rate_reminder_sender.run_sweep", _SHOW_RATE_REMINDER_SWEEP_INTERVAL_SECONDS, show_rate_reminder_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)

@@ -49,10 +49,19 @@ def run_renewal_sweep() -> int:
 
 	renewed = 0
 	with get_system_db_context() as session:
+		# GoHighLevel connections have no OAuth tokens and no provider-side
+		# push subscription to renew -- their bookings arrive directly in the
+		# webhook POST (src/services/ghl_webhook.py -> process_ghl_event).
+		# They must be excluded here: their expires_at is permanently NULL,
+		# so they would otherwise be selected as due every sweep, routed to
+		# the Microsoft Graph branch below, fail for lack of credentials, and
+		# be flipped to NEEDS_RECONNECT -- which the webhook resolver then
+		# rejects, silently dropping real GHL bookings.
 		due = session.execute(
 			text(
 				"SELECT connection_id, provider FROM calendar_connections "
-				"WHERE status = 'ACTIVE' AND (expires_at IS NULL OR expires_at <= :cutoff)"
+				"WHERE status = 'ACTIVE' AND provider IN ('GOOGLE', 'MICROSOFT') "
+				"AND (expires_at IS NULL OR expires_at <= :cutoff)"
 			),
 			{"cutoff": datetime.now(timezone.utc) + _RENEW_WITHIN},
 		).fetchall()
@@ -72,9 +81,10 @@ def run_renewal_sweep() -> int:
 					session.execute(
 						text(
 							"UPDATE calendar_connections SET subscription_id = :sub, "
-							"verification_secret = :secret, updated_at = NOW() WHERE connection_id = :id"
+							"verification_secret = :secret, expires_at = :expires_at, updated_at = NOW() "
+							"WHERE connection_id = :id"
 						),
-						{"sub": new_channel_id, "secret": verification_secret, "id": connection.connection_id},
+						{"sub": new_channel_id, "secret": verification_secret, "expires_at": result.get("expires_at"), "id": connection.connection_id},
 					)
 				else:
 					client = MicrosoftGraphClient(session)
