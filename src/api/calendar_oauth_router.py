@@ -23,7 +23,11 @@ from src.core.token_crypto import encrypt_token
 from src.services import calendar_oauth
 from src.services.booking_ingest import sync_connection_locked
 from src.services.calendar_oauth import OAuthStateError
-from src.services.calendar_providers import GoogleCalendarClient, MicrosoftGraphClient
+from src.services.calendar_providers import (
+	GoogleCalendarClient,
+	MicrosoftGraphClient,
+	expires_at_ms_to_datetime,
+)
 
 router = APIRouter(prefix="/api/v1/calendar", tags=["calendar-oauth"])
 logger = logging.getLogger(__name__)
@@ -111,6 +115,8 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				access_token_encrypted=encrypt_token(tokens.access_token), token_expires_at=tokens.expires_at,
 			)
 			client = GoogleCalendarClient(session)
+			subscription_id_value = channel_id
+			subscription_expires_at = None
 			if get_settings().skip_calendar_watch_registration:
 				logger.warning(
 					"SKIP_CALENDAR_WATCH_REGISTRATION is set — connecting client %s's Google calendar "
@@ -123,9 +129,11 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				# register_watch needs a connection-shaped object with a valid
 				# access token available via get_valid_access_token(); the row
 				# doesn't exist yet, so we pass a lightweight stand-in exposing
-				# just what that call needs.
-				client.register_watch(existing_row, channel_id, _webhook_url(provider), verification_secret)
-			subscription_expires_at = None
+				# just what that call needs. Google echoes channel_id back
+				# verbatim as X-Goog-Channel-ID — it IS the subscription_id,
+				# unlike Microsoft's server-issued one below.
+				watch_result = client.register_watch(existing_row, channel_id, _webhook_url(provider), verification_secret)
+				subscription_expires_at = expires_at_ms_to_datetime(watch_result.get("expires_at_ms"))
 		else:
 			me_calendar = requests.get(
 				"https://graph.microsoft.com/v1.0/me/calendar",
@@ -139,6 +147,7 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				access_token_encrypted=encrypt_token(tokens.access_token), token_expires_at=tokens.expires_at,
 			)
 			client = MicrosoftGraphClient(session)
+			subscription_id_value = channel_id
 			subscription_expires_at = None
 			if get_settings().skip_calendar_watch_registration:
 				logger.warning(
@@ -147,9 +156,14 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 					claims.client_id,
 				)
 			else:
+				# Graph issues its own subscription id (body["id"]) — distinct
+				# from the locally generated channel_id, and it's what Graph's
+				# webhook payload carries back, so it must be what's persisted
+				# as subscription_id or resolve_calendar_connection() can never
+				# find this row (previously stored channel_id here — a bug).
 				sub_result = client.register_subscription(existing_row, _webhook_url(provider), verification_secret)
+				subscription_id_value = sub_result["subscription_id"]
 				subscription_expires_at = sub_result.get("expires_at")
-			subscription_expires_at = sub_result.get("expires_at")
 
 		row = session.execute(
 			text(
@@ -178,7 +192,7 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				"client_id": claims.client_id,
 				"provider": provider,
 				"external_calendar_id": external_calendar_id,
-				"subscription_id": channel_id,
+				"subscription_id": subscription_id_value,
 				"verification_secret": verification_secret,
 				"access_token_encrypted": encrypt_token(tokens.access_token),
 				"refresh_token_encrypted": encrypt_token(tokens.refresh_token),

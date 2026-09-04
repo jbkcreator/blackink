@@ -32,6 +32,21 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+
+def expires_at_ms_to_datetime(expires_at_ms: Optional[str]) -> Optional[datetime]:
+    """Google's watch registration returns `expiration` as an epoch-ms
+    string (per the Google Calendar API's own JSON convention for that
+    field) — converts it to a real TIMESTAMPTZ value so
+    calendar_connections.expires_at is populated the same way for both
+    providers, instead of Google connections permanently carrying a NULL
+    expiry that makes every renewal sweep tick treat them as due."""
+    if expires_at_ms is None:
+        return None
+    return datetime.fromtimestamp(int(expires_at_ms) / 1000, tz=timezone.utc)
+
+from datetime import datetime, timezone
+from typing import Optional
+
 import requests
 
 from src.services.booking_ingest import (
