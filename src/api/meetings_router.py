@@ -4,12 +4,13 @@ Queries meeting_outcomes joined with contacts + companies for display names.
 Uses system role (BYPASSRLS) — this is a cross-client internal ops view.
 No auth guard yet.
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 
+from src.api.deps import require_admin_jwt
 from src.core.database import get_system_db_context
 
-router = APIRouter(prefix="/api/meetings", tags=["meetings"])
+router = APIRouter(prefix="/api/meetings", tags=["meetings"], dependencies=[Depends(require_admin_jwt)])
 
 _OUTCOMES_SQL = """
     SELECT

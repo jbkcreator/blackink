@@ -7,12 +7,13 @@ when the seeder runs or an event is logged, so a short TTL is acceptable.
 """
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 
+from src.api.deps import require_admin_jwt
 from src.core.database import get_db_context
 
-router = APIRouter(prefix="/api/sandbox", tags=["sandbox"])
+router = APIRouter(prefix="/api/sandbox", tags=["sandbox"], dependencies=[Depends(require_admin_jwt)])
 
 _SANDBOX_CLIENT = "DEMO_FRIDAY_SANDBOX"
 _CACHE_TTL = 300  # 5 minutes
@@ -35,7 +36,7 @@ WITH data AS (
 SELECT
     COUNT(*)                                              AS total_companies,
     COALESCE(SUM(door_count_est), 0)                     AS total_doors,
-    COUNT(*) FILTER (WHERE meetings_booked > 0)          AS total_meetings,
+    COALESCE(SUM(meetings_booked), 0)                    AS total_meetings,
     json_agg(
         json_build_object(
             'company_id',          company_id,

@@ -5,12 +5,13 @@ window, platform-wide (no client_id filter, system role). No auth guard yet.
 """
 from datetime import timedelta
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 
+from src.api.deps import require_admin_jwt
 from src.core.database import get_system_db_context
 
-router = APIRouter(prefix="/api/metrics", tags=["metrics"])
+router = APIRouter(prefix="/api/metrics", tags=["metrics"], dependencies=[Depends(require_admin_jwt)])
 
 _WINDOW = timedelta(hours=24)
 
@@ -28,6 +29,7 @@ _METRICS_SQL = """
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
+      AND client_id <> 'DEMO_FRIDAY_SANDBOX'
 """
 
 
