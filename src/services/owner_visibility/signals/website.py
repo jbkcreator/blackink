@@ -18,10 +18,13 @@ import ipaddress
 import logging
 import re
 import socket
+import time
+from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlunparse
 
 import requests
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 
 from src.services.owner_visibility.signals.base import (
@@ -34,8 +37,17 @@ from src.services.owner_visibility.signals.base import (
 
 logger = logging.getLogger(__name__)
 
-_REQUEST_TIMEOUT = 8
+# (connect, read) inactivity timeouts — a per-socket-operation limit.
+_REQUEST_TIMEOUT = (5, 8)
 _MAX_REDIRECTS = 2
+# Hard caps that an inactivity timeout alone cannot provide: an absolute
+# wall-clock deadline for the whole fetch (all redirect hops included), and a
+# maximum body size read while streaming. Without these, a hostile site can
+# hold the single self-serve worker forever by dribbling bytes just fast
+# enough to keep resetting the read timeout, or exhaust memory with an
+# unbounded body — this provider is reachable from the public /audit page.
+_TOTAL_DEADLINE_SECONDS = 20
+_MAX_RESPONSE_BYTES = 5 * 1024 * 1024  # 5 MiB
 
 
 class UnsafeFetchTargetError(Exception):
@@ -47,30 +59,106 @@ class UnsafeFetchTargetError(Exception):
     used to reach internal infrastructure (SSRF)."""
 
 
-def _is_safe_host(hostname: str) -> bool:
-    """Resolves hostname and rejects if ANY resolved address is
+class _FetchAborted(Exception):
+    """Streaming read hit the absolute deadline or the size cap."""
+
+
+@dataclass
+class _FetchedPage:
+    """The subset of a response the scoring functions read, with the body
+    already fully (and safely, size-capped) buffered so nothing downstream
+    can re-trigger a stream from an attacker-controlled socket."""
+    status_code: int
+    url: str
+    content: bytes
+    headers: dict
+
+
+def _safe_ip_for_host(hostname: str) -> str | None:
+    """Resolve hostname and return ONE validated public IP to connect to,
+    or None if it can't be resolved or ANY resolved address is
     private/loopback/link-local/multicast/reserved (covers RFC1918,
     127.0.0.0/8, 169.254.0.0/16 including the 169.254.169.254 cloud
     metadata address, multicast, and other IANA-reserved ranges).
-    Checked before the initial request AND again on every redirect hop
-    (see _fetch) — closing most of the DNS-rebinding window, though a
-    residual TOCTOU gap remains between this check and the underlying
-    socket library's own connect-time resolution (requests does not
-    expose a way to pin the validated IP without a custom transport
-    adapter, not implemented here)."""
+
+    Returning the validated IP — not just a bool — is what lets the caller
+    PIN the connection to it (see _PinnedIPAdapter). Validating the name and
+    then letting requests resolve it again at connect time is a DNS-rebinding
+    hole: an attacker's resolver can answer public on the first lookup and
+    169.254.169.254 on the second. Pinning to this exact validated address
+    closes that TOCTOU gap — every byte is fetched from an address that was
+    checked, never a second, attacker-swapped resolution."""
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
-        return False
+        return None
+    safe_ip = None
     for info in infos:
         addr = info[4][0]
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
-            return False
+            return None
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
-            return False
-    return True
+            return None
+        if safe_ip is None:
+            safe_ip = addr
+    return safe_ip
+
+
+def _is_safe_host(hostname: str) -> bool:
+    """Back-compat boolean wrapper around _safe_ip_for_host()."""
+    return _safe_ip_for_host(hostname) is not None
+
+
+class _PinnedIPAdapter(HTTPAdapter):
+    """Pins every connection this adapter makes to a pre-validated IP while
+    preserving the original hostname for TLS SNI and certificate
+    verification. This is what actually forecloses DNS rebinding: the socket
+    dials the exact address _safe_ip_for_host() checked, never a fresh,
+    possibly-swapped resolution of the name."""
+
+    def __init__(self, pinned_ip: str, sni_hostname: str, is_https: bool, **kwargs):
+        self._pinned_ip = pinned_ip
+        self._sni_hostname = sni_hostname
+        self._is_https = is_https
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        # For TLS, verify the cert against — and send SNI for — the REAL
+        # hostname even though the socket connects to the pinned IP. These
+        # kwargs are only valid on an HTTPS pool, so never set them for http.
+        if self._is_https:
+            kwargs["assert_hostname"] = self._sni_hostname
+            kwargs["server_hostname"] = self._sni_hostname
+        super().init_poolmanager(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        parsed = urlparse(request.url)
+        host, port = parsed.hostname, parsed.port
+        ip = self._pinned_ip
+        ip_netloc = f"[{ip}]" if ":" in ip else ip
+        if port:
+            ip_netloc += f":{port}"
+        request.url = urlunparse(parsed._replace(netloc=ip_netloc))
+        request.headers["Host"] = host if not port else f"{host}:{port}"
+        return super().send(request, **kwargs)
+
+
+def _read_capped(resp: requests.Response, deadline: float) -> bytes:
+    """Stream the body, enforcing both the size cap and the absolute
+    deadline while reading — never buffering an unbounded body and never
+    letting a slow-drip response run past the wall-clock limit."""
+    total = 0
+    chunks = []
+    for chunk in resp.iter_content(chunk_size=8192):
+        if time.monotonic() > deadline:
+            raise _FetchAborted("absolute fetch deadline exceeded")
+        total += len(chunk)
+        if total > _MAX_RESPONSE_BYTES:
+            raise _FetchAborted(f"response body exceeded {_MAX_RESPONSE_BYTES} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 # Regex patterns for after-hours detection — case-insensitive.
 _AFTER_HOURS_PATTERNS = [
@@ -84,27 +172,56 @@ _AFTER_HOURS_PATTERNS = [
 _OWNER_PAGE_SLUGS = ["/owner", "/landlord", "/property-owner", "/for-owners", "/for-landlords"]
 
 
-def _get_validated(target: str, headers: dict) -> requests.Response:
+def _get_validated(target: str, headers: dict) -> _FetchedPage:
     """Manually follows redirects (never requests' own allow_redirects=True)
-    so every hop's hostname is re-validated by _is_safe_host() before the
-    request is issued — a redirect to an internal/reserved address must
-    be rejected the same as a direct request to one."""
-    session = requests.Session()
+    so every hop's hostname is re-validated before the request is issued —
+    a redirect to an internal/reserved address is rejected the same as a
+    direct request to one. Each hop's connection is PINNED to the exact IP
+    that was validated (via _PinnedIPAdapter), closing the DNS-rebinding
+    TOCTOU gap, and the body is streamed under an absolute deadline and a
+    size cap shared across all hops."""
+    deadline = time.monotonic() + _TOTAL_DEADLINE_SECONDS
     url = target
     for _ in range(_MAX_REDIRECTS + 1):
-        hostname = urlparse(url).hostname
-        if not hostname or not _is_safe_host(hostname):
+        if time.monotonic() > deadline:
+            raise _FetchAborted("absolute fetch deadline exceeded before request")
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        safe_ip = _safe_ip_for_host(hostname) if hostname else None
+        if not safe_ip:
             raise UnsafeFetchTargetError(f"{hostname!r} resolves to a private/reserved/loopback address")
-        resp = session.get(url, timeout=_REQUEST_TIMEOUT, allow_redirects=False, headers=headers)
-        if resp.is_redirect and resp.headers.get("location"):
-            url = urljoin(url, resp.headers["location"])
-            continue
-        return resp
+
+        is_https = parsed.scheme == "https"
+        session = requests.Session()
+        adapter = _PinnedIPAdapter(safe_ip, hostname, is_https)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        resp = None
+        try:
+            resp = session.get(
+                url, timeout=_REQUEST_TIMEOUT, allow_redirects=False, headers=headers, stream=True
+            )
+            if resp.is_redirect and resp.headers.get("location"):
+                url = urljoin(url, resp.headers["location"])
+                continue
+            content = _read_capped(resp, deadline)
+            return _FetchedPage(
+                # Report the hostname URL, not the IP-rewritten one the adapter
+                # actually dialed — downstream scoring reads the scheme off this.
+                status_code=resp.status_code,
+                url=url,
+                content=content,
+                headers=dict(resp.headers),
+            )
+        finally:
+            if resp is not None:
+                resp.close()
+            session.close()
     raise UnsafeFetchTargetError(f"too many redirects (> {_MAX_REDIRECTS})")
 
 
-def _fetch(url: str) -> tuple[requests.Response | None, bool]:
-    """Return (response, ssl_ok). ssl_ok=False means we fell back to non-TLS."""
+def _fetch(url: str) -> tuple[_FetchedPage | None, bool]:
+    """Return (page, ssl_ok). ssl_ok=False means we fell back to non-TLS."""
     headers = {"User-Agent": "BlackInkBot/1.0 (property-management research)"}
 
     try:
@@ -114,9 +231,9 @@ def _fetch(url: str) -> tuple[requests.Response | None, bool]:
         http_url = url.replace("https://", "http://", 1)
         try:
             return _get_validated(http_url, headers), False
-        except (requests.RequestException, UnsafeFetchTargetError):
+        except (requests.RequestException, UnsafeFetchTargetError, _FetchAborted):
             return None, False
-    except (requests.RequestException, UnsafeFetchTargetError):
+    except (requests.RequestException, UnsafeFetchTargetError, _FetchAborted):
         return None, True
 
 
@@ -155,7 +272,7 @@ def _score_contact_info(soup: BeautifulSoup) -> SignalResult:
     return SignalResult("website_contact_info", pts, 10, SCORED, detail)
 
 
-def _score_tech_health(resp: requests.Response, ssl_ok: bool) -> SignalResult:
+def _score_tech_health(resp: "_FetchedPage", ssl_ok: bool) -> SignalResult:
     """6 pts — HTTPS (3) + mobile viewport (3). SSL failure costs the HTTPS pts."""
     https_pts = 3 if ssl_ok and resp.url.startswith("https://") else 0
     soup = BeautifulSoup(resp.content, "lxml")

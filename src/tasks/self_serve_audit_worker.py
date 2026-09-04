@@ -160,17 +160,18 @@ def process_submission(session, submission_id: int) -> None:
 	}
 
 	try:
-		score_one_company(session, company, month_key)
+		# SAVEPOINT, not a full session.rollback(): a DB-level failure inside
+		# score_one_company (a constraint violation, a bad statement) aborts
+		# the transaction at the Postgres level, and _mark_failed() below must
+		# still be able to run. A full rollback would ALSO discard the claim's
+		# attempts increment (done in claim_submissions in the outer
+		# transaction) — so a persistently failing job would never reach
+		# FAILED_PERMANENT — and would throw away every earlier submission
+		# already scored in this batch. ROLLBACK TO SAVEPOINT recovers the
+		# aborted subtransaction while preserving both.
+		with session.begin_nested():
+			score_one_company(session, company, month_key)
 	except Exception as exc:  # noqa: BLE001 - a scoring failure is a definite, bounded-retry failure
-		# A DB-level failure inside score_one_company (a constraint
-		# violation, a bad statement) leaves the session's transaction
-		# aborted at the Postgres level even though Python only sees this
-		# exception -- rolling back here is what makes the _mark_failed()
-		# UPDATE below actually able to run, instead of itself failing
-		# with "current transaction is aborted". run_sweep() shares one
-		# session across every claimed row in a batch, so this must not
-		# be skipped just because this row is being abandoned.
-		session.rollback()
 		_mark_failed(session, submission_id, row.attempts, str(exc), company_id=company_id)
 		return
 
@@ -182,7 +183,17 @@ def run_sweep(limit: int = 20) -> int:
 	with get_system_db_context() as session:
 		claimed = claim_submissions(session, claim_time=datetime.now(timezone.utc), limit=limit)
 		for submission_id in claimed:
-			process_submission(session, submission_id)
+			# Each submission runs in its own SAVEPOINT so an unexpected error
+			# on one row can never roll back the shared batch transaction —
+			# the claimed attempts increments and every already-processed
+			# submission survive. process_submission handles a scoring failure
+			# itself (an inner savepoint + FAILED); this outer savepoint is the
+			# backstop for anything it doesn't catch.
+			try:
+				with session.begin_nested():
+					process_submission(session, submission_id)
+			except Exception:  # noqa: BLE001
+				logger.exception("self_serve_audit_worker: submission %s failed unexpectedly", submission_id)
 			processed += 1
 	logger.info("self_serve_audit_worker: processed %d submission(s)", processed)
 	return processed

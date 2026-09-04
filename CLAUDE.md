@@ -466,11 +466,19 @@ domain is marked `SKIPPED_RECENT` (bounds Google Places spend on repeat
 submissions); a submitted domain that resolves to a private/loopback/
 link-local/metadata IP, or is a raw IP literal, is rejected as
 `REJECTED_DOMAIN` — the same SSRF guard
-(`src/services/owner_visibility/signals/website.py`'s `_is_safe_host()`,
-re-checked at fetch time and on every redirect hop, not just at
-submission time) also now protects the pre-existing monthly sweep, since
-this subtask made that provider reachable from untrusted public input
-for the first time.
+(`src/services/owner_visibility/signals/website.py`, re-checked at fetch
+time and on every redirect hop, not just at submission time) also now
+protects the pre-existing monthly sweep, since this subtask made that
+provider reachable from untrusted public input for the first time. The
+guard resolves the host to a validated public IP and **pins the
+connection to that exact IP** via `_PinnedIPAdapter` (preserving the
+hostname for TLS SNI / cert verification) — closing the DNS-rebinding
+TOCTOU window where a name validated as public could resolve to
+`169.254.169.254` at connect time. The fetch also streams under an
+absolute wall-clock deadline and a body-size cap (not just an inactivity
+timeout), so a hostile site can neither hold the single self-serve
+worker forever with a slow drip nor exhaust memory with an unbounded
+body.
 
 A honeypot field (`website_url`) and a Redis-backed per-IP-hash rate
 limit (`SELF_SERVE_RATE_LIMIT_PER_10MIN`) gate the endpoint. The rate

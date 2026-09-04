@@ -35,9 +35,28 @@ class FakeSession:
 		self._results = list(results)
 		self.updates = []
 		self.rolled_back = False
+		self.savepoints = 0
 
 	def rollback(self):
 		self.rolled_back = True
+
+	def begin_nested(self):
+		# Emulates a SAVEPOINT context manager: on an exception inside the
+		# block it "rolls back to savepoint" (records it) and re-raises, the
+		# same shape SQLAlchemy's real begin_nested() has.
+		session = self
+
+		class _SP:
+			def __enter__(self_inner):
+				session.savepoints += 1
+				return self_inner
+
+			def __exit__(self_inner, exc_type, exc, tb):
+				if exc_type is not None:
+					session.rolled_back = True
+				return False
+
+		return _SP()
 
 	def execute(self, stmt, params=None):
 		sql = str(stmt)
