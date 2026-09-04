@@ -455,3 +455,63 @@ def test_submit_rejected_when_outcome_already_recorded(sales_demo):
 
 	assert ack.await_args.kwargs.get("response_action") == "errors"
 	assert wo.get(_BLACKINK_INTERNAL_SALES, order.action_id).status == "QUEUED"
+
+
+# ── Live-DB: closer auto-resolved from the booking's rep-slot email ─────
+
+def test_post_prompt_resolves_rep_from_client_rep_email_and_caches(sales_demo):
+	"""No manual rep_slack_user_id column, but the booking carries a
+	client_rep_email: the poster resolves it via users.lookupByEmail, posts
+	the card to that closer, and caches the id onto the connection so the
+	lookup never runs twice."""
+	import asyncio
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE calendar_connections SET rep_slack_user_id = NULL WHERE connection_id = :id"),
+			{"id": sales_demo["connection_id"]},
+		)
+		session.execute(
+			text("UPDATE bookings SET client_rep_email = 'rep@blackink-sales.example.com' WHERE booking_id = :id"),
+			{"id": sales_demo["booking_id"]},
+		)
+
+	fake_lookup = AsyncMock(return_value="U_RESOLVED_REP")
+	fake_post = AsyncMock(return_value={"channel_id": "C_SETTER", "message_ts": "1699.0009"})
+	with patch("src.services.meeting_outcome_prompts.post.lookup_user_id_by_email", fake_lookup), \
+	     patch("src.services.meeting_outcome_prompts.post.post_action_card", fake_post):
+		with get_system_db_context() as session:
+			asyncio.run(post_prompt(session, sales_demo["prompt_job_id"], as_of=datetime.now(timezone.utc)))
+
+	fake_lookup.assert_awaited_once_with("rep@blackink-sales.example.com")
+	row = _job_status(sales_demo["prompt_job_id"])
+	assert row.status == "SENT"
+	order = wo.get(_BLACKINK_INTERNAL_SALES, str(row.work_order_action_id))
+	assert order.recipient == "U_RESOLVED_REP"
+	# cached onto the connection
+	with get_system_db_context() as session:
+		cached = session.execute(
+			text("SELECT rep_slack_user_id FROM calendar_connections WHERE connection_id = :id"),
+			{"id": sales_demo["connection_id"]},
+		).scalar()
+	assert cached == "U_RESOLVED_REP"
+
+
+def test_post_prompt_blocked_when_email_unresolvable_and_no_column(sales_demo):
+	"""Column empty AND the rep-slot email doesn't resolve to a Slack user
+	-> BLOCKED, not a card with no closer."""
+	import asyncio
+	with get_system_db_context() as session:
+		session.execute(
+			text("UPDATE calendar_connections SET rep_slack_user_id = NULL WHERE connection_id = :id"),
+			{"id": sales_demo["connection_id"]},
+		)
+		session.execute(
+			text("UPDATE bookings SET client_rep_email = 'ghost@nowhere.example.com' WHERE booking_id = :id"),
+			{"id": sales_demo["booking_id"]},
+		)
+	with patch("src.services.meeting_outcome_prompts.post.lookup_user_id_by_email", AsyncMock(return_value=None)):
+		with get_system_db_context() as session:
+			asyncio.run(post_prompt(session, sales_demo["prompt_job_id"], as_of=datetime.now(timezone.utc)))
+	row = _job_status(sales_demo["prompt_job_id"])
+	assert row.status == "BLOCKED"
+	assert row.last_error == "MISSING_REP_SLACK_USER_ID"

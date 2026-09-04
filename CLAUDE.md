@@ -534,15 +534,20 @@ altered card. An unclicked card gets exactly one threaded reminder ping
 at `posted_at + 4h`; at `posted_at + 24h` the job goes `EXPIRED` and the
 sweep stops examining it — matching how every other expired card behaves.
 
-The card @mentions and authorizes against `calendar_connections.
-rep_slack_user_id` — **manually provisioned per rep** (same runbook
-posture as `public_booking_url`; no code path sets it, no Slack-directory
-lookup exists here). A connection without it can't produce an attributable
-card, so the job stays `BLOCKED`/`MISSING_REP_SLACK_USER_ID` (as does an
-unresolved `target_contact_id` → `UNRESOLVED_TARGET`); the sweep's
-self-heal step promotes both back to `PENDING` the moment the underlying
-data appears, the same pattern the show-rate reminder uses for
-`MISSING_OVS_*`.
+The card @mentions and authorizes against the assigned closer's Slack id,
+**derived from the booking's own rep-calendar-slot email**
+(`bookings.client_rep_email`) via `users.lookupByEmail` (bot scope
+`users:read.email`) — matching the addendum's DoD, which sources the
+closer from that webhook field rather than a hand-entered mapping. The
+resolved id is cached onto `calendar_connections.rep_slack_user_id` so the
+lookup runs at most once per rep; a value already in that column is
+honored as a manual override and skips the lookup. Only when there is
+neither a column override nor a resolvable rep-slot email does the job
+stay `BLOCKED`/`MISSING_REP_SLACK_USER_ID` (as an unresolved
+`target_contact_id` stays `UNRESOLVED_TARGET`); the sweep's self-heal step
+promotes a row back to `PENDING` once the column is set (the lookup-failure
+path is not auto-retried — a not-found email won't resolve on its own),
+the same pattern the show-rate reminder uses for `MISSING_OVS_*`.
 
 `open_meeting_outcome_modal()` and the global
 `@app.view("meeting_outcome_submit")` submit handler are **built here**
@@ -568,11 +573,12 @@ new hardened `SECURITY DEFINER` functions
 other's case, so exactly one writes — this also silently fixed the same
 gap in 3.2.3's existing `mark_no_show` path.
 
-**Open after this work:** `rep_slack_user_id` is manual, so the
-"@mention the correct closer" DoD line can't be verified until an operator
-provisions it; the real-Slack click→modal→submit round-trip needs a live
-workspace + `SLACK_BOT_TOKEN` this environment lacks (manual verification
-item).
+The full click→modal→submit round-trip (including both intelligence
+mirrors landing on the RLS-scoped rows) has been verified against a real
+Slack workspace over Socket Mode. Note that **Interactivity must be toggled
+on** in the Slack app config even under Socket Mode — Socket Mode only
+replaces the Request URL; it does not enable interactivity, and a card's
+button renders with a warning until it is on.
 
 ## Tooling Rules
 

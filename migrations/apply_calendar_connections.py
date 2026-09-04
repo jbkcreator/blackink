@@ -138,16 +138,18 @@ DDL = [
 	""",
 
 	# ── Addendum to Subtask 3.2.1 — "Log Outcome" trigger card ───────────────
-	# The Slack user id of the closer who owns this calendar. Manually
-	# provisioned per INTERNAL_SALES_DEMO rep, exactly like public_booking_url
-	# above — no code path anywhere sets it, and there is no Slack-directory
-	# lookup in this repo to derive it from the rep's calendar email.
+	# The Slack user id of the closer who owns this calendar. Normally
+	# DERIVED, not hand-entered: meeting_outcome_prompts.post_prompt() resolves
+	# it from the booking's rep-calendar-slot email (bookings.client_rep_email)
+	# via users.lookupByEmail and caches the result here, so the lookup runs at
+	# most once per rep. A value set here by an operator is honored as a manual
+	# OVERRIDE and skips the lookup.
 	#
-	# Two DoD lines depend on it: the card @mentions the assigned closer, and
-	# the click handler rejects a click from anyone else. A connection without
-	# it therefore cannot produce an attributable card at all — the job row
-	# stays BLOCKED (MISSING_REP_SLACK_USER_ID) rather than posting a button
-	# that no one can be verified against, and the sweep's self-heal step
+	# Two DoD lines depend on this id: the card @mentions the assigned closer,
+	# and the click handler rejects a click from anyone else. When there is
+	# neither a cached/override value here NOR a resolvable rep-slot email, the
+	# job row stays BLOCKED (MISSING_REP_SLACK_USER_ID) rather than posting a
+	# button no one can be verified against; the sweep's self-heal step
 	# promotes it the moment this column is filled in.
 	"ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS rep_slack_user_id VARCHAR(20)",
 

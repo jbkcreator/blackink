@@ -117,6 +117,36 @@ async def open_modal(*, trigger_id: str, view: dict) -> bool:
 		return False
 
 
+async def lookup_user_id_by_email(email: str) -> Optional[str]:
+	"""Resolve a Slack user id from an email via users.lookupByEmail.
+
+	Used to derive the assigned closer for the "Log Outcome" card from the
+	booking's own rep-calendar-slot email (bookings.client_rep_email),
+	rather than a hand-entered mapping — the addendum's DoD sources the
+	closer from that webhook field. Requires the bot scope
+	users:read.email.
+
+	Returns the user id, or None when Slack is unconfigured, the email is
+	empty, the user isn't found, or the scope is missing — the caller then
+	falls back to a manually-provisioned override and, failing that, blocks.
+	Never raises."""
+	if not email:
+		return None
+	client = _client_or_none()
+	if client is None:
+		return None
+	try:
+		resp = await client.users_lookupByEmail(email=email)
+	except SlackApiError as exc:
+		logger.info(
+			"[slack.post] users.lookupByEmail(%s) failed: %s",
+			email, exc.response.get("error") if exc.response else exc,
+		)
+		return None
+	user = resp.get("user") or {}
+	return user.get("id")
+
+
 async def post_notice(
 	*,
 	channel_key: str,

@@ -193,8 +193,8 @@ async def post_prompt(session: Session, prompt_job_id: int, *, as_of: datetime) 
 	job = session.execute(
 		text(
 			"SELECT j.prompt_job_id, j.booking_id, j.scheduled_for, b.client_id, b.event_status, "
-			"b.scheduled_at, b.target_contact_id, b.target_company_id, "
-			"cc.rep_slack_user_id, c.first_name, c.last_name, co.company_name "
+			"b.scheduled_at, b.target_contact_id, b.target_company_id, b.client_rep_email, "
+			"b.calendar_connection_id, cc.rep_slack_user_id, c.first_name, c.last_name, co.company_name "
 			"FROM meeting_outcome_prompt_jobs j "
 			"JOIN bookings b ON j.booking_id = b.booking_id "
 			"JOIN calendar_connections cc ON cc.connection_id = b.calendar_connection_id "
@@ -217,10 +217,28 @@ async def post_prompt(session: Session, prompt_job_id: int, *, as_of: datetime) 
 		_mark(session, prompt_job_id, "BLOCKED", error="UNRESOLVED_TARGET")
 		return
 
-	if not job.rep_slack_user_id:
-		# Without the mapping the card can neither @mention the assigned
-		# closer nor have a click authorized against them. self_heal_blocked()
-		# promotes this row the moment an operator provisions the column.
+	# The assigned closer is derived from the booking's own rep-calendar-slot
+	# email (the addendum's DoD sources the @mention from that webhook field),
+	# resolved to a Slack id via users.lookupByEmail and CACHED onto
+	# calendar_connections.rep_slack_user_id so the lookup runs at most once
+	# per rep. A manually-provisioned column value is honored as an override
+	# and skips the lookup entirely.
+	rep_slack_user_id = job.rep_slack_user_id
+	if not rep_slack_user_id and job.client_rep_email:
+		rep_slack_user_id = await post.lookup_user_id_by_email(job.client_rep_email)
+		if rep_slack_user_id:
+			session.execute(
+				text("UPDATE calendar_connections SET rep_slack_user_id = :rep, updated_at = NOW() "
+				     "WHERE connection_id = :cid AND rep_slack_user_id IS NULL"),
+				{"rep": rep_slack_user_id, "cid": job.calendar_connection_id},
+			)
+
+	if not rep_slack_user_id:
+		# Neither an override column nor a resolvable rep-slot email — the card
+		# can neither @mention the assigned closer nor authorize a click
+		# against them. self_heal_blocked() promotes this row the moment an
+		# operator provisions the column (the lookup-failure path is not
+		# auto-retried, since a not-found email won't resolve on its own).
 		_mark(session, prompt_job_id, "BLOCKED", error="MISSING_REP_SLACK_USER_ID")
 		return
 
@@ -244,7 +262,7 @@ async def post_prompt(session: Session, prompt_job_id: int, *, as_of: datetime) 
 		action_class=_ACTION_CLASS,
 		autonomy_band="BAND_2_ONE_TAP",
 		risk_class="LOW",
-		recipient=job.rep_slack_user_id,
+		recipient=rep_slack_user_id,
 		payload={
 			"booking_id": job.booking_id,
 			"contact_id": job.target_contact_id,
@@ -279,7 +297,7 @@ async def post_prompt(session: Session, prompt_job_id: int, *, as_of: datetime) 
 			prospect_name=prospect_name,
 			company_name=company_name,
 			scheduled_at=job.scheduled_at,
-			rep_slack_user_id=job.rep_slack_user_id,
+			rep_slack_user_id=rep_slack_user_id,
 			button_value=button_value,
 		),
 	)
