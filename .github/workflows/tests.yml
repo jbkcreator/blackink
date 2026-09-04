@@ -1,0 +1,71 @@
+name: Test suite
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: blackink_owner
+          POSTGRES_PASSWORD: test_only_password
+          POSTGRES_DB: blackink_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://blackink_owner:test_only_password@localhost:5432/blackink_test
+      BLACKINK_APP_DB_PASSWORD: test_only_password
+      BLACKINK_SYSTEM_DB_PASSWORD: test_only_password
+      AKRASH_INGEST_DB_PASSWORD: test_only_password
+      REDIS_URL: redis://localhost:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      # Migration order must match CLAUDE.md and tenant_leakage_nightly.yml.
+      # Every table in config/tenant_policies.py must be created before
+      # apply_rls_policies.py runs or it aborts with UndefinedTable.
+      - name: Apply migrations
+        run: |
+          PYTHONPATH=. python migrations/apply_db_roles.py
+          echo "DATABASE_URL_APP=postgresql://blackink_app:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
+          echo "DATABASE_URL_SYSTEM=postgresql://blackink_system:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
+          PYTHONPATH=. python migrations/apply_counties.py
+          PYTHONPATH=. python migrations/apply_clients.py
+          PYTHONPATH=. python migrations/apply_relay_halts.py
+          PYTHONPATH=. python migrations/apply_companies.py
+          PYTHONPATH=. python migrations/apply_contacts.py
+          PYTHONPATH=. python migrations/apply_owner_entities.py
+          PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
+          PYTHONPATH=. python migrations/apply_events.py
+          PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
+          PYTHONPATH=. python migrations/apply_sending_domains.py
+          PYTHONPATH=. python migrations/apply_agent_work_orders.py
+          PYTHONPATH=. python migrations/apply_companies_google_place_id.py
+          PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
+          PYTHONPATH=. python migrations/apply_meeting_outcomes.py
+          PYTHONPATH=. python migrations/apply_rls_policies.py
+      - name: Run full test suite
+        run: PYTHONPATH=. pytest tests/ -v
