@@ -3,7 +3,7 @@
   - _dial_task_content_blocks — card layout + pending-score degradation
   - _linkedin_task_content_blocks — note code block, fallback URL
   - _linkedin_action_buttons — url button, modal button, mark-sent
-  - _sales_reply_content_blocks — reply card with/without opt-out button
+  - sales_reply_content_blocks — reply card with/without opt-out button
   - Touch-1-approval triggers _post_dial_task_after_touch1_approval
 
 Tests only external behaviour (rendered block structure, SQL calls, Bolt ack).
@@ -25,7 +25,7 @@ from src.services.slack.listeners import (
     _dial_task_content_blocks,
     _linkedin_action_buttons,
     _linkedin_task_content_blocks,
-    _sales_reply_content_blocks,
+    sales_reply_content_blocks,
     _simple_action_button_blocks,
 )
 
@@ -236,7 +236,7 @@ def test_linkedin_action_buttons_mark_sent():
 
 
 def test_sales_reply_header():
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="prospect@example.com",
         contact_name="Jane Doe",
         firm_name="Acme PM",
@@ -254,7 +254,7 @@ def test_sales_reply_header():
 
 
 def test_sales_reply_attributed_badge():
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name=None, firm_name=None,
         run_id="r1", touch_step=1, attribution_status="attributed",
         subject=None, raw_body="text", contact_id=1, client_id="c1", inbound_id="i1",
@@ -264,7 +264,7 @@ def test_sales_reply_attributed_badge():
 
 
 def test_sales_reply_unattributed_badge():
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name=None, firm_name=None,
         run_id=None, touch_step=None, attribution_status="unattributed",
         subject=None, raw_body="text", contact_id=None, client_id="c1", inbound_id="i1",
@@ -275,7 +275,7 @@ def test_sales_reply_unattributed_badge():
 
 def test_sales_reply_opt_out_button_present_when_contact_id_known():
     """opt_out_contact button present when contact_id is set."""
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name="Jane", firm_name="Acme",
         run_id="r1", touch_step=1, attribution_status="attributed",
         subject=None, raw_body="hi", contact_id=99, client_id="cli-1", inbound_id="i1",
@@ -291,7 +291,7 @@ def test_sales_reply_opt_out_button_present_when_contact_id_known():
 
 def test_sales_reply_no_opt_out_button_when_unattributed():
     """No opt_out button on unattributed cards (no contact to target)."""
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name=None, firm_name=None,
         run_id=None, touch_step=None, attribution_status="unattributed",
         subject=None, raw_body="hi", contact_id=None, client_id="cli-1", inbound_id="i1",
@@ -302,7 +302,7 @@ def test_sales_reply_no_opt_out_button_when_unattributed():
 
 def test_sales_reply_opt_out_has_confirm_dialog():
     """Opt-out button includes a confirmation dialog to prevent fat-finger."""
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name="Jane", firm_name=None,
         run_id=None, touch_step=None, attribution_status="attributed",
         subject=None, raw_body="hi", contact_id=1, client_id="c1", inbound_id="i1",
@@ -313,7 +313,7 @@ def test_sales_reply_opt_out_has_confirm_dialog():
 
 def test_sales_reply_body_blockquoted():
     """Body is rendered with '>' blockquote prefix."""
-    blocks = _sales_reply_content_blocks(
+    blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name=None, firm_name=None,
         run_id=None, touch_step=None, attribution_status="unattributed",
         subject=None, raw_body="Hello\nWorld",

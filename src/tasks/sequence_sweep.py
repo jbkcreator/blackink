@@ -16,6 +16,7 @@ the normal production mode. Providing it is useful for per-client debugging.
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 
@@ -26,10 +27,66 @@ from src.services import work_orders as wo
 logger = logging.getLogger(__name__)
 
 _EMAIL_TOUCH_ACTION = "DISPATCH_EMAIL_TOUCH"
+_LINKEDIN_TASK_ACTION = "LINKEDIN_TASK"
 
 
 async def _post_due_card(order) -> bool:
     from src.services.slack.listeners import post_work_order_card
+
+    posted = await post_work_order_card(order, channel_key="setter")
+    return posted is not None
+
+
+async def _post_due_linkedin_card(order) -> bool:
+    """Post a due LINKEDIN_TASK card, but only after the per-touch compliance
+    gate passes. On a block (including a global opt-out), skip the post and
+    record a touch_skipped_compliance event instead. See
+    docs/adr/0001-non-email-touch-posting-model.md.
+
+    DB access is synchronous (get_db_context) inside this async function — same
+    pattern as listeners._post_dial_task_after_touch1_approval."""
+    from sqlalchemy import text
+
+    from src.core.database import get_db_context
+    from src.services.compliance_gate import evaluate_touch_gate
+    from src.services.slack.listeners import post_work_order_card
+
+    contact_id = int(order.entity_id)
+    touch_step = int(order.payload.get("touch_step", 4)) if isinstance(order.payload, dict) else 4
+
+    with get_db_context(client_id=order.client_id) as session:
+        contact = session.execute(
+            text("SELECT * FROM contacts WHERE contact_id = :cid"),
+            {"cid": contact_id},
+        ).fetchone()
+        if contact is None:
+            logger.error("sequence_sweep: LINKEDIN_TASK contact_id=%s not found — skipping", contact_id)
+            return False
+
+        gate = evaluate_touch_gate(session, contact, order.client_id)
+        if not gate.ready:
+            logger.info(
+                "sequence_sweep: LINKEDIN_TASK compliance block contact_id=%s reasons=%s — skipping",
+                contact_id, gate.blocked_reasons,
+            )
+            session.execute(
+                text(
+                    "INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
+                    "VALUES (:client_id, 'touch_skipped_compliance', 'contact', :entity_id, 'sequence_sweep', :payload)"
+                ),
+                {
+                    "client_id": order.client_id,
+                    "entity_id": str(contact_id),
+                    "payload": json.dumps({
+                        "action_id": str(order.action_id),
+                        "touch_step": touch_step,
+                        "action_class": _LINKEDIN_TASK_ACTION,
+                        "blocked_reasons": gate.blocked_reasons,
+                    }),
+                },
+            )
+            session.commit()
+            return False
 
     posted = await post_work_order_card(order, channel_key="setter")
     return posted is not None
@@ -65,12 +122,17 @@ def alert_stuck_dispatches(older_than_minutes: int = 30) -> int:
 
 
 def run_sweep(client_id=None, limit: int = 100) -> int:
-    """Fetch due QUEUED orders and post their approval cards. Returns cards posted."""
+    """Fetch due QUEUED orders and post their approval cards. Returns cards posted.
+
+    Handles email touches (1/3/5) and the day-7 LinkedIn touch (4). The dial
+    touch (2) is NOT swept — it is posted event-driven on Touch 1 approval
+    (docs/adr/0001-non-email-touch-posting-model.md)."""
     batch = wo.due_batch(client_id=client_id, limit=limit)
     email_orders = [o for o in batch if o.action_class == _EMAIL_TOUCH_ACTION]
+    linkedin_orders = [o for o in batch if o.action_class == _LINKEDIN_TASK_ACTION]
 
-    if not email_orders:
-        logger.info("sequence_sweep: no due email-touch orders")
+    if not email_orders and not linkedin_orders:
+        logger.info("sequence_sweep: no due email-touch or LinkedIn orders")
         return 0
 
     posted = 0
@@ -86,7 +148,19 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         else:
             logger.warning("sequence_sweep: card NOT posted action_id=%s — Slack error", order.action_id)
 
-    logger.info("sequence_sweep: %d/%d cards posted", posted, len(email_orders))
+    for order in linkedin_orders:
+        if order.slack_message_ts:
+            logger.debug("sequence_sweep: LINKEDIN action_id=%s already has a card, skipping", order.action_id)
+            continue
+        ok = asyncio.run(_post_due_linkedin_card(order))
+        if ok:
+            posted += 1
+            logger.info("sequence_sweep: LinkedIn card posted action_id=%s contact=%s", order.action_id, order.entity_id)
+        else:
+            logger.info("sequence_sweep: LinkedIn card NOT posted action_id=%s (compliance skip or Slack error)", order.action_id)
+
+    total = len(email_orders) + len(linkedin_orders)
+    logger.info("sequence_sweep: %d/%d cards posted", posted, total)
     return posted
 
 

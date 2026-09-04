@@ -1,17 +1,11 @@
 """Tests for POST /api/v1/webhooks/inbound-email (Task 3.1.3 / ticket 30).
 
-The one new seam — drives the endpoint via FastAPI TestClient with signed
-Mailgun payloads. Verifies:
-  - Valid signature + In-Reply-To attribution → 200, row stored, card posted
-  - Forged signature → 403
-  - BCC echo → discarded
-  - Duplicate message_id → discarded
-  - Unknown alias → discarded
-  - Unattributed reply → 200, unattributed row
-  - Opt-out button value carries contact_id + client_id (from card builder)
-
-Follows 3.2.1-style trust-boundary test pattern (closest prior art:
-tests/test_slack_auth.py + tests/test_work_orders.py).
+The router is now a thin HTTP trust boundary: it verifies the Mailgun HMAC
+signature, parses the form, and delegates to
+src.services.inbound_ingest.ingest_inbound_reply. These tests cover exactly
+that boundary — signature acceptance/rejection and delegation. The ingestion
+logic (attribution, dedup, discard reasons) is covered in
+tests/test_inbound_ingest.py.
 """
 
 from __future__ import annotations
@@ -27,12 +21,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 
-# ── App fixture ───────────────────────────────────────────────────────────────
-
 @pytest.fixture()
 def client():
-    """Minimal FastAPI test client with only the inbound-email router,
-    settings patched so MAILGUN_SIGNING_KEY is set."""
     from fastapi import FastAPI
     from src.api.inbound_email_router import router
 
@@ -40,8 +30,6 @@ def client():
     app.include_router(router)
     return TestClient(app)
 
-
-# ── Signing helpers ───────────────────────────────────────────────────────────
 
 _SIGNING_KEY = "test-mailgun-signing-key-for-tests"
 
@@ -84,8 +72,6 @@ def _make_form(
     }
 
 
-# ── Patches shared across tests ───────────────────────────────────────────────
-
 def _patch_settings(signing_key=_SIGNING_KEY):
     from pydantic import SecretStr
     settings = MagicMock()
@@ -93,125 +79,68 @@ def _patch_settings(signing_key=_SIGNING_KEY):
     return patch("src.api.inbound_email_router.get_settings", return_value=settings)
 
 
-def _patch_db(
-    *,
-    client_id: str | None = "testclient",
-    is_echo: bool = False,
-    existing: bool = False,
-    attribution_status: str = "attributed",
-    contact_id: int | None = 1,
-):
-    """Patch the DB-touching functions to return controlled results."""
-
-    def _ctx():
-        session = MagicMock()
-        # existing inbound_messages check
-        exists_result = MagicMock()
-        exists_result.first.return_value = MagicMock() if existing else None
-        session.execute.return_value = exists_result
-        cm = MagicMock()
-        cm.__enter__ = lambda s: session
-        cm.__exit__ = MagicMock(return_value=False)
-        return cm
-
-    attribution = MagicMock()
-    attribution.client_id = client_id or "testclient"
-    attribution.contact_id = contact_id
-    attribution.run_id = "run-uuid-1" if attribution_status == "attributed" else None
-    attribution.touch_step = 1 if attribution_status == "attributed" else None
-    attribution.attribution_status = attribution_status
-    attribution.contact_name = "Jane Doe" if contact_id else None
-    attribution.firm_name = "Acme PM" if contact_id else None
-
-    return (
-        patch("src.api.inbound_email_router.resolve_client_from_alias", return_value=client_id),
-        patch("src.api.inbound_email_router.is_bcc_echo", return_value=is_echo),
-        patch("src.api.inbound_email_router.attribute", return_value=attribution),
-        patch("src.api.inbound_email_router.get_system_db_context", return_value=_ctx()),
-        patch("src.api.inbound_email_router.slack_post.post_notice", new_callable=AsyncMock),
+def _patch_ingest(return_value=None):
+    rv = return_value or {"status": "ok", "inbound_id": "inbound-uuid-1"}
+    return patch(
+        "src.api.inbound_email_router.ingest_inbound_reply",
+        new_callable=AsyncMock,
+        return_value=rv,
     )
 
 
-# ── Tests ─────────────────────────────────────────────────────────────────────
-
-
-def test_valid_signature_returns_200(client):
+def test_valid_signature_delegates_and_returns_200(client):
     form = _make_form()
-    p1, p2, p3, p4, p5 = _patch_db()
-    with _patch_settings(), p1, p2, p3, p4, p5:
+    with _patch_settings(), _patch_ingest() as mock_ingest:
         resp = client.post("/api/v1/webhooks/inbound-email", data=form)
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "ok"
-    assert "inbound_id" in body
+    assert resp.json() == {"status": "ok", "inbound_id": "inbound-uuid-1"}
+    mock_ingest.assert_awaited_once()
+    # The parsed payload carries the fields the router extracted.
+    parsed = mock_ingest.await_args.args[0]
+    assert parsed.to_alias == "testclient@inbound.getblackink.com"
+    assert parsed.from_raw == "prospect@example.com"
+    assert parsed.in_reply_to == "<msg-id-123@mail.example.com>"
 
 
-def test_forged_signature_returns_403(client):
+def test_forged_signature_returns_403_and_does_not_delegate(client):
     form = _make_form(key="wrong-key")
-    with _patch_settings():
+    with _patch_settings(), _patch_ingest() as mock_ingest:
         resp = client.post("/api/v1/webhooks/inbound-email", data=form)
     assert resp.status_code == 403
+    mock_ingest.assert_not_awaited()
 
 
 def test_missing_signing_key_returns_403(client):
     form = _make_form()
-    with _patch_settings(signing_key=None):
+    with _patch_settings(signing_key=None), _patch_ingest() as mock_ingest:
         resp = client.post("/api/v1/webhooks/inbound-email", data=form)
     assert resp.status_code == 403
+    mock_ingest.assert_not_awaited()
 
 
-def test_stale_timestamp_returns_403(client):
-    form = _make_form(age_seconds=400)  # > 300s limit
-    with _patch_settings():
-        resp = client.post("/api/v1/webhooks/inbound-email", data=form)
-    assert resp.status_code == 403
-
-
-def test_unknown_alias_discards(client):
-    form = _make_form()
-    p1, p2, p3, p4, p5 = _patch_db(client_id=None)
-    with _patch_settings(), p1, p2, p3, p4, p5:
+def test_old_timestamp_still_accepted(client):
+    """The 300s freshness gate was removed — a legit Mailgun retry with an old
+    timestamp but valid signature must still be delegated (not 403)."""
+    form = _make_form(age_seconds=6000)  # well past the old 300s window
+    with _patch_settings(), _patch_ingest() as mock_ingest:
         resp = client.post("/api/v1/webhooks/inbound-email", data=form)
     assert resp.status_code == 200
-    assert resp.json()["reason"] == "unknown_alias"
+    mock_ingest.assert_awaited_once()
 
 
-def test_bcc_echo_discards(client):
+def test_router_returns_service_discard_verbatim(client):
     form = _make_form()
-    p1, p2, p3, p4, p5 = _patch_db(is_echo=True)
-    with _patch_settings(), p1, p2, p3, p4, p5:
+    with _patch_settings(), _patch_ingest(return_value={"status": "discarded", "reason": "bcc_echo"}):
         resp = client.post("/api/v1/webhooks/inbound-email", data=form)
     assert resp.status_code == 200
     assert resp.json()["reason"] == "bcc_echo"
 
 
-def test_duplicate_message_id_discards(client):
+def test_missing_message_id_header_generates_one(client):
     form = _make_form()
-    p1, p2, p3, p4, p5 = _patch_db(existing=True)
-    with _patch_settings(), p1, p2, p3, p4, p5:
+    form["message-headers"] = json.dumps([["Subject", "hi"]])  # no Message-Id
+    with _patch_settings(), _patch_ingest() as mock_ingest:
         resp = client.post("/api/v1/webhooks/inbound-email", data=form)
     assert resp.status_code == 200
-    assert resp.json()["reason"] == "duplicate"
-
-
-def test_unattributed_reply_stored_and_posted(client):
-    form = _make_form()
-    p1, p2, p3, p4, p5 = _patch_db(attribution_status="unattributed", contact_id=None)
-    with _patch_settings(), p1, p2, p3, p4, p5 as mock_post_notice:
-        resp = client.post("/api/v1/webhooks/inbound-email", data=form)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
-    # Slack card should still be posted for unattributed
-    mock_post_notice.assert_called_once()
-    call_kwargs = mock_post_notice.call_args.kwargs
-    assert call_kwargs["channel_key"] == "replies"
-
-
-def test_attributed_reply_posts_card_with_correct_channel(client):
-    form = _make_form()
-    p1, p2, p3, p4, p5 = _patch_db(attribution_status="attributed", contact_id=42)
-    with _patch_settings(), p1, p2, p3, p4, p5 as mock_post_notice:
-        resp = client.post("/api/v1/webhooks/inbound-email", data=form)
-    assert resp.status_code == 200
-    mock_post_notice.assert_called_once()
-    assert mock_post_notice.call_args.kwargs["channel_key"] == "replies"
+    parsed = mock_ingest.await_args.args[0]
+    assert parsed.inbound_message_id.startswith("<generated-")

@@ -42,6 +42,18 @@ from sqlalchemy.orm import Session
 logger = logging.getLogger(__name__)
 
 
+def strip_display_name(from_raw: str) -> str:
+    """Reduce a From header to a bare email address.
+
+    'First Last <email@example.com>' → 'email@example.com'. If there is no
+    angle-bracket form, the trimmed input is returned unchanged.
+    """
+    value = (from_raw or "").strip()
+    if "<" in value and value.endswith(">"):
+        return value[value.rfind("<") + 1 : -1].strip() or value
+    return value
+
+
 @dataclass
 class AttributionResult:
     """Resolved attribution for one inbound forwarded reply."""
@@ -204,9 +216,7 @@ def _attribute_by_sender_email(
     using BYPASSRLS, this correctly limits to the client's own contacts.
     """
     # Normalize: strip display name from "First Last <email@example.com>"
-    email = from_address.strip()
-    if "<" in email and email.endswith(">"):
-        email = email[email.rfind("<") + 1 : -1].strip()
+    email = strip_display_name(from_address)
 
     row = session.execute(
         text(

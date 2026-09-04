@@ -23,7 +23,27 @@ from src.services.inbound_attribution import (
     attribute,
     is_bcc_echo,
     resolve_client_from_alias,
+    strip_display_name,
 )
+
+
+# ── strip_display_name ───────────────────────────────────────────────────────
+
+
+def test_strip_display_name_angle_bracket_form():
+    assert strip_display_name("Jane Doe <jane@acme.com>") == "jane@acme.com"
+
+
+def test_strip_display_name_bare_email_unchanged():
+    assert strip_display_name("jane@acme.com") == "jane@acme.com"
+
+
+def test_strip_display_name_trims_whitespace():
+    assert strip_display_name("  bob@smith.com  ") == "bob@smith.com"
+
+
+def test_strip_display_name_empty():
+    assert strip_display_name("") == ""
 
 
 # ── FakeSession helpers ──────────────────────────────────────────────────────

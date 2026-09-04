@@ -398,7 +398,7 @@ def _linkedin_action_buttons(order: "wo.WorkOrder") -> list:
 	return [{"type": "actions", "elements": elements}]
 
 
-def _sales_reply_content_blocks(
+def sales_reply_content_blocks(
 	*,
 	from_address: str,
 	contact_name: Optional[str],
@@ -619,9 +619,10 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 		"phone": phone,
 	}
 
-	idempotency_key = wo.default_idempotency_key(
-		order.client_id, str(contact_id), "DIAL_TASK", datetime.now(timezone.utc)
-	)
+	# Stable run/touch key — matches the other touches' convention and
+	# guarantees exactly one dial order per run regardless of approval retries
+	# (a time-bucketed key could double-post across the bucket boundary).
+	idempotency_key = f"seq:{run_id}:touch:2"
 	try:
 		dial_order = wo.enqueue(
 			client_id=order.client_id,
