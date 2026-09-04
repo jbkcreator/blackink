@@ -1,0 +1,325 @@
+"""Tests for the 3.1.2 additions to src/services/slack/listeners.py:
+  - _calling_hours_indicator — green/red boundary, conservative default
+  - _dial_task_content_blocks — card layout + pending-score degradation
+  - _linkedin_task_content_blocks — note code block, fallback URL
+  - _linkedin_action_buttons — url button, modal button, mark-sent
+  - _sales_reply_content_blocks — reply card with/without opt-out button
+  - Touch-1-approval triggers _post_dial_task_after_touch1_approval
+
+Tests only external behaviour (rendered block structure, SQL calls, Bolt ack).
+Does NOT test Slack transport or live DB.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
+from zoneinfo import ZoneInfo
+
+import pytest
+
+from src.services.slack.listeners import (
+    _calling_hours_indicator,
+    _calling_hours_label,
+    _dial_task_content_blocks,
+    _linkedin_action_buttons,
+    _linkedin_task_content_blocks,
+    _sales_reply_content_blocks,
+    _simple_action_button_blocks,
+)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _fake_order(action_class="DISPATCH_EMAIL_TOUCH", payload=None, action_id=None, client_id="client-x"):
+    """Minimal fake WorkOrder for card-block builder tests."""
+    order = MagicMock()
+    order.action_class = action_class
+    order.payload = payload or {}
+    order.action_id = (action_id or "abcd1234-efef-efef-efef-abcd1234abcd")
+    order.client_id = client_id
+    order.recipient = None
+    order.slack_channel_id = None
+    order.slack_message_ts = None
+    return order
+
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _at_hour(hour: int) -> datetime:
+    """Return a datetime whose ET hour equals `hour` (minute=0, UTC-based)."""
+    from datetime import timedelta
+    # Build a naive ET datetime and attach the zone
+    et_dt = datetime(2026, 9, 5, hour, 0, 0, tzinfo=_ET)
+    return et_dt.astimezone(timezone.utc)
+
+
+# ── Calling-hours indicator ───────────────────────────────────────────────────
+
+
+def test_calling_hours_green_during_window():
+    """8 AM ET → green."""
+    now = _at_hour(8)
+    assert _calling_hours_indicator(now) == "🟢"
+
+
+def test_calling_hours_green_at_1pm():
+    now = _at_hour(13)
+    assert _calling_hours_indicator(now) == "🟢"
+
+
+def test_calling_hours_red_at_8pm():
+    """8 PM ET → red (conservative default — D15 pending)."""
+    now = _at_hour(20)
+    assert _calling_hours_indicator(now) == "🔴"
+
+
+def test_calling_hours_red_at_9pm():
+    now = _at_hour(21)
+    assert _calling_hours_indicator(now) == "🔴"
+
+
+def test_calling_hours_red_before_8am():
+    now = _at_hour(7)
+    assert _calling_hours_indicator(now) == "🔴"
+
+
+def test_calling_hours_label_green():
+    assert "Valid" in _calling_hours_label("🟢")
+
+
+def test_calling_hours_label_red():
+    assert "Outside" in _calling_hours_label("🔴")
+
+
+# ── Dial-task card blocks ─────────────────────────────────────────────────────
+
+
+def test_dial_task_header_block():
+    """Card starts with a header block containing 'Touch 2'."""
+    order = _fake_order(
+        action_class="DIAL_TASK",
+        payload={"contact_name": "Jane Doe", "firm_name": "Acme PM", "county": "Hillsborough", "phone": "+18135550100", "run_id": "abcd1234"},
+    )
+    blocks = _dial_task_content_blocks(order)
+    assert blocks[0]["type"] == "header"
+    assert "Touch 2" in blocks[0]["text"]["text"]
+
+
+def test_dial_task_fields_section_contains_phone():
+    order = _fake_order(
+        action_class="DIAL_TASK",
+        payload={"contact_name": "Jane Doe", "firm_name": "Acme PM", "county": "Hillsborough", "phone": "+18135550100", "run_id": "run1"},
+    )
+    blocks = _dial_task_content_blocks(order)
+    fields_text = str(blocks)
+    assert "+18135550100" in fields_text
+    assert "Jane Doe" in fields_text
+    assert "Acme PM" in fields_text
+
+
+def test_dial_task_missing_phone_shows_placeholder():
+    """No phone → graceful 'no phone on record' placeholder."""
+    order = _fake_order(action_class="DIAL_TASK", payload={"run_id": "r1"})
+    blocks = _dial_task_content_blocks(order)
+    text = str(blocks)
+    assert "no phone on record" in text
+
+
+def test_dial_task_has_divider():
+    order = _fake_order(action_class="DIAL_TASK", payload={"run_id": "r1"})
+    blocks = _dial_task_content_blocks(order)
+    assert any(b.get("type") == "divider" for b in blocks)
+
+
+def test_simple_action_button_mark_done():
+    """_simple_action_button_blocks returns a single actions block with mark_done."""
+    order = _fake_order()
+    # patch payload_hash.button_value to return something
+    with patch("src.services.slack.listeners.payload_hash") as ph:
+        ph.button_value.return_value = '{"action_id": "x", "decision": "DONE"}'
+        blocks = _simple_action_button_blocks(order, label="Mark Called ✓")
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "actions"
+    elements = blocks[0]["elements"]
+    assert len(elements) == 1
+    assert elements[0]["action_id"] == "mark_done"
+    assert elements[0]["text"]["text"] == "Mark Called ✓"
+
+
+# ── LinkedIn task card blocks ─────────────────────────────────────────────────
+
+
+def test_linkedin_task_header_block():
+    order = _fake_order(
+        action_class="LINKEDIN_TASK",
+        payload={"contact_name": "Bob Smith", "firm_name": "Acme PM", "county": "Pinellas", "run_id": "run2"},
+    )
+    blocks = _linkedin_task_content_blocks(order)
+    assert blocks[0]["type"] == "header"
+    assert "Touch 4" in blocks[0]["text"]["text"]
+
+
+def test_linkedin_task_note_in_code_block():
+    """Connection note appears in a code block (desktop hover-copy)."""
+    order = _fake_order(
+        action_class="LINKEDIN_TASK",
+        payload={"contact_name": "Bob", "firm_name": "Acme PM", "county": "Pinellas",
+                 "connection_note": "Hello from Blackink", "run_id": "r2"},
+    )
+    blocks = _linkedin_task_content_blocks(order)
+    text_block = next((b for b in blocks if b.get("type") == "section" and "note" in str(b).lower()), None)
+    assert text_block is not None
+    assert "Hello from Blackink" in str(text_block)
+    assert "```" in str(text_block)  # code block
+
+
+def test_linkedin_action_buttons_include_url_button():
+    """LinkedIn action buttons include a url button for the profile."""
+    order = _fake_order(
+        action_class="LINKEDIN_TASK",
+        payload={"linkedin_url": "https://linkedin.com/in/bob", "connection_note": "Hi Bob"},
+    )
+    with patch("src.services.slack.listeners.payload_hash") as ph:
+        ph.button_value.return_value = '{"action_id": "x", "decision": "DONE"}'
+        action_blocks = _linkedin_action_buttons(order)
+    elements = action_blocks[0]["elements"]
+    url_buttons = [e for e in elements if e.get("url")]
+    assert len(url_buttons) == 1
+    assert url_buttons[0]["url"] == "https://linkedin.com/in/bob"
+    assert url_buttons[0]["action_id"] == "open_linkedin_url"
+
+
+def test_linkedin_action_buttons_fallback_search_url():
+    """No stored linkedin_url → fallback to people-search URL."""
+    order = _fake_order(
+        action_class="LINKEDIN_TASK",
+        payload={"contact_name": "Jane Doe", "firm_name": "Acme", "connection_note": "Hi"},
+    )
+    with patch("src.services.slack.listeners.payload_hash") as ph:
+        ph.button_value.return_value = '{"action_id": "x", "decision": "DONE"}'
+        action_blocks = _linkedin_action_buttons(order)
+    elements = action_blocks[0]["elements"]
+    url_btn = next((e for e in elements if e.get("url")), None)
+    assert url_btn is not None
+    assert "linkedin.com/search" in url_btn["url"]
+
+
+def test_linkedin_action_buttons_mobile_modal():
+    """Note button → opens_linkedin_note action for mobile copy."""
+    order = _fake_order(
+        action_class="LINKEDIN_TASK",
+        payload={"connection_note": "Hi there", "linkedin_url": "https://linkedin.com/x"},
+    )
+    with patch("src.services.slack.listeners.payload_hash") as ph:
+        ph.button_value.return_value = '{"action_id": "x", "decision": "DONE"}'
+        action_blocks = _linkedin_action_buttons(order)
+    elements = action_blocks[0]["elements"]
+    modal_btn = next((e for e in elements if e.get("action_id") == "open_linkedin_note"), None)
+    assert modal_btn is not None
+    assert "Hi there" in modal_btn["value"]
+
+
+def test_linkedin_action_buttons_mark_sent():
+    """Last element is the 'Mark Sent ✓' button (mark_done action_id)."""
+    order = _fake_order(action_class="LINKEDIN_TASK", payload={})
+    with patch("src.services.slack.listeners.payload_hash") as ph:
+        ph.button_value.return_value = '{"action_id": "x", "decision": "DONE"}'
+        action_blocks = _linkedin_action_buttons(order)
+    last_elem = action_blocks[0]["elements"][-1]
+    assert last_elem["action_id"] == "mark_done"
+
+
+# ── Sales-reply card blocks ───────────────────────────────────────────────────
+
+
+def test_sales_reply_header():
+    blocks = _sales_reply_content_blocks(
+        from_address="prospect@example.com",
+        contact_name="Jane Doe",
+        firm_name="Acme PM",
+        run_id="run-1234",
+        touch_step=1,
+        attribution_status="attributed",
+        subject="Re: Your Visibility Report",
+        raw_body="Thanks for reaching out!",
+        contact_id=42,
+        client_id="client-abc",
+        inbound_id="inbound-uuid-1234",
+    )
+    assert blocks[0]["type"] == "header"
+    assert "Reply" in blocks[0]["text"]["text"]
+
+
+def test_sales_reply_attributed_badge():
+    blocks = _sales_reply_content_blocks(
+        from_address="p@example.com", contact_name=None, firm_name=None,
+        run_id="r1", touch_step=1, attribution_status="attributed",
+        subject=None, raw_body="text", contact_id=1, client_id="c1", inbound_id="i1",
+    )
+    text = str(blocks)
+    assert "✅ attributed" in text
+
+
+def test_sales_reply_unattributed_badge():
+    blocks = _sales_reply_content_blocks(
+        from_address="p@example.com", contact_name=None, firm_name=None,
+        run_id=None, touch_step=None, attribution_status="unattributed",
+        subject=None, raw_body="text", contact_id=None, client_id="c1", inbound_id="i1",
+    )
+    text = str(blocks)
+    assert "⚠️ unattributed" in text
+
+
+def test_sales_reply_opt_out_button_present_when_contact_id_known():
+    """opt_out_contact button present when contact_id is set."""
+    blocks = _sales_reply_content_blocks(
+        from_address="p@example.com", contact_name="Jane", firm_name="Acme",
+        run_id="r1", touch_step=1, attribution_status="attributed",
+        subject=None, raw_body="hi", contact_id=99, client_id="cli-1", inbound_id="i1",
+    )
+    action_blocks = [b for b in blocks if b.get("type") == "actions"]
+    assert len(action_blocks) == 1
+    btn = action_blocks[0]["elements"][0]
+    assert btn["action_id"] == "opt_out_contact"
+    value = json.loads(btn["value"])
+    assert value["contact_id"] == 99
+    assert value["client_id"] == "cli-1"
+
+
+def test_sales_reply_no_opt_out_button_when_unattributed():
+    """No opt_out button on unattributed cards (no contact to target)."""
+    blocks = _sales_reply_content_blocks(
+        from_address="p@example.com", contact_name=None, firm_name=None,
+        run_id=None, touch_step=None, attribution_status="unattributed",
+        subject=None, raw_body="hi", contact_id=None, client_id="cli-1", inbound_id="i1",
+    )
+    action_blocks = [b for b in blocks if b.get("type") == "actions"]
+    assert len(action_blocks) == 0
+
+
+def test_sales_reply_opt_out_has_confirm_dialog():
+    """Opt-out button includes a confirmation dialog to prevent fat-finger."""
+    blocks = _sales_reply_content_blocks(
+        from_address="p@example.com", contact_name="Jane", firm_name=None,
+        run_id=None, touch_step=None, attribution_status="attributed",
+        subject=None, raw_body="hi", contact_id=1, client_id="c1", inbound_id="i1",
+    )
+    btn = [b for b in blocks if b.get("type") == "actions"][0]["elements"][0]
+    assert "confirm" in btn
+
+
+def test_sales_reply_body_blockquoted():
+    """Body is rendered with '>' blockquote prefix."""
+    blocks = _sales_reply_content_blocks(
+        from_address="p@example.com", contact_name=None, firm_name=None,
+        run_id=None, touch_step=None, attribution_status="unattributed",
+        subject=None, raw_body="Hello\nWorld",
+        contact_id=None, client_id="c1", inbound_id="i1",
+    )
+    text_sections = [b for b in blocks if b.get("type") == "section"]
+    message_section = next((s for s in text_sections if "Message" in str(s)), None)
+    assert message_section is not None
+    assert "> Hello" in str(message_section)

@@ -175,6 +175,12 @@ class AppSettings(BaseSettings):
 	# before any halt can be issued or resumed. Recommended: 32+ bytes of entropy.
 	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
 
+	# ── Inbound email (3.1.3 reply bridge) ──────────────────────────────────
+	# Mailgun webhook signing key — used to verify HMAC-SHA256 signatures on
+	# inbound-email webhook POSTs (src/api/inbound_email_router.py). Without
+	# this the /webhooks/inbound-email endpoint rejects all requests.
+	mailgun_signing_key: Optional[SecretStr] = Field(default=None, env="MAILGUN_SIGNING_KEY")
+
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 

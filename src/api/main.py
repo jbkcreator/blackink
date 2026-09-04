@@ -17,6 +17,7 @@ from fastapi import FastAPI
 
 from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
+from src.api.inbound_email_router import router as inbound_email_router
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
 
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Blackink API", lifespan=lifespan)
 
 app.include_router(akrash_router)
+app.include_router(inbound_email_router)
 
 
 @app.get("/healthz")

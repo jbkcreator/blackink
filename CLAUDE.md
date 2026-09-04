@@ -37,6 +37,7 @@ PYTHONPATH=. python migrations/apply_mailbox_last_used.py    # adds mailboxes.la
 PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
 PYTHONPATH=. python migrations/apply_sequence_runs.py       # Dev 3 — after agent_work_orders
 PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py  # Dev 3 — after sequence_runs
+PYTHONPATH=. python migrations/apply_inbound_messages.py    # Dev 3 — after sequence_runs, before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 

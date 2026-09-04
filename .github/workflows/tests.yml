@@ -72,6 +72,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_sequence_runs.py
           PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py
+          PYTHONPATH=. python migrations/apply_inbound_messages.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       # Full suite — this is what actually gates a PR on every change, not
       # just the tenant-leakage path-filtered nightly. Runs
