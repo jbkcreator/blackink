@@ -135,6 +135,15 @@ class AppSettings(BaseSettings):
 	# issued or resumed. Recommended: 32+ bytes of entropy.
 	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
 
+	# ── Demo sandbox dashboard export (src/tasks/seed_demo_sandbox.py) ──────
+	# Service account JSON key path (gitignored `secrets/` dir, never
+	# committed) and target Sheet ID for the sandbox dashboard export that
+	# powers the free-tier Looker Studio demo dashboard. Chosen over a
+	# direct Looker Studio -> Postgres connection specifically to avoid
+	# exposing the shared production database's port to the internet.
+	google_sheets_credentials_path: Optional[str] = Field(default=None, env="GOOGLE_SHEETS_CREDENTIALS_PATH")
+	google_sheets_sandbox_id: Optional[str] = Field(default=None, env="GOOGLE_SHEETS_SANDBOX_ID")
+
 	blackink_qa_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_QA_SLACK_CHANNEL")
 	blackink_command_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_COMMAND_SLACK_CHANNEL")
 	blackink_setter_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_SETTER_SLACK_CHANNEL")
@@ -192,6 +201,13 @@ class AppSettings(BaseSettings):
 
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
+
+	# ── Rent valuation adapter ───────────────────────────────────────────────
+	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
+	# False: no valuation vendor is under contract, so enabling this would
+	# point the adapter at a provider that does not exist. Flipped to True
+	# only when a real RentValuationProvider implementation lands in Q1.
+	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
 
 @lru_cache

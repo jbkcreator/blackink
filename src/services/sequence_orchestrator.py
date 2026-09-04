@@ -166,6 +166,7 @@ def dispatch_touch(
         mailbox_id=mailbox.mailbox_id,
         sending_domain=mailbox.sending_domain,
         template_version=template_version,
+        recipient_email=contact.email,
     )
 
     if touch_step >= _FINAL_TOUCH_STEP and run_id:
