@@ -44,7 +44,18 @@ def sync_halts_from_db() -> int:
         )
         return 0
 
-    r = get_redis_client()
+    try:
+        r = get_redis_client()
+    except Exception as exc:
+        # Redis unavailable — do not block startup. is_halted() falls back to
+        # Postgres on every call until a later sync succeeds. Matches this
+        # module's own contract (see docstring: "preferable to blocking startup").
+        logger.error(
+            "relay.sync: Redis unavailable (%s) — skipping sync; "
+            "is_halted() will use its Postgres fallback", exc
+        )
+        return 0
+
     synced = 0
     active_keys: set = set()
 

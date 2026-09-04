@@ -44,6 +44,17 @@ TENANT_POLICIES = {
 	"sending_domains": {"mode": "direct", "column": "client_id"},
 	"mailboxes": {"mode": "direct", "column": "client_id"},
 	"agent_work_orders": {"mode": "direct", "column": "client_id"},
+	"meeting_outcomes": {"mode": "direct", "column": "client_id"},
+	"sequence_runs": {"mode": "direct", "column": "client_id"},
+	"sequence_touch_dispatches": {"mode": "direct", "column": "client_id"},
+	# owner_visibility_scores has no client_id column of its own — scoped through
+	# companies.owning_client_id via company_id FK, same join pattern as contacts.
+	"owner_visibility_scores": {
+		"mode": "join",
+		"join_table": "companies",
+		"join_on": "company_id",
+		"join_column": "owning_client_id",
+	},
 	"calendar_connections": {"mode": "direct", "column": "client_id"},
 	"owner_contacts": {"mode": "direct", "column": "client_id"},
 	"bookings": {"mode": "direct", "column": "client_id"},
@@ -61,4 +72,4 @@ TENANT_POLICIES = {
 #   counties, owner_entities, owner_entity_links — global reference data.
 #   raw_prospect_companies, raw_prospect_contacts — Akrash has no visibility
 #     into the client roster by design; ownership is assigned only at
-#     promotion time (see Dev 1 plan §Key decision 6).
+#     promotion time (ownership is assigned at promotion, not ingestion).

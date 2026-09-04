@@ -33,7 +33,16 @@ class AppSettings(BaseSettings):
 	)
 
 	debug: bool = Field(default=True, env="DEBUG")
+	# Deployment environment. Anything other than "development"/"test" is treated
+	# as production for fail-closed guards (e.g. the email sender must not fall
+	# back to the transmit-nothing stub in production). Default is development so
+	# local dev and CI stay convenient; production must set ENVIRONMENT=production.
+	environment: str = Field(default="development", env="ENVIRONMENT")
 	app_base_url: str = Field(default="http://localhost:8000", env="APP_BASE_URL")
+
+	@property
+	def is_production(self) -> bool:
+		return (self.environment or "development").strip().lower() not in {"development", "dev", "test", "testing", "local"}
 
 	# ── Database ─────────────────────────────────────────────────────────────
 	# Generic fallback DSN (used by tooling/tests that don't care which role).
@@ -89,6 +98,28 @@ class AppSettings(BaseSettings):
 		default=0.08, env="DELIVERABILITY_SPAM_COMPLAINT_THRESHOLD_PCT"
 	)
 
+	# ── Outbound email (SMTP per warmed mailbox — wayfinder ticket 05) ────────
+	# When smtp_host + smtp_password are set, build_email_sender() returns a real
+	# SmtpEmailSender; otherwise it falls back to the StubEmailSender (mints a
+	# Message-ID, transmits nothing). Per blueprint §475/§853 mailboxes are
+	# warmed Google Workspace / Outlook (smtp.gmail.com:587 / smtp.office365.com:587).
+	# smtp_username defaults to the sending mailbox address at send time; set it
+	# only if the SMTP login differs from the From address.
+	# Sender selection guard (review finding #2). "auto" (default) uses the real
+	# SmtpEmailSender when SMTP is configured, else the StubEmailSender — the
+	# convenient dev/test behaviour. "smtp" is fail-closed: build_email_sender()
+	# raises if SMTP is not configured, so a mis-deployed production box cannot
+	# silently record undelivered mail as SENT. "stub" always uses the stub.
+	email_sender_mode: str = Field(default="auto", env="EMAIL_SENDER_MODE")
+	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
+	smtp_port: int = Field(default=587, env="SMTP_PORT")
+	smtp_use_tls: bool = Field(default=True, env="SMTP_USE_TLS")
+	smtp_username: Optional[str] = Field(default=None, env="SMTP_USERNAME")
+	smtp_password: Optional[SecretStr] = Field(default=None, env="SMTP_PASSWORD")
+	# §768: Reply-To points at the client's own inbox; every send is BCC'd.
+	email_reply_to: Optional[str] = Field(default=None, env="EMAIL_REPLY_TO")
+	email_bcc: Optional[str] = Field(default=None, env="EMAIL_BCC")
+
 	# ── Slack ────────────────────────────────────────────────────────────────
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
@@ -98,11 +129,20 @@ class AppSettings(BaseSettings):
 	# this field's use but doesn't require removing it.
 	slack_app_token: Optional[SecretStr] = Field(default=None, env="SLACK_APP_TOKEN")
 
-	# ── Relay halt / resume (Dev 2, src/agents/relay/) ──────────────────────
+	# ── Relay halt / resume (src/agents/relay/) ─────────────────────────────
 	# HMAC-SHA256 signing key for cryptographic resume tokens
 	# (src/agents/relay/resume_auth.py). Must be set before any halt can be
 	# issued or resumed. Recommended: 32+ bytes of entropy.
 	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
+
+	# ── Demo sandbox dashboard export (src/tasks/seed_demo_sandbox.py) ──────
+	# Service account JSON key path (gitignored `secrets/` dir, never
+	# committed) and target Sheet ID for the sandbox dashboard export that
+	# powers the free-tier Looker Studio demo dashboard. Chosen over a
+	# direct Looker Studio -> Postgres connection specifically to avoid
+	# exposing the shared production database's port to the internet.
+	google_sheets_credentials_path: Optional[str] = Field(default=None, env="GOOGLE_SHEETS_CREDENTIALS_PATH")
+	google_sheets_sandbox_id: Optional[str] = Field(default=None, env="GOOGLE_SHEETS_SANDBOX_ID")
 
 	blackink_qa_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_QA_SLACK_CHANNEL")
 	blackink_command_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_COMMAND_SLACK_CHANNEL")
@@ -113,7 +153,7 @@ class AppSettings(BaseSettings):
 	# Fail-closed workspace-wide approver allowlist — Slack user IDs,
 	# comma-separated (e.g. "U012ABC,U034DEF"). src.services.slack.auth.
 	# approver_authorized() treats an empty/unset list as "nobody
-	# authorized", never "everybody". Dev 3 plan §7.4 — per-tenant
+	# authorized", never "everybody". Per-tenant
 	# approvers are Week 1 (need a clients column that doesn't exist yet);
 	# this is global-only for Week 0.
 	#
@@ -199,6 +239,22 @@ class AppSettings(BaseSettings):
 	# email provider must be a visible launch blocker (booking_confirmation_
 	# blocked event), never a silent no-op or a stub quietly satisfying a test.
 	email_sending_enabled: bool = Field(default=False, env="EMAIL_SENDING_ENABLED")
+
+	# ── Oxylabs residential proxy ────────────────────────────────────────────
+	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
+	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
+
+	# ── Owner Visibility Score ───────────────────────────────────────────────
+	# When absent the stub provider is used — max achievable score is 42/100
+	# (38 website + 4 DBPR). Set to enable live Google Places API calls.
+	google_places_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_PLACES_API_KEY")
+
+	# ── Rent valuation adapter ───────────────────────────────────────────────
+	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
+	# False: no valuation vendor is under contract, so enabling this would
+	# point the adapter at a provider that does not exist. Flipped to True
+	# only when a real RentValuationProvider implementation lands in Q1.
+	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
 
 @lru_cache

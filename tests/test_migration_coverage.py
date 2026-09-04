@@ -102,7 +102,12 @@ def test_documented_migration_order_matches_ci():
 	# function-privilege assertions in test_tenant_isolation.py come from
 	# apply_compliance_gate_audit.py). Listed here so the exemption is a
 	# decision on the record rather than a silent gap.
-	runbook_only = {"apply_akrash_grant.py"}
+	# apply_sandbox_dashboard_view.py is also runbook-only: it creates a
+	# read-only VIEW (demo_sandbox_dashboard) over already-registered tables,
+	# not a tenant-bearing table of its own — no config/tenant_policies.py
+	# entry, so apply_rls_policies.py never touches it and nightly RLS-leakage
+	# CI has no reason to run it. Same precedent as apply_akrash_grant.py.
+	runbook_only = {"apply_akrash_grant.py", "apply_sandbox_dashboard_view.py"}
 
 	assert documented - in_ci - runbook_only == set(), (
 		"documented in CLAUDE.md but never run in CI: "
