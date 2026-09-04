@@ -209,6 +209,20 @@ class AppSettings(BaseSettings):
 	# blocked event), never a silent no-op or a stub quietly satisfying a test.
 	email_sending_enabled: bool = Field(default=False, env="EMAIL_SENDING_ENABLED")
 
+	# ── OVS PDF fetch (Subtask 3.2.2) ────────────────────────────────────────
+	# Comma-separated exact hostnames the pre-demo reminder is allowed to
+	# fetch contacts.ovs_pdf_url from (e.g. an S3/GCS bucket's public host,
+	# once Dev 2's storage step exists — see src/services/show_rate_reminders.py's
+	# _fetch_ovs_pdf()). Default empty means fail-closed: nothing is an
+	# approved host until this is explicitly configured, same posture as
+	# email_sending_enabled defaulting False — a missing/misconfigured value
+	# is a visible BLOCKED reminder job, never a silent fetch-anything.
+	ovs_pdf_allowed_hosts_raw: str = Field(default="", validation_alias="OVS_PDF_ALLOWED_HOSTS")
+
+	@property
+	def ovs_pdf_allowed_hosts(self) -> Tuple[str, ...]:
+		return tuple(v.strip().lower() for v in self.ovs_pdf_allowed_hosts_raw.split(",") if v.strip())
+
 
 @lru_cache
 def get_settings() -> AppSettings:

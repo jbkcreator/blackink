@@ -19,15 +19,33 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+from urllib.parse import urlparse
 
+import httpx
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from config.settings import get_settings
 from src.services.calendar_confirmation import UncertainDeliveryError
 from src.services.email_dispatch import send_show_rate_24h_reminder, send_show_rate_pre_demo_email
 
 _CLAIM_LEASE_MINUTES = 10
 _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT = 5
+
+# ── Hardened OVS PDF fetch ───────────────────────────────────────────────
+# contacts.ovs_pdf_url is written by Dev 2's (not-yet-built) storage step,
+# not by this codebase — treat it as untrusted input, not a value we can
+# assume is well-formed or safe to fetch blindly.
+_OVS_PDF_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB — generous for a 1-2 page report
+_OVS_PDF_TIMEOUT = httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+_PDF_MAGIC = b"%PDF-"
+
+
+class UnsafeOvsPdfUrlError(Exception):
+    """Raised when contacts.ovs_pdf_url fails a safety check — never
+    caught and retried as a generic failure; the reminder job records
+    this as its own distinct BLOCKED reason (see send_show_rate_reminder)
+    rather than silently attaching whatever bytes came back."""
 
 
 def claim_reminders(session: Session, *, claim_time: datetime, limit: int = 20) -> List[int]:
@@ -175,6 +193,54 @@ def _resolve_view_event_link(job) -> Optional[str]:
     return (raw_payload or {}).get("htmlLink") or (raw_payload or {}).get("webLink")
 
 
+def _fetch_ovs_pdf(url: str) -> bytes:
+    """Fetches contacts.ovs_pdf_url with the checks a URL from an
+    untrusted, not-yet-built upstream (Dev 2's storage step) demands:
+
+    - approved host allowlist (settings.ovs_pdf_allowed_hosts) — fails
+      closed if unconfigured, exactly like email_sending_enabled
+    - https only
+    - redirects never followed (a redirect to an unapproved host would
+      otherwise bypass the allowlist check entirely)
+    - a real connect/read timeout, not an indefinite hang
+    - a hard byte cap enforced while streaming, not just Content-Length
+      (a malicious or misconfigured host could omit or lie about it)
+    - Content-Type and the actual leading bytes (%PDF- magic) both
+      checked — a wrong Content-Type alone isn't trusted, and neither is
+      an unverified body just because the header looked right
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise UnsafeOvsPdfUrlError(f"ovs_pdf_url is not https: {parsed.scheme!r}")
+    allowed_hosts = get_settings().ovs_pdf_allowed_hosts
+    if not allowed_hosts:
+        raise UnsafeOvsPdfUrlError("OVS_PDF_ALLOWED_HOSTS is not configured — no host is approved")
+    if (parsed.hostname or "").lower() not in allowed_hosts:
+        raise UnsafeOvsPdfUrlError(f"ovs_pdf_url host {parsed.hostname!r} is not in the approved allowlist")
+
+    with httpx.stream(
+        "GET", url, timeout=_OVS_PDF_TIMEOUT, follow_redirects=False,
+    ) as resp:
+        if resp.status_code != 200:
+            raise UnsafeOvsPdfUrlError(f"ovs_pdf_url returned HTTP {resp.status_code}")
+        content_type = resp.headers.get("content-type", "")
+        if "application/pdf" not in content_type.lower():
+            raise UnsafeOvsPdfUrlError(f"ovs_pdf_url Content-Type is not application/pdf: {content_type!r}")
+
+        chunks = []
+        total = 0
+        for chunk in resp.iter_bytes():
+            total += len(chunk)
+            if total > _OVS_PDF_MAX_BYTES:
+                raise UnsafeOvsPdfUrlError(f"ovs_pdf_url body exceeds {_OVS_PDF_MAX_BYTES} bytes — aborted mid-stream")
+            chunks.append(chunk)
+        body = b"".join(chunks)
+
+    if not body.startswith(_PDF_MAGIC):
+        raise UnsafeOvsPdfUrlError("ovs_pdf_url body does not start with the PDF magic bytes (%PDF-)")
+    return body
+
+
 def send_show_rate_reminder(session: Session, reminder_job_id: int, *, as_of: datetime) -> None:
     """Called only on a job already claimed (status='SENDING') by
     claim_reminders(). Rechecks the booking's live state immediately
@@ -234,9 +300,18 @@ def send_show_rate_reminder(session: Session, reminder_job_id: int, *, as_of: da
             if pdf_row is None or pdf_row.ovs_pdf_url is None:
                 _mark(session, reminder_job_id, "BLOCKED", error="MISSING_OVS_PDF")
                 return
-            import httpx
-
-            pdf_bytes = httpx.get(pdf_row.ovs_pdf_url, timeout=15).content
+            try:
+                pdf_bytes = _fetch_ovs_pdf(pdf_row.ovs_pdf_url)
+            except UnsafeOvsPdfUrlError as exc:
+                # Distinct BLOCKED reason from MISSING_OVS_PDF — the URL
+                # exists but failed a safety check (unapproved host, wrong
+                # content, oversized, etc.), a data-quality problem in
+                # Dev 2's pipeline, not something a plain retry fixes and
+                # not something recover_blocked_jobs() auto-heals (unlike
+                # MISSING_OVS_PDF, the row existing again next sweep tick
+                # doesn't mean this got fixed).
+                _mark(session, reminder_job_id, "BLOCKED", error=f"UNSAFE_OVS_PDF_URL: {exc}")
+                return
             message_id = send_show_rate_pre_demo_email(
                 session,
                 client_id=job.client_id,

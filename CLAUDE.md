@@ -155,6 +155,12 @@ Manager-backed env vars, never baked into the image):
 - `EMAIL_SENDING_ENABLED` — leave `False`/unset unless real SMTP
   credentials for a validated sending domain exist; see
   `src/services/email_dispatch.py`.
+- `OVS_PDF_ALLOWED_HOSTS` — comma-separated exact hostnames the 30-minute
+  pre-demo reminder is allowed to fetch `contacts.ovs_pdf_url` from (e.g.
+  the real object-storage host once Dev 2's storage step exists); leave
+  unset until then — every such reminder job stays `BLOCKED` rather than
+  fetching from an unapproved host. See
+  `src/services/show_rate_reminders._fetch_ovs_pdf`.
 - `AKRASH_INGEST_JWT_SECRET`, `DNC_VENDOR_API_KEY`, etc. — the existing
   Week 1 settings, only needed if those code paths are actually
   exercised in this test deployment.
@@ -313,18 +319,31 @@ that's already started (`as_of >= scheduled_at` → `SKIPPED`, never a
 stale send) regardless of why processing was delayed.
 
 The 30-minute pre-demo email attaches Dev 2's **stored** Owner
-Visibility Score PDF (`contacts.ovs_pdf_url`, fetched via `httpx`) —
-never regenerates one via `pdf_report.compile_pdf()` itself, which would
-produce a second, independently-generated report. If no
-`owner_visibility_scores` row or `ovs_pdf_url` exists yet for the target
-company (true today — `owner_visibility_sweep.py` doesn't populate
-`ovs_pdf_url`, only the compiler function exists), the job is marked
-`BLOCKED` (`MISSING_OVS_SCORE` / `MISSING_OVS_PDF`) rather than sending
-fabricated content; the sweep's self-heal step re-checks and auto-
-promotes those specific rows back to `PENDING` the moment the underlying
-data actually appears, no event-consumer plumbing required. `BLOCKED`
-rows (that reason, or `EMAIL_SENDING_DISABLED`) and `UNCERTAIN` rows are
-excluded from the claim query — never re-reclaimed every sweep tick.
+Visibility Score PDF (`contacts.ovs_pdf_url`), fetched via
+`show_rate_reminders._fetch_ovs_pdf()` — never regenerates one via
+`pdf_report.compile_pdf()` itself, which would produce a second,
+independently-generated report. `ovs_pdf_url` is untrusted input
+(written by Dev 2's own, separate storage step, not this codebase), so
+the fetch enforces: an exact-hostname allowlist
+(`OVS_PDF_ALLOWED_HOSTS`, comma-separated — empty means fail closed,
+same posture as `EMAIL_SENDING_ENABLED`), `https` only,
+`follow_redirects=False` (a redirect could otherwise land outside the
+allowlist), a real connect/read timeout, a 10 MiB cap enforced while
+streaming (never trusting a `Content-Length` header alone), and both
+`Content-Type` and the actual `%PDF-` magic bytes checked. A URL that
+fails any of these marks the job `BLOCKED`/`UNSAFE_OVS_PDF_URL` — a
+distinct reason from `MISSING_OVS_PDF`, and one the sweep's self-heal
+step does *not* auto-promote (the row reappearing doesn't mean the
+underlying safety problem got fixed). If no `owner_visibility_scores`
+row or `ovs_pdf_url` exists yet for the target company (true today —
+`owner_visibility_sweep.py` doesn't populate `ovs_pdf_url`, only the
+compiler function exists), the job is marked `BLOCKED`
+(`MISSING_OVS_SCORE` / `MISSING_OVS_PDF`) rather than sending fabricated
+content; the sweep's self-heal step re-checks and auto-promotes those
+two specific reasons back to `PENDING` the moment the underlying data
+actually appears, no event-consumer plumbing required. `BLOCKED` rows
+(any reason) and `UNCERTAIN` rows are excluded from the claim query —
+never re-reclaimed every sweep tick.
 No self-serve reschedule mechanism exists anywhere in this repo or its
 provider contracts (Google's `htmlLink`/Microsoft's `webLink` are
 event-*view* links, not reschedule actions) — the 24h email may show a

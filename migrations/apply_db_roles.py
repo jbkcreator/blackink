@@ -98,6 +98,19 @@ def main() -> int:
 			bypassrls_clause = "BYPASSRLS" if cfg["bypassrls"] else "NOBYPASSRLS"
 			stmt = CREATE_ROLE_SQL_TEMPLATE.format(role=role, bypassrls_clause=bypassrls_clause)
 			db.execute(text(stmt), {"pw": pw})
+
+		# Explicit, not relied-on-by-default: PG15+ already denies CREATE on
+		# public to PUBLIC out of the box (confirmed for this project's
+		# Postgres 16), but stating it here makes the invariant survive a
+		# different Postgres version or a differently-provisioned database,
+		# rather than depending on an upstream default nobody in this repo
+		# chose. This is what makes SET search_path = pg_catalog on the
+		# SECURITY DEFINER functions (resolve_calendar_connection,
+		# resolve_sales_demo_target, is_claimed_by_other_client) an actual
+		# guarantee instead of an assumption — none of blackink_app/
+		# blackink_system/akrash_ingest can ever create a shadowing object
+		# in a schema any of those functions might search.
+		db.execute(text("REVOKE CREATE ON SCHEMA public FROM PUBLIC"))
 		db.commit()
 		print(f"apply_db_roles: done — roles ready: {list(ROLES.keys())}")
 	return 0

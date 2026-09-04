@@ -118,12 +118,24 @@ DDL = [
 	# never accepted as a parameter, for the identical reason
 	# is_claimed_by_other_client() reads it that way rather than trusting a
 	# caller-supplied client_id.
+	#
+	# search_path = pg_catalog (NOT public) — a second layer, not relying
+	# solely on today's verified fact that blackink_app/blackink_system/
+	# akrash_ingest have no CREATE on public (confirmed via
+	# has_schema_privilege before landing this). pg_catalog is
+	# superuser-owned and never writable by any application role in any
+	# configuration, so it can't be shadowed regardless of what a future
+	# grant or a different Postgres deployment default allows. Every
+	# object this function touches is fully schema-qualified
+	# (public.contacts) so removing public from the search path doesn't
+	# break resolution — current_setting() itself resolves fine unqualified
+	# since it's a pg_catalog builtin.
 	"DROP FUNCTION IF EXISTS resolve_sales_demo_target(VARCHAR)",
 	"""
 	CREATE OR REPLACE FUNCTION resolve_sales_demo_target(p_email VARCHAR)
 	RETURNS TABLE(contact_id BIGINT, company_id VARCHAR)
 	SECURITY DEFINER
-	SET search_path = public
+	SET search_path = pg_catalog
 	LANGUAGE plpgsql
 	AS $$
 	DECLARE

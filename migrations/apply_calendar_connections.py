@@ -167,12 +167,16 @@ DDL = [
 	# search_path/REVOKE/OWNER hardening matches is_claimed_by_other_client()'s
 	# established convention (apply_compliance_gate_audit.py) — the original
 	# version of this function in this branch's history had neither.
+	# search_path = pg_catalog, not public — see resolve_sales_demo_target()'s
+	# comment in apply_bookings.py for the full rationale (a second layer on
+	# top of today's verified no-CREATE-on-public grants, not a substitute
+	# for schema-qualifying every referenced object).
 	"DROP FUNCTION IF EXISTS resolve_calendar_connection(VARCHAR, VARCHAR)",
 	"""
 	CREATE OR REPLACE FUNCTION resolve_calendar_connection(p_provider VARCHAR, p_subscription_id VARCHAR)
 	RETURNS TABLE(connection_id BIGINT, client_id VARCHAR, verification_secret VARCHAR)
 	SECURITY DEFINER
-	SET search_path = public
+	SET search_path = pg_catalog
 	LANGUAGE sql
 	AS $$
 		SELECT connection_id, client_id, verification_secret

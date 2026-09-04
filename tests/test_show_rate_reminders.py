@@ -401,9 +401,14 @@ def test_30min_reminder_fires_within_60s_of_the_30min_mark_and_sends():
 
 			email_dispatch.SmtpEmailProvider = lambda **kwargs: _FakeProvider()
 
-			import httpx as _httpx
-			original_get = _httpx.get
-			_httpx.get = lambda *a, **k: type("R", (), {"content": b"%PDF-fake"})()
+			# _fetch_ovs_pdf() enforces a real host allowlist/https/content
+			# checks against contacts.ovs_pdf_url -- mocked here at the
+			# function boundary rather than faking an httpx.stream response,
+			# since this test is about the reminder pipeline, not re-proving
+			# _fetch_ovs_pdf()'s own hardening (see tests/test_ovs_pdf_fetch.py).
+			import src.services.show_rate_reminders as show_rate_reminders_module
+			original_fetch = show_rate_reminders_module._fetch_ovs_pdf
+			show_rate_reminders_module._fetch_ovs_pdf = lambda url: b"%PDF-fake"
 
 			try:
 				as_of = scheduled_at - timedelta(minutes=30)
@@ -416,7 +421,7 @@ def test_30min_reminder_fires_within_60s_of_the_30min_mark_and_sends():
 				).one()
 				assert row.status == "SENT"
 			finally:
-				_httpx.get = original_get
+				show_rate_reminders_module._fetch_ovs_pdf = original_fetch
 				email_dispatch.SmtpEmailProvider = original_smtp
 				email_dispatch.decrypt_token = original_decrypt
 				email_dispatch._resolve_mailbox = original_resolve
