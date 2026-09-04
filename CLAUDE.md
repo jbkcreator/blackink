@@ -124,14 +124,18 @@ sync per above.
 
 `Dockerfile` runs `uvicorn src.api.main:app --host 0.0.0.0 --port
 ${PORT}` — Cloud Run injects `PORT`, never hardcode a port. On startup,
-`src/api/main.py`'s lifespan spawns three background threads
+`src/api/main.py`'s lifespan spawns the scheduled-worker threads
 (`calendar_sync_worker.drain_queue`/`sweep_all_active_connections`,
 `booking_confirmation_sender.run_sweep`,
-`calendar_subscription_renewal.run_renewal_sweep`) — this only actually
-keeps running under an **instance-based** billing / **min-instances ≥
-1** Cloud Run configuration; request-based billing suspends the
-container (and these threads) between requests, which would silently
-break the whole point of a background worker.
+`calendar_subscription_renewal.run_renewal_sweep`, and
+`show_rate_reminder_sender.run_sweep` — the last is the Subtask 3.2.2
+reminder cascade's only sender, so it MUST stay in
+`_start_background_workers()` or every 24h/30min reminder job silently
+never sends) — this only actually keeps running under an
+**instance-based** billing / **min-instances ≥ 1** Cloud Run
+configuration; request-based billing suspends the container (and these
+threads) between requests, which would silently break the whole point of
+a background worker.
 
 **Required environment variables / secrets** (exact names
 `config/settings.py` reads — set these as Cloud Run env vars or Secret

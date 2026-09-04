@@ -149,7 +149,22 @@ class GoogleCalendarClient:
 		)
 		resp.raise_for_status()
 		body = resp.json()
-		return {"resource_id": body["resourceId"], "expires_at_ms": body.get("expiration")}
+		# Google returns `expiration` as a Unix timestamp in MILLISECONDS,
+		# as a string. Parse it to a tz-aware datetime here so every caller
+		# persists calendar_connections.expires_at consistently — without a
+		# stored expiry the renewal sweep treats the connection as perpetually
+		# due and creates a fresh watch channel on every tick.
+		expiration_ms = body.get("expiration")
+		expires_at = (
+			datetime.fromtimestamp(int(expiration_ms) / 1000, tz=timezone.utc)
+			if expiration_ms
+			else None
+		)
+		return {
+			"resource_id": body["resourceId"],
+			"expires_at_ms": expiration_ms,
+			"expires_at": expires_at,
+		}
 
 
 def _is_tagged_microsoft(item: dict) -> bool:
