@@ -4,6 +4,7 @@ from src.tasks.seed_demo_sandbox import (
     SANDBOX_CLIENT_ID,
     build_mock_companies,
     build_mock_contacts_for_company,
+    export_dashboard_to_sheet,
 )
 
 
@@ -46,7 +47,8 @@ def test_each_company_gets_exactly_two_role_distinct_contacts():
 
 def test_main_is_idempotent_upsert_not_duplicate_insert():
     with patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
-         patch("src.tasks.seed_demo_sandbox.log_event") as mock_log:
+         patch("src.tasks.seed_demo_sandbox.log_event") as mock_log, \
+         patch("src.tasks.seed_demo_sandbox.export_dashboard_to_sheet", return_value=0):
         session = MagicMock()
         mock_ctx.return_value.__enter__.return_value = session
         # No existing owner for any company — the collision check must not
@@ -79,7 +81,8 @@ def test_main_skips_company_and_contacts_already_owned_by_another_client():
         return result
 
     with patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
-         patch("src.tasks.seed_demo_sandbox.log_event") as mock_log:
+         patch("src.tasks.seed_demo_sandbox.log_event") as mock_log, \
+         patch("src.tasks.seed_demo_sandbox.export_dashboard_to_sheet", return_value=0):
         session = MagicMock()
         session.execute.side_effect = fake_execute
         mock_ctx.return_value.__enter__.return_value = session
@@ -123,7 +126,8 @@ def test_main_reassigns_county_for_already_seeded_sandbox_company():
         return result
 
     with patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
-         patch("src.tasks.seed_demo_sandbox.log_event"):
+         patch("src.tasks.seed_demo_sandbox.log_event"), \
+         patch("src.tasks.seed_demo_sandbox.export_dashboard_to_sheet", return_value=0):
         session = MagicMock()
         session.execute.side_effect = fake_execute
         mock_ctx.return_value.__enter__.return_value = session
@@ -137,3 +141,67 @@ def test_main_reassigns_county_for_already_seeded_sandbox_company():
     )
     assert "county_slug = EXCLUDED.county_slug" in str(upsert_call.args[0])
     assert upsert_call.args[1]["county_slug"] in {"hillsborough_fl", "pinellas_fl"}
+
+
+def test_export_dashboard_to_sheet_skips_when_unconfigured():
+    """Looker Studio reads a Google Sheet, not Postgres directly (avoids
+    exposing the shared production database to the internet). Without
+    credentials configured, export must no-op rather than error — this is
+    the default state for every environment that hasn't set up the Sheets
+    export yet (e.g. CI, a fresh dev machine)."""
+    fake_settings = MagicMock(google_sheets_credentials_path=None, google_sheets_sandbox_id=None)
+    with patch("src.tasks.seed_demo_sandbox.get_settings", return_value=fake_settings), \
+         patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
+         patch("src.tasks.seed_demo_sandbox.gspread") as mock_gspread:
+        assert export_dashboard_to_sheet() == 0
+    mock_ctx.assert_not_called()
+    mock_gspread.service_account.assert_not_called()
+
+
+def test_export_dashboard_to_sheet_writes_header_and_rows():
+    fake_settings = MagicMock(
+        google_sheets_credentials_path="secrets/fake.json",
+        google_sheets_sandbox_id="fake-sheet-id",
+    )
+    fake_rows = [("Sunbelt Property Management", "hillsborough_fl", 120, "AppFolio", "CLIENT", 2, 1)]
+
+    with patch("src.tasks.seed_demo_sandbox.get_settings", return_value=fake_settings), \
+         patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
+         patch("src.tasks.seed_demo_sandbox.gspread") as mock_gspread:
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = fake_rows
+        mock_ctx.return_value.__enter__.return_value = session
+        worksheet = MagicMock()
+        mock_gspread.service_account.return_value.open_by_key.return_value.sheet1 = worksheet
+
+        result = export_dashboard_to_sheet()
+
+    mock_gspread.service_account.assert_called_once_with(filename="secrets/fake.json")
+    mock_gspread.service_account.return_value.open_by_key.assert_called_once_with("fake-sheet-id")
+    worksheet.clear.assert_called_once()
+    written = worksheet.update.call_args[0][0]
+    assert written[0] == [
+        "company_name", "county_slug", "door_count_est", "current_pm_software",
+        "status", "touches_sent", "meetings_booked",
+    ]
+    assert written[1] == list(fake_rows[0])
+    assert result == 1
+
+
+def test_export_dashboard_to_sheet_failure_does_not_raise():
+    """A Sheets-side failure (bad credentials, network blip, API quota) must
+    never fail the seeding run that calls this — seeding the database is
+    the important part; updating the demo dashboard sheet is secondary."""
+    fake_settings = MagicMock(
+        google_sheets_credentials_path="secrets/fake.json",
+        google_sheets_sandbox_id="fake-sheet-id",
+    )
+    with patch("src.tasks.seed_demo_sandbox.get_settings", return_value=fake_settings), \
+         patch("src.tasks.seed_demo_sandbox.get_system_db_context") as mock_ctx, \
+         patch("src.tasks.seed_demo_sandbox.gspread") as mock_gspread:
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = []
+        mock_ctx.return_value.__enter__.return_value = session
+        mock_gspread.service_account.side_effect = RuntimeError("auth failed")
+
+        assert export_dashboard_to_sheet() == 0

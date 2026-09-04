@@ -27,4 +27,9 @@ httpx>=0.27
 # installs slack-bolt fine but AsyncSocketModeHandler fails to import.
 aiohttp>=3.13
 fakeredis>=2.0
+# Demo sandbox dashboard export (src/tasks/seed_demo_sandbox.py) — writes to
+# a Google Sheet that Looker Studio's free Sheets connector reads, instead
+# of exposing the production database to Looker Studio's connector directly.
+gspread>=6.0
+google-auth>=2.0
 

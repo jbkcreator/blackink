@@ -18,12 +18,24 @@ import hashlib
 import logging
 import random
 
+import gspread
 from sqlalchemy import text
 
+from config.settings import get_settings
 from src.core.database import get_system_db_context
 from src.services.events import log_event
 
 logger = logging.getLogger(__name__)
+
+_DASHBOARD_SHEET_HEADER = [
+    "company_name", "county_slug", "door_count_est", "current_pm_software",
+    "status", "touches_sent", "meetings_booked",
+]
+_SELECT_DASHBOARD_ROWS = f"""
+    SELECT {', '.join(_DASHBOARD_SHEET_HEADER)}
+    FROM demo_sandbox_dashboard
+    ORDER BY company_name
+"""
 
 SANDBOX_CLIENT_ID = "DEMO_FRIDAY_SANDBOX"
 
@@ -158,6 +170,35 @@ def _existing_owner(session, company_id: str) -> "str | None":
     return row["owning_client_id"] if row else None
 
 
+def export_dashboard_to_sheet() -> int:
+    """Push the current demo_sandbox_dashboard rows into a Google Sheet, so
+    Looker Studio's free Sheets connector can render them. Chosen over
+    pointing Looker Studio directly at Postgres: that would require opening
+    the shared production database's port to the internet (Looker Studio's
+    connector has no fixed, narrow IP range to allowlist), exposing the
+    whole server rather than just this one demo view. Returns the number of
+    rows written, or 0 if export is unconfigured/unreachable (never raises —
+    a Sheets outage must not fail the seeding run that calls this)."""
+    settings = get_settings()
+    if not settings.google_sheets_credentials_path or not settings.google_sheets_sandbox_id:
+        logger.info("export_dashboard_to_sheet: GOOGLE_SHEETS_* not configured, skipping")
+        return 0
+
+    with get_system_db_context() as session:
+        rows = session.execute(text(_SELECT_DASHBOARD_ROWS)).fetchall()
+
+    try:
+        gc = gspread.service_account(filename=settings.google_sheets_credentials_path)
+        worksheet = gc.open_by_key(settings.google_sheets_sandbox_id).sheet1
+        worksheet.clear()
+        worksheet.update([_DASHBOARD_SHEET_HEADER] + [list(row) for row in rows])
+    except Exception:
+        logger.warning("export_dashboard_to_sheet: failed to update sheet", exc_info=True)
+        return 0
+
+    return len(rows)
+
+
 def main() -> int:
     """company_id is sha256(domain) — globally unique and deterministic. If
     one of this seeder's 40 domains happens to collide with a REAL customer's
@@ -229,6 +270,11 @@ def main() -> int:
         f"{events_logged} mock events"
         + (f", {len(skipped_domains)} collision(s) skipped" if skipped_domains else "")
     )
+
+    exported = export_dashboard_to_sheet()
+    if exported:
+        print(f"seed_demo_sandbox: exported {exported} rows to the dashboard sheet")
+
     return 0
 
 
