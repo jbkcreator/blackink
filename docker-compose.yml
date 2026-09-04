@@ -1,5 +1,19 @@
 
 services:
+  # Disposable local Postgres for schema/migration development — never used
+  # for staging or production. Port 5433 (not 5432) so it doesn't collide
+  # with a native Postgres install some dev machines already have on 5432.
+  # See CLAUDE.md's "Local development database" section.
+  postgres-test:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: localdevpass
+      POSTGRES_DB: blackink
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+
   api:
     build: .
     image: blackink-backend:latest
@@ -40,3 +54,6 @@ services:
     restart: unless-stopped
     depends_on:
       - api
+
+volumes:
+  postgres_test_data:

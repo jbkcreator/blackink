@@ -28,6 +28,7 @@ def test_create_all_tables_succeeds():
 		"client_pm_books",
 		"companies",
 		"contacts",
+		"pm_profiles",
 	}
 	missing = expected - table_names
 	assert not missing, f"Expected tables missing after create_all(): {missing}"
