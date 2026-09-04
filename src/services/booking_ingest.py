@@ -333,6 +333,118 @@ def schedule_show_rate_reminders(
 			)
 
 
+def schedule_no_show_prompt(
+	session: Session,
+	*,
+	client_id: str,
+	booking_id: int,
+	old_event_status: Optional[str],
+	old_scheduled_at: Optional[datetime],
+	new_event_status: str,
+	new_scheduled_at: Optional[datetime],
+	as_of: Optional[datetime] = None,
+) -> None:
+	"""Subtask 3.2.3 — No-Show Handler. Sibling to
+	schedule_show_rate_reminders() — same insert/reschedule/cancel call
+	sites and lifecycle rules, but for the single 'Mark No-Show' Slack
+	prompt job rather than an email reminder. Reads bookings.target_contact_id
+	itself (rather than taking it as a parameter) so every call site is
+	uniform whether the target was just resolved (new insert) or was
+	resolved earlier (reschedule/cancel of an already-matched booking).
+
+	Never schedules an actionable PENDING prompt for a booking whose
+	target_contact_id is unresolved (still PENDING_RECONCILIATION) — a
+	rep clicking "Mark No-Show" on an inferred/unknown contact would pause
+	the wrong person. Such a booking's job stays BLOCKED until
+	reconciliation resolves target_contact_id (no automatic re-check exists
+	yet for this specific case — a future reconciliation-completion hook
+	would need to re-run this function)."""
+	as_of = as_of or datetime.now(timezone.utc)
+
+	if new_event_status == "CANCELLED":
+		session.execute(
+			text(
+				"UPDATE no_show_prompt_jobs SET status = 'CANCELLED', updated_at = NOW() "
+				"WHERE booking_id = :bid AND status IN ('PENDING', 'BLOCKED', 'SENDING')"
+			),
+			{"bid": booking_id},
+		)
+		return
+
+	if new_event_status != "CONFIRMED" or new_scheduled_at is None:
+		return
+
+	is_new = old_event_status is None
+	is_reschedule = not is_new and old_scheduled_at != new_scheduled_at
+	if not is_new and not is_reschedule:
+		return  # unchanged CONFIRMED booking — no-op
+
+	target_contact_id = session.execute(
+		text("SELECT target_contact_id FROM bookings WHERE booking_id = :bid"),
+		{"bid": booking_id},
+	).scalar()
+
+	if target_contact_id is None:
+		status, last_error = "BLOCKED", "target_contact_id unresolved (booking is PENDING_RECONCILIATION)"
+	elif new_scheduled_at <= as_of:
+		status = "SKIPPED"
+		last_error = f"scheduled_for ({new_scheduled_at.isoformat()}) already past at {'creation' if is_new else 'reschedule'} time"
+	else:
+		status, last_error = "PENDING", None
+
+	if is_new:
+		session.execute(
+			text(
+				"INSERT INTO no_show_prompt_jobs (client_id, booking_id, scheduled_for, status, last_error) "
+				"VALUES (:client_id, :booking_id, :scheduled_for, :status, :last_error) "
+				"ON CONFLICT (booking_id) DO NOTHING"
+			),
+			{
+				"client_id": client_id, "booking_id": booking_id, "scheduled_for": new_scheduled_at,
+				"status": status, "last_error": last_error,
+			},
+		)
+	else:
+		# Reschedule: only touch rows still PENDING/BLOCKED — a SENT/CANCELLED
+		# job is never re-posted.
+		session.execute(
+			text(
+				"UPDATE no_show_prompt_jobs SET scheduled_for = :scheduled_for, status = :status, "
+				"last_error = :last_error, updated_at = NOW() "
+				"WHERE booking_id = :booking_id AND status IN ('PENDING', 'BLOCKED')"
+			),
+			{
+				"scheduled_for": new_scheduled_at, "status": status, "last_error": last_error,
+				"booking_id": booking_id,
+			},
+		)
+
+
+def _resume_if_rebooked(session: Session, *, contact_id: int, new_booking_id: int) -> None:
+	"""Subtask 3.2.3. Clears a contact's outbound pause ONLY when the
+	contact has actually rebooked under a genuinely new, distinct
+	booking_id — never on a routine re-sync/re-delivery of the SAME
+	booking whose no-show caused the pause (that would silently defeat
+	the pause the moment the provider redelivers an unchanged webhook
+	event). Only ever called from the was_inserted branch below, so
+	new_booking_id is always a booking_id that did not exist before this
+	call — still compared explicitly against
+	outbound_pause_source_booking_id rather than assumed, since that's the
+	actual invariant that matters here, not merely "this code path only
+	runs on insert."
+
+	Goes through resume_contact_if_rebooked() (apply_bookings.py), not a
+	direct UPDATE — contacts is RLS-scoped via companies.owning_client_id,
+	which is NULL for every unallocated prospect, so a session scoped to
+	client_id='BLACKINK_INTERNAL_SALES' can never write these rows
+	directly (same reason _find_sales_demo_target() above goes through
+	resolve_sales_demo_target() rather than a direct SELECT)."""
+	session.execute(
+		text("SELECT resume_contact_if_rebooked(:cid, :new_booking_id)"),
+		{"cid": contact_id, "new_booking_id": new_booking_id},
+	)
+
+
 def _process_event(
 	session: Session,
 	connection,
@@ -362,6 +474,11 @@ def _process_event(
 			})
 			if connection.connection_scope == "INTERNAL_SALES_DEMO":
 				schedule_show_rate_reminders(
+					session, client_id=connection.client_id, booking_id=booking_id,
+					old_event_status="CONFIRMED", old_scheduled_at=None,
+					new_event_status="CANCELLED", new_scheduled_at=None,
+				)
+				schedule_no_show_prompt(
 					session, client_id=connection.client_id, booking_id=booking_id,
 					old_event_status="CONFIRMED", old_scheduled_at=None,
 					new_event_status="CANCELLED", new_scheduled_at=None,
@@ -404,6 +521,14 @@ def _process_event(
 					),
 					{"cid": target["company_id"], "ctid": target["contact_id"], "bid": result["booking_id"]},
 				)
+				# A genuinely new booking_id (this is the was_inserted branch)
+				# for a matched contact means the contact has rebooked — clear
+				# any standing no-show pause, but only if it wasn't already
+				# sourced from this exact booking (can't be, since this
+				# booking_id did not exist until this INSERT).
+				_resume_if_rebooked(
+					session, contact_id=target["contact_id"], new_booking_id=result["booking_id"]
+				)
 		else:
 			owner_contact_id = _find_owner_contact(session, connection.client_id, event.owner_email)
 			match_status = "MATCHED" if owner_contact_id else "PENDING_RECONCILIATION"
@@ -437,6 +562,11 @@ def _process_event(
 				old_event_status=None, old_scheduled_at=None,
 				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
 			)
+			schedule_no_show_prompt(
+				session, client_id=connection.client_id, booking_id=result["booking_id"],
+				old_event_status=None, old_scheduled_at=None,
+				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+			)
 	else:
 		if result["old_scheduled_at"] is not None and result["scheduled_at"] != result["old_scheduled_at"]:
 			_record_event(session, connection.client_id, "booking_rescheduled", result["booking_id"], {
@@ -447,6 +577,11 @@ def _process_event(
 			outcome.rescheduled += 1
 			if is_sales_demo:
 				schedule_show_rate_reminders(
+					session, client_id=connection.client_id, booking_id=result["booking_id"],
+					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
+					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+				)
+				schedule_no_show_prompt(
 					session, client_id=connection.client_id, booking_id=result["booking_id"],
 					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
 					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],

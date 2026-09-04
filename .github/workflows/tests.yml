@@ -38,6 +38,13 @@ jobs:
       BLACKINK_SYSTEM_DB_PASSWORD: test_only_password
       AKRASH_INGEST_DB_PASSWORD: test_only_password
       REDIS_URL: redis://localhost:6379/0
+      # Test-only keys (not real secrets) — required by
+      # src/core/token_crypto.py (calendar OAuth tests) and
+      # src/services/no_show_prompts.py (Subtask 3.2.3's Mark No-Show
+      # token tests), both of which exercise real
+      # encryption/HMAC rather than mocking it.
+      TOKEN_ENCRYPTION_KEY: sWHdVufCbVgVcqllGh3tCpyvFNKIBKO9kVkfoippIwk=
+      NO_SHOW_TOKEN_SECRET: test-only-no-show-token-secret-not-a-real-secret
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -76,6 +83,9 @@ jobs:
           PYTHONPATH=. python migrations/apply_calendar_connections.py
           PYTHONPATH=. python migrations/apply_bookings.py
           PYTHONPATH=. python migrations/apply_booking_reminder_jobs.py
+          PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py
+          PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py
+          PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       # Full suite — this is what actually gates a PR on every change, not
       # just the tenant-leakage path-filtered nightly. Runs

@@ -154,6 +154,24 @@ def _check_dnc(contact, dnc_provider: DncProvider) -> GateCheckResult:
 	)
 
 
+def _check_not_paused(contact) -> GateCheckResult:
+	"""Subtask 3.2.3 — No-Show Handler. The real dispatch safeguard for a
+	contact paused after a sales-demo no-show: contacts.outbound_paused_at
+	is set by the Slack mark_no_show click handler
+	(src/services/slack/listeners.py) and cleared by booking_ingest.py only
+	when the contact rebooks under a genuinely new booking_id. There is no
+	durable outbound-sequence/campaign-enrollment engine in this codebase
+	yet to mark PAUSED directly (src/agents/cora/worker.py's own docstring
+	states draft generation is still a Week-0 placeholder) — this check is
+	the actual, enforced choke point every cold-campaign send already
+	passes through per contact."""
+	if contact.outbound_paused_at is not None:
+		return GateCheckResult(
+			"outbound_not_paused", FAIL, f"paused: {contact.outbound_pause_reason or 'unspecified'}"
+		)
+	return GateCheckResult("outbound_not_paused", PASS, "not paused")
+
+
 def _check_non_poach(session: Session, company_id: str) -> GateCheckResult:
 	"""requesting_client_id is deliberately NOT passed to the SQL function —
 	it reads the requesting client from the session's own SET LOCAL
@@ -191,6 +209,7 @@ def evaluate_compliance_gate(
 
 	checks = (
 		_check_deterministic_columns(contact),
+		_check_not_paused(contact),
 		_check_cooldown(contact),
 		_check_dnc(contact, dnc_provider),
 		_check_non_poach(session, contact.company_id),

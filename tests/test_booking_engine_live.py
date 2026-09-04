@@ -368,11 +368,25 @@ def sales_demo_connection():
 		connection_id = row.connection_id
 	yield connection_id
 	with get_owner_db_context() as session:
-		# booking_reminder_jobs has no DELETE grant for blackink_app/blackink_system
-		# in production (a reminder job is never deleted, only status-transitioned) --
-		# test cleanup goes through the owner/superuser context instead.
+		# booking_reminder_jobs/no_show_prompt_jobs/no_show_recovery_jobs have
+		# no DELETE grant for blackink_app/blackink_system in production (a
+		# job row is never deleted, only status-transitioned) -- test cleanup
+		# goes through the owner/superuser context instead. All three now
+		# FK-reference bookings, so all three must clear before bookings can
+		# be deleted below.
 		session.execute(text("DELETE FROM booking_reminder_jobs WHERE booking_id IN "
 							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
+		session.execute(text("DELETE FROM no_show_prompt_jobs WHERE booking_id IN "
+							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
+		session.execute(text("DELETE FROM no_show_recovery_jobs WHERE booking_id IN "
+							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
+		# A test may have paused a contact whose outbound_pause_source_booking_id
+		# FK-references one of these bookings (directly, or via trigger_recovery())
+		# -- clear it first so the bookings DELETE below doesn't hit that FK.
+		session.execute(text(
+			"UPDATE contacts SET outbound_pause_source_booking_id = NULL WHERE outbound_pause_source_booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"
+		), {"id": connection_id})
 	with get_system_db_context() as session:
 		session.execute(text("DELETE FROM bookings WHERE calendar_connection_id = :id"), {"id": connection_id})
 		session.execute(text("DELETE FROM calendar_connections WHERE connection_id = :id"), {"id": connection_id})
@@ -526,3 +540,105 @@ def test_cancellation_leaves_zero_claimable_reminder_jobs(sales_demo_target_cont
 		).fetchall()
 		assert len(all_jobs) == 2
 		assert all(j.status == "CANCELLED" for j in all_jobs)
+
+
+# ── Subtask 3.2.3 — No-Show Handler ───────────────────────────────────────
+
+def test_no_show_prompt_job_scheduled_for_new_sales_demo_booking(sales_demo_target_contact, sales_demo_connection):
+	target = sales_demo_target_contact
+	scheduled_at = datetime.now(timezone.utc) + timedelta(days=2)
+	client = _FakeProviderClient(incremental_events=[
+		_tagged_event("evt-no-show-schedule", owner_email=target["email"], scheduled_at=scheduled_at)
+	])
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, client)
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-no-show-schedule'"),
+			{"id": sales_demo_connection},
+		).one()
+		job = session.execute(
+			text("SELECT * FROM no_show_prompt_jobs WHERE booking_id = :id"), {"id": booking.booking_id}
+		).one()
+		assert job.status == "PENDING"
+		assert job.scheduled_for == scheduled_at
+
+
+def test_no_show_prompt_job_blocked_when_target_unresolved(sales_demo_connection):
+	"""A booking whose work-email doesn't match any real contact never
+	gets an actionable 'Mark No-Show' button — see
+	schedule_no_show_prompt()'s docstring."""
+	scheduled_at = datetime.now(timezone.utc) + timedelta(days=2)
+	client = _FakeProviderClient(incremental_events=[
+		_tagged_event("evt-unresolved", owner_email="unknown@nowhere.example.com", scheduled_at=scheduled_at)
+	])
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, client)
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-unresolved'"),
+			{"id": sales_demo_connection},
+		).one()
+		assert booking.target_contact_id is None
+		job = session.execute(
+			text("SELECT * FROM no_show_prompt_jobs WHERE booking_id = :id"), {"id": booking.booking_id}
+		).one()
+		assert job.status == "BLOCKED"
+
+
+def test_resume_clears_pause_only_for_a_distinct_new_booking(sales_demo_target_contact, sales_demo_connection):
+	"""Correction: a routine re-sync/re-delivery of the SAME booking that
+	caused the pause must never clear it -- only a genuinely new,
+	different booking_id (the contact actually rebooking) does.
+
+	contacts is RLS-scoped via companies.owning_client_id, which is NULL
+	for this unallocated prospect -- a session scoped to
+	client_id='BLACKINK_INTERNAL_SALES' can never read or write that row
+	directly (same reason booking_ingest.py goes through
+	pause_contact_after_no_show()/resume_contact_if_rebooked() rather than
+	a bare UPDATE). This test's own direct read/write of contacts must
+	therefore go through get_owner_db_context() (BYPASSRLS), exactly as
+	the real pause/resume SECURITY DEFINER functions do internally --
+	only the sync_connection_locked() calls themselves run under the
+	tenant-scoped session, matching production."""
+	target = sales_demo_target_contact
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-no-show-source", owner_email=target["email"])
+		]))
+		booking = session.execute(
+			text("SELECT * FROM bookings WHERE calendar_connection_id = :id AND external_event_id = 'evt-no-show-source'"),
+			{"id": sales_demo_connection},
+		).one()
+
+	# Simulate the pause trigger_recovery() would have set (via
+	# pause_contact_after_no_show() itself, not a bare UPDATE, so this
+	# matches production's write path exactly).
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		session.execute(
+			text("SELECT pause_contact_after_no_show(:cid, :bid)"),
+			{"cid": target["contact_id"], "bid": booking.booking_id},
+		)
+
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		# A re-sync of the SAME booking (e.g. an incremental sync
+		# re-delivering an unchanged event) must NOT clear the pause.
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-no-show-source", owner_email=target["email"])
+		]))
+	with get_owner_db_context() as session:
+		still_paused = session.execute(
+			text("SELECT outbound_paused_at FROM contacts WHERE contact_id = :cid"), {"cid": target["contact_id"]}
+		).one()
+		assert still_paused.outbound_paused_at is not None
+
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		# A genuinely NEW booking (the contact rebooking) DOES clear it.
+		sync_connection_locked(session, sales_demo_connection, _FakeProviderClient(incremental_events=[
+			_tagged_event("evt-no-show-rebooked", owner_email=target["email"])
+		]))
+	with get_owner_db_context() as session:
+		resumed = session.execute(
+			text("SELECT outbound_paused_at, outbound_pause_source_booking_id FROM contacts WHERE contact_id = :cid"),
+			{"cid": target["contact_id"]},
+		).one()
+		assert resumed.outbound_paused_at is None
+		assert resumed.outbound_pause_source_booking_id is None

@@ -43,6 +43,9 @@ PYTHONPATH=. python migrations/apply_owner_contacts.py
 PYTHONPATH=. python migrations/apply_calendar_connections.py
 PYTHONPATH=. python migrations/apply_bookings.py
 PYTHONPATH=. python migrations/apply_booking_reminder_jobs.py      # Subtask 3.2.2 — Show-Rate Reminder Cascade
+PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py        # Subtask 3.2.3 — No-Show Handler
+PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2.3 — No-Show Handler
+PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -56,6 +59,9 @@ python -m src.tasks.calendar_subscription_renewal
 python -m src.tasks.calendar_sync_worker
 python -m src.tasks.booking_confirmation_sender
 python -m src.tasks.show_rate_reminder_sender
+python -m src.tasks.no_show_prompt_sender
+python -m src.tasks.no_show_recovery_sender
+python -m src.tasks.self_serve_audit_worker
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
@@ -349,6 +355,144 @@ provider contracts (Google's `htmlLink`/Microsoft's `webLink` are
 event-*view* links, not reschedule actions) — the 24h email may show a
 correctly-labelled "View calendar event" link, never a relabeled or
 fabricated reschedule link.
+
+### No-Show Handler & Owner Score Self-Serve Landing Page (Subtask 3.2.3)
+
+**No-show, scoped to `INTERNAL_SALES_DEMO` only** — a PM-firm prospect
+missing their Blackink sales demo, not a property owner missing a
+client's own appointment (`CLIENT_OWNER_BOOKING` has no cold-outbound
+concept to pause). `src/tasks/no_show_prompt_sender.py` posts a "Mark
+No-Show" Slack card (`#blackink-command`) at exactly `bookings.scheduled_at`
+— never before, and never after `scheduled_at + 10 minutes` (a job
+claimed that late is marked `SKIPPED`, not posted, since a stale prompt
+would only invite an incorrect late click). A booking whose
+`target_contact_id` is still unresolved (`PENDING_RECONCILIATION`) never
+gets an actionable button — its `no_show_prompt_jobs` row stays
+`BLOCKED` rather than risk pausing an inferred contact.
+
+**Blocking dependency, stated plainly:** there is no durable outbound-
+sequence/campaign-enrollment engine anywhere in this codebase yet
+(`src/agents/cora/worker.py`'s `_process_draft()` is an explicit Week-0
+placeholder, and nothing anywhere calls `cora.queue.publish()`). "Pause
+the outbound sequence" is implemented as `contacts.outbound_paused_at`/
+`outbound_pause_reason`/`outbound_pause_source_booking_id`, enforced by a
+new `outbound_not_paused` check in `src/services/compliance_gate.py` —
+the real, already-existing choke point every cold-campaign send passes
+through per contact. Once a real sequence-enrollment table exists, it
+must check this column before scheduling a contact — not done yet.
+`contacts` is RLS-scoped via `companies.owning_client_id` (`NULL` for
+every unallocated prospect), so pausing/resuming go through two new
+SECURITY DEFINER functions in `apply_bookings.py`
+(`pause_contact_after_no_show`, `resume_contact_if_rebooked`) — same
+caller-scope-gated pattern as `resolve_sales_demo_target()`. Resume only
+fires when the contact's `outbound_pause_source_booking_id` differs from
+the newly-upserted `booking_id` — a routine re-sync of the SAME
+no-showed booking's webhook event must never clear the pause.
+
+The Slack `mark_no_show` click handler (`src/services/slack/listeners.py`)
+does no external I/O inside its transaction — it records the
+`meeting_outcomes` `NO_SHOW` row, pauses the contact, and INSERTs exactly
+one `no_show_recovery_jobs` row (`PENDING`). `src/tasks/no_show_recovery_sender.py`
+sends the actual email (email-only, no SMS import anywhere in this
+path), rechecking immediately before send: already-rebooked ->
+`CANCELLED`; booking no longer eligible -> `SKIPPED`; sending disabled or
+no booking-link redirect available -> `BLOCKED`. `triggered_at`/`sent_at`
+on the job row exist specifically to prove the "within 5 minutes" DoD
+line with a real assertion, not just a short sweep interval.
+
+**Booking-page redirect** (`src/services/booking_link.py`) never guesses
+— it requires an operator to flag exactly one `INTERNAL_SALES_DEMO`
+`calendar_connections` row `is_default_sales_booking = TRUE` with a
+manually-provisioned `public_booking_url` (a real GHL calendar's public
+page, or a real Google Calendar "Appointment Schedule" page — no
+self-serve slot-picker exists anywhere in this repo for Google/
+Microsoft). Query-param pre-fill is only attempted for a `GOHIGHLEVEL`
+connection, and only once `_GHL_PREFILL_PARAMS` in that file has been
+verified against a real GHL calendar's public booking-page contract —
+not assumed. Until a default connection is flagged, `resolve_booking_link()`
+returns `None` and the redirect DoD line is not complete.
+
+**Self-serve landing page** (`GET /audit`, `GET /api/v1/public/counties`,
+`POST /api/v1/public/owner-score-audit` — `src/api/public_landing_router.py`)
+is the one deliberately unauthenticated router in this API, scoped to
+the reserved `BLACKINK_INTERNAL_SALES` client (never a bare/unscoped
+session — `events` is RLS-protected direct-`client_id` mode and would
+otherwise reject the log-event INSERT). The POST handler only validates
+and inserts a row into `self_serve_audit_submissions` (mirrors
+`raw_prospect_companies`' staging philosophy) — no live company lookup,
+no Owner Visibility Score computation, no Google Places call in the
+request path, so the response never depends on whether a company
+already exists. Name, work email, company, and county are all required
+(pydantic `EmailStr` + non-empty `Field(...)`) — a domain-only
+submission carries no lead and no scoreable company context.
+
+**County is required, not optional metadata:** both `companies.county_slug`
+and `owner_visibility_scores.county_slug` are `NOT NULL` (FK to
+`counties`), and this repo has no domain-to-county geocoding step — a
+self-serve submission with no county can never become a `companies` row
+at all, let alone a score. The landing page's county `<select>` is
+populated from the real, currently-launched counties (`GET
+/api/v1/public/counties`, read-only reference data, no auth needed),
+never free text; the POST handler validates the submitted `county_slug`
+against a real `counties` row before accepting it.
+`self_serve_audit_worker.py` checks the submission's own `county_slug`
+**before** ever attempting the `companies` INSERT (which would
+otherwise crash on the NOT NULL constraint, not fail gracefully) and
+marks a submission with none `BLOCKED_MISSING_COUNTY` — a defense-in-depth
+case, not the expected path, since the API already requires it.
+
+`src/tasks/self_serve_audit_worker.py` is the only thing that ever
+creates/finds a `companies` row (using the visitor-submitted company
+name and county, never the raw domain as a fake company name) or calls
+`score_one_company()` (extracted from `owner_visibility_sweep.py` so the
+monthly sweep and this self-serve path share one scoring implementation
+— extracting it also surfaced and fixed two pre-existing, previously
+untested SQL bugs: a bare `:param::jsonb` cast confuses SQLAlchemy's
+bind-parameter parser and must read `:param ::jsonb` with a space) for
+a self-serve submission, running BYPASSRLS same as `promotion_sweep.py`.
+Retry is bounded and terminal, not silently dead-ended: a scoring
+failure sets `FAILED` with an exponential-backoff `next_retry_at`
+(reclaimed by the same claim query, same pattern as every other job
+table in this subtask) until `_MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT` is
+hit, then `FAILED_PERMANENT` (excluded from the claim query, never
+retried again); a mid-scoring DB failure rolls back the session before
+recording it, since a poisoned transaction would otherwise also fail
+the failure-recording UPDATE itself. An already-scored-this-month
+domain is marked `SKIPPED_RECENT` (bounds Google Places spend on repeat
+submissions); a submitted domain that resolves to a private/loopback/
+link-local/metadata IP, or is a raw IP literal, is rejected as
+`REJECTED_DOMAIN` — the same SSRF guard
+(`src/services/owner_visibility/signals/website.py`'s `_is_safe_host()`,
+re-checked at fetch time and on every redirect hop, not just at
+submission time) also now protects the pre-existing monthly sweep, since
+this subtask made that provider reachable from untrusted public input
+for the first time.
+
+A honeypot field (`website_url`) and a Redis-backed per-IP-hash rate
+limit (`SELF_SERVE_RATE_LIMIT_PER_10MIN`) gate the endpoint. The rate
+limiter fails **closed**: if Redis itself can't be reached, the request
+is rejected (HTTP 503) rather than silently exempted from the limit —
+same posture as `EMAIL_SENDING_ENABLED` defaulting False. `ok` in the
+JSON response tells the landing page's JS whether to fire the tracking
+pixels (accepted-for-processing vs. rejected-domain/honeypot/rate-
+limited) — it never reveals whether the company already existed or was
+already scored, the one thing this response must never leak. Meta/Google
+Tag `<script>` tags are injected into the DOM only from inside the
+POST's success handler (`response.ok && data.ok`) — never present in the
+initial HTML, never fired on page load, and the fired events carry no
+submitted PII. Navigation to the booking-link redirect is deliberately
+delayed a short, bounded interval (`PIXEL_FLUSH_DELAY_MS`) after firing
+the pixel calls, so the injected fbevents.js/gtag.js beacon has time to
+actually be sent before the page unloads — proving that ordering is a
+browser-level (Network-tab / Playwright-style) assertion this repo has
+no JS test runner for, so it's a manual verification item, not an
+automated test.
+
+**Deployment, explicitly open:** `/audit` reachable on this service's own
+URL is what code can verify. `audit.getblackink.com` requires a DNS
+record and a Cloud Run domain mapping done outside this codebase (same
+manual-runbook posture as sending-domain DNS) — not done as part of this
+change.
 
 ## Tooling Rules
 

@@ -26,10 +26,25 @@ def sales_demo_setup():
 	(not through booking_ingest.sync_connection_locked) so each test
 	controls scheduled_at/company/contact state precisely."""
 	with get_owner_db_context() as session:
-		# booking_reminder_jobs has no DELETE grant for blackink_app/blackink_system
-		# in production either -- see apply_booking_reminder_jobs.py.
+		# booking_reminder_jobs/no_show_prompt_jobs/no_show_recovery_jobs have
+		# no DELETE grant for blackink_app/blackink_system in production
+		# either -- see their respective apply_*.py migrations. All three now
+		# FK-reference bookings, so all three must clear before the bookings
+		# DELETE below.
 		session.execute(text(
 			"DELETE FROM booking_reminder_jobs WHERE booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
+		))
+		session.execute(text(
+			"DELETE FROM no_show_prompt_jobs WHERE booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
+		))
+		session.execute(text(
+			"DELETE FROM no_show_recovery_jobs WHERE booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
+		))
+		session.execute(text(
+			"UPDATE contacts SET outbound_pause_source_booking_id = NULL WHERE outbound_pause_source_booking_id IN "
 			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
 		))
 	with get_system_db_context() as session:

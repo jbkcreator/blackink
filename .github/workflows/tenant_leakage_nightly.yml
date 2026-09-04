@@ -74,6 +74,9 @@ jobs:
           PYTHONPATH=. python migrations/apply_calendar_connections.py
           PYTHONPATH=. python migrations/apply_bookings.py
           PYTHONPATH=. python migrations/apply_booking_reminder_jobs.py
+          PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py
+          PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py
+          PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       - name: Run tenant leakage suite
         run: PYTHONPATH=. pytest tests/test_tenant_isolation.py -v

@@ -18,6 +18,7 @@ from src.services.compliance_gate import (
 	_check_deterministic_columns,
 	_check_dnc,
 	_check_non_poach,
+	_check_not_paused,
 )
 
 
@@ -31,6 +32,8 @@ def _contact(**overrides):
 		phone="+15551234567",
 		dnc_clean=None,
 		dnc_checked_at=None,
+		outbound_paused_at=None,
+		outbound_pause_reason=None,
 	)
 	base.update(overrides)
 	return SimpleNamespace(**base)
@@ -136,6 +139,19 @@ def test_dnc_fails_on_fresh_cached_false():
 	fresh = datetime.now(timezone.utc) - timedelta(days=5)
 	result = _check_dnc(_contact(dnc_clean=False, dnc_checked_at=fresh), _AlwaysClearDnc())
 	assert result.status == FAIL
+
+
+# ── _check_not_paused (Subtask 3.2.3) ────────────────────────────────────
+
+def test_not_paused_passes_when_never_paused():
+	assert _check_not_paused(_contact()).status == PASS
+
+
+def test_not_paused_fails_when_paused():
+	paused_at = datetime.now(timezone.utc) - timedelta(hours=1)
+	result = _check_not_paused(_contact(outbound_paused_at=paused_at, outbound_pause_reason="NO_SHOW_RECOVERY"))
+	assert result.status == FAIL
+	assert "NO_SHOW_RECOVERY" in result.detail
 
 
 # ── _check_non_poach ─────────────────────────────────────────────────────

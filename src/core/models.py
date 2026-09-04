@@ -281,6 +281,16 @@ class Contact(Base):
 	# requires inbound_sms_count > 0 OR booked_appointment_id IS NOT NULL.
 	booked_appointment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 	inbound_sms_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+	# Subtask 3.2.3 — No-Show Handler. outbound_pause_source_booking_id has
+	# no ForeignKey() declared here even though the DB column carries one
+	# (added by apply_bookings.py, not apply_contacts.py — see that
+	# migration's comment on why the FK can't be added until bookings
+	# exists) — Bookings has no ORM model in this codebase (booking_*
+	# tables are raw-SQL only, per CLAUDE.md), so there is no ORM class to
+	# target.
+	outbound_paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	outbound_pause_reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+	outbound_pause_source_booking_id: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

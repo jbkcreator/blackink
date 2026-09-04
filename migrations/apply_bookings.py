@@ -165,6 +165,84 @@ DDL = [
 	# hardcoded role name — matches is_claimed_by_other_client()'s rationale.
 	"ALTER FUNCTION resolve_sales_demo_target(VARCHAR) OWNER TO CURRENT_USER",
 
+	# ── Subtask 3.2.3 — No-Show Handler ──────────────────────────────────────
+	# Lives here, not apply_contacts.py, because bookings does not exist yet
+	# when apply_contacts.py runs (contacts is migration 5 of 11, bookings is
+	# much later) — outbound_paused_at/outbound_pause_reason themselves were
+	# added in apply_contacts.py without a FK; this is just the FK column.
+	# Resume logic (booking_ingest.py) keys off this rather than "any later
+	# CONFIRMED booking" so a routine re-sync of the SAME no-showed booking's
+	# webhook event can never accidentally clear the pause.
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS outbound_pause_source_booking_id BIGINT REFERENCES bookings(booking_id)",
+
+	# contacts is RLS-scoped via companies.owning_client_id, which is NULL
+	# for every unallocated PROSPECTING/ENGAGED company — a session scoped
+	# to client_id='BLACKINK_INTERNAL_SALES' can never write to (or read)
+	# these rows directly (NULL never matches an RLS equality filter), same
+	# problem resolve_sales_demo_target() above already solves for reads.
+	# These two SECURITY DEFINER functions are the write-side equivalent,
+	# hardened identically: caller-scope check read from the session's own
+	# RLS context (never a parameter), search_path = pg_catalog, EXECUTE
+	# revoked from PUBLIC and granted only to blackink_app, owned by
+	# CURRENT_USER so SECURITY DEFINER actually bypasses RLS.
+	"DROP FUNCTION IF EXISTS pause_contact_after_no_show(BIGINT, BIGINT)",
+	"""
+	CREATE OR REPLACE FUNCTION pause_contact_after_no_show(p_contact_id BIGINT, p_booking_id BIGINT)
+	RETURNS VOID
+	SECURITY DEFINER
+	SET search_path = pg_catalog
+	LANGUAGE plpgsql
+	AS $$
+	DECLARE
+		v_requesting_client_id VARCHAR(40);
+	BEGIN
+		v_requesting_client_id := current_setting('app.current_client_id', true);
+		IF v_requesting_client_id IS DISTINCT FROM 'BLACKINK_INTERNAL_SALES' THEN
+			RETURN;
+		END IF;
+		UPDATE public.contacts
+		SET outbound_paused_at = NOW(), outbound_pause_reason = 'NO_SHOW_RECOVERY',
+			outbound_pause_source_booking_id = p_booking_id, updated_at = NOW()
+		WHERE contact_id = p_contact_id;
+	END;
+	$$
+	""",
+	"REVOKE EXECUTE ON FUNCTION pause_contact_after_no_show(BIGINT, BIGINT) FROM PUBLIC",
+	"GRANT EXECUTE ON FUNCTION pause_contact_after_no_show(BIGINT, BIGINT) TO blackink_app",
+	"ALTER FUNCTION pause_contact_after_no_show(BIGINT, BIGINT) OWNER TO CURRENT_USER",
+
+	# Resume side of the same problem — only clears the pause when
+	# p_new_booking_id differs from the contact's own
+	# outbound_pause_source_booking_id (a routine re-sync/re-delivery of
+	# the SAME no-showed booking's webhook event must never clear it — see
+	# src/services/booking_ingest.py's _resume_if_rebooked()).
+	"DROP FUNCTION IF EXISTS resume_contact_if_rebooked(BIGINT, BIGINT)",
+	"""
+	CREATE OR REPLACE FUNCTION resume_contact_if_rebooked(p_contact_id BIGINT, p_new_booking_id BIGINT)
+	RETURNS VOID
+	SECURITY DEFINER
+	SET search_path = pg_catalog
+	LANGUAGE plpgsql
+	AS $$
+	DECLARE
+		v_requesting_client_id VARCHAR(40);
+	BEGIN
+		v_requesting_client_id := current_setting('app.current_client_id', true);
+		IF v_requesting_client_id IS DISTINCT FROM 'BLACKINK_INTERNAL_SALES' THEN
+			RETURN;
+		END IF;
+		UPDATE public.contacts
+		SET outbound_paused_at = NULL, outbound_pause_reason = NULL,
+			outbound_pause_source_booking_id = NULL, updated_at = NOW()
+		WHERE contact_id = p_contact_id AND outbound_paused_at IS NOT NULL
+		  AND outbound_pause_source_booking_id IS DISTINCT FROM p_new_booking_id;
+	END;
+	$$
+	""",
+	"REVOKE EXECUTE ON FUNCTION resume_contact_if_rebooked(BIGINT, BIGINT) FROM PUBLIC",
+	"GRANT EXECUTE ON FUNCTION resume_contact_if_rebooked(BIGINT, BIGINT) TO blackink_app",
+	"ALTER FUNCTION resume_contact_if_rebooked(BIGINT, BIGINT) OWNER TO CURRENT_USER",
+
 	"CREATE INDEX IF NOT EXISTS ix_bookings_client ON bookings (client_id)",
 	"CREATE INDEX IF NOT EXISTS ix_bookings_owner_contact ON bookings (owner_contact_id)",
 	# Read by booking_confirmation_sender.py's claim query.

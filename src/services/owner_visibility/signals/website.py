@@ -14,9 +14,12 @@ but the other signals can still be collected from the non-TLS content.
 Never raises — every failure path returns MISSING_DATA or SKIPPED.
 """
 
+import ipaddress
 import logging
 import re
+import socket
 from typing import Any
+from urllib.parse import urlparse, urljoin
 
 import requests
 from bs4 import BeautifulSoup
@@ -34,6 +37,41 @@ logger = logging.getLogger(__name__)
 _REQUEST_TIMEOUT = 8
 _MAX_REDIRECTS = 2
 
+
+class UnsafeFetchTargetError(Exception):
+    """Raised when a hostname resolves to a private/reserved/loopback
+    address. Subtask 3.2.3 — this provider is now reachable from the
+    public /audit landing page via self_serve_audit_worker.py, where the
+    submitted domain is untrusted input, not an internally-vetted
+    prospected company — an attacker-controlled domain must never be
+    used to reach internal infrastructure (SSRF)."""
+
+
+def _is_safe_host(hostname: str) -> bool:
+    """Resolves hostname and rejects if ANY resolved address is
+    private/loopback/link-local/multicast/reserved (covers RFC1918,
+    127.0.0.0/8, 169.254.0.0/16 including the 169.254.169.254 cloud
+    metadata address, multicast, and other IANA-reserved ranges).
+    Checked before the initial request AND again on every redirect hop
+    (see _fetch) — closing most of the DNS-rebinding window, though a
+    residual TOCTOU gap remains between this check and the underlying
+    socket library's own connect-time resolution (requests does not
+    expose a way to pin the validated IP without a custom transport
+    adapter, not implemented here)."""
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        return False
+    for info in infos:
+        addr = info[4][0]
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+            return False
+    return True
+
 # Regex patterns for after-hours detection — case-insensitive.
 _AFTER_HOURS_PATTERNS = [
     re.compile(r"\bafter[\s-]?hours?\b", re.I),
@@ -46,26 +84,39 @@ _AFTER_HOURS_PATTERNS = [
 _OWNER_PAGE_SLUGS = ["/owner", "/landlord", "/property-owner", "/for-owners", "/for-landlords"]
 
 
+def _get_validated(target: str, headers: dict) -> requests.Response:
+    """Manually follows redirects (never requests' own allow_redirects=True)
+    so every hop's hostname is re-validated by _is_safe_host() before the
+    request is issued — a redirect to an internal/reserved address must
+    be rejected the same as a direct request to one."""
+    session = requests.Session()
+    url = target
+    for _ in range(_MAX_REDIRECTS + 1):
+        hostname = urlparse(url).hostname
+        if not hostname or not _is_safe_host(hostname):
+            raise UnsafeFetchTargetError(f"{hostname!r} resolves to a private/reserved/loopback address")
+        resp = session.get(url, timeout=_REQUEST_TIMEOUT, allow_redirects=False, headers=headers)
+        if resp.is_redirect and resp.headers.get("location"):
+            url = urljoin(url, resp.headers["location"])
+            continue
+        return resp
+    raise UnsafeFetchTargetError(f"too many redirects (> {_MAX_REDIRECTS})")
+
+
 def _fetch(url: str) -> tuple[requests.Response | None, bool]:
     """Return (response, ssl_ok). ssl_ok=False means we fell back to non-TLS."""
     headers = {"User-Agent": "BlackInkBot/1.0 (property-management research)"}
 
-    def _get(target: str) -> requests.Response:
-        # max_redirects is a Session attribute, not a kwarg on requests.get().
-        s = requests.Session()
-        s.max_redirects = _MAX_REDIRECTS
-        return s.get(target, timeout=_REQUEST_TIMEOUT, allow_redirects=True, headers=headers)
-
     try:
-        return _get(url), True
+        return _get_validated(url, headers), True
     except requests.exceptions.SSLError:
         # Try without TLS so other signals can still be evaluated.
         http_url = url.replace("https://", "http://", 1)
         try:
-            return _get(http_url), False
-        except requests.RequestException:
+            return _get_validated(http_url, headers), False
+        except (requests.RequestException, UnsafeFetchTargetError):
             return None, False
-    except requests.RequestException:
+    except (requests.RequestException, UnsafeFetchTargetError):
         return None, True
 
 

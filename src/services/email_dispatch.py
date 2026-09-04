@@ -310,6 +310,50 @@ def send_show_rate_24h_reminder(
 	)
 
 
+def send_no_show_recovery_email(
+	session: Session,
+	*,
+	client_id: str,
+	target_email: str,
+	target_name: Optional[str],
+	booking_url: Optional[str],
+	provider: Optional[EmailProvider] = None,
+) -> Optional[str]:
+	"""Subtask 3.2.3 — No-Show Handler recovery email. One immediate
+	send, no cadence — the DoD tests exactly one recovery email within 5
+	minutes of the no-show trigger; no further follow-up timing is
+	specified anywhere in the source of truth for this flow, so none is
+	invented here (src/tasks/no_show_recovery_sender.py calls this
+	exactly once per booking, enforced by no_show_recovery_jobs'
+	UNIQUE(booking_id)). Email only — no SMS import anywhere in this
+	function or its call path, matching the DoD's own "no SMS" line."""
+	if not get_settings().email_sending_enabled:
+		return None
+	mailbox = _resolve_mailbox(session, client_id)
+	if mailbox is None:
+		return None
+	if provider is None:
+		provider = SmtpEmailProvider(
+			host=mailbox.smtp_host, port=mailbox.smtp_port or 587, username=mailbox.smtp_username,
+			password=decrypt_token(mailbox.smtp_password_encrypted), from_address=mailbox.mailbox_address,
+		)
+
+	booking_line = (
+		f'<p><a href="{booking_url}">Pick a new time</a></p>' if booking_url
+		else "<p>Reply to this email and we'll find a new time.</p>"
+	)
+	html_body = (
+		f"<p>Hi {target_name or 'there'},</p>"
+		f"<p>We missed you for your Blackink demo — no worries, let's find a time that works.</p>"
+		f"{booking_line}"
+	)
+	_assert_clean_content(html_body)
+	return provider.send_plain(
+		to=target_email, reply_to=mailbox.mailbox_address, bcc=mailbox.mailbox_address,
+		subject="Let's reschedule your Blackink demo", html_body=html_body,
+	)
+
+
 def send_show_rate_pre_demo_email(
 	session: Session,
 	*,

@@ -223,6 +223,26 @@ class AppSettings(BaseSettings):
 	def ovs_pdf_allowed_hosts(self) -> Tuple[str, ...]:
 		return tuple(v.strip().lower() for v in self.ovs_pdf_allowed_hosts_raw.split(",") if v.strip())
 
+	# ── No-Show Handler / Self-Serve Landing Page (Subtask 3.2.3) ───────────
+	# Same fail-closed posture as ovs_pdf_allowed_hosts: empty means no host
+	# is approved, so resolve_booking_link() returns None (no redirect)
+	# rather than trusting an unvetted stored URL.
+	booking_redirect_allowed_hosts_raw: str = Field(default="", validation_alias="BOOKING_REDIRECT_ALLOWED_HOSTS")
+
+	@property
+	def booking_redirect_allowed_hosts(self) -> Tuple[str, ...]:
+		return tuple(v.strip().lower() for v in self.booking_redirect_allowed_hosts_raw.split(",") if v.strip())
+
+	# Optional — the /audit landing page renders no pixel <script> at all
+	# when unset (see src/api/public_landing_router.py), never a broken tag.
+	meta_pixel_id: Optional[str] = Field(default=None, env="META_PIXEL_ID")
+	google_tag_id: Optional[str] = Field(default=None, env="GOOGLE_TAG_ID")
+	self_serve_rate_limit_per_10min: int = Field(default=5, env="SELF_SERVE_RATE_LIMIT_PER_10MIN")
+	# Deliberately its own secret, not a reuse of relay_resume_secret — same
+	# rationale as calendar_oauth_state_secret above: unrelated token
+	# families must be able to rotate independently.
+	no_show_token_secret: Optional[SecretStr] = Field(default=None, env="NO_SHOW_TOKEN_SECRET")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

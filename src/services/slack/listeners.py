@@ -43,6 +43,8 @@ from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
 from src.core.database import get_db_context
 from src.services import work_orders as wo
+from src.services.no_show_prompts import verify_no_show_token
+from src.services.no_show_recovery import already_recorded, trigger_recovery
 from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
 from src.services.slack.bolt_app import get_listener_app
@@ -553,3 +555,64 @@ async def handle_halt_resume_click(ack, body, respond, action):
 		return
 
 	await respond(response_type="in_channel", text=f":white_check_mark: Halt #{halt_id} resumed by <@{user_id}>.")
+
+
+# ── Mark No-Show — Subtask 3.2.3, control action, no work order ─────────
+
+_INTERNAL_SALES_CLIENT_ID = "BLACKINK_INTERNAL_SALES"
+_NO_SHOW_WINDOW = timedelta(minutes=10)
+
+
+@app.action("mark_no_show")
+async def handle_mark_no_show(ack, body, respond, action):
+	"""Steps 1-8 of Subtask 3.2.3's mark-no-show flow. ack() first (no
+	network I/O before it — Slack's 3-second budget), then verify the
+	token, the 10-minute timing window (both boundaries), and the
+	double-click guard, THEN run trigger_recovery() as one transaction
+	with no external calls inside it — the recovery email itself is sent
+	later, out-of-band, by src/tasks/no_show_recovery_sender.py."""
+	await ack()
+	user_id = body.get("user", {}).get("id", "")
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	if not approver_authorized(user_id):
+		await respond(response_type="ephemeral", text=":no_entry: Not authorized to mark no-shows.")
+		return
+
+	booking_id = value.get("booking_id")
+	token = value.get("token", "")
+	if not booking_id or not verify_no_show_token(booking_id, token):
+		await respond(response_type="ephemeral", text=":warning: Stale or invalid button — this card may have been superseded.")
+		return
+
+	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
+		booking = session.execute(
+			text("SELECT booking_id, scheduled_at, event_status FROM bookings WHERE booking_id = :bid"),
+			{"bid": booking_id},
+		).first()
+		if booking is None:
+			await respond(response_type="ephemeral", text=":warning: Booking not found.")
+			return
+		if booking.event_status == "CANCELLED":
+			await respond(response_type="ephemeral", text=":information_source: This booking was cancelled — nothing to mark.")
+			return
+
+		now = datetime.now(timezone.utc)
+		if now < booking.scheduled_at:
+			await respond(response_type="ephemeral", text=":warning: This meeting hasn't started yet.")
+			return
+		if now > booking.scheduled_at + _NO_SHOW_WINDOW:
+			await respond(response_type="ephemeral", text=":warning: The 10-minute no-show window for this meeting has passed.")
+			return
+
+		if already_recorded(session, booking_id):
+			await respond(response_type="ephemeral", text=":information_source: Already marked no-show by someone else.")
+			return
+
+		trigger_recovery(session, booking_id=booking_id, submitted_by=f"slack:{user_id}")
+
+	await respond(response_type="in_channel", text=f":x: Marked no-show for booking `{booking_id}` by <@{user_id}> — recovery email enqueued.")

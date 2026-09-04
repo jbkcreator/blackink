@@ -40,14 +40,81 @@ def _current_month_key() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
+def score_one_company(db, company: dict, month_key: str):
+    """Score exactly one company and upsert its owner_visibility_scores
+    row. Extracted from run_sweep()'s loop body (Subtask 3.2.3) so the
+    monthly sweep and the self-serve landing page's single-company
+    trigger (src/tasks/self_serve_audit_worker.py) share one scoring
+    implementation — no drift between the two callers.
+
+    `company` must carry company_id/company_name/domain/website/
+    county_slug/google_place_id (same shape run_sweep() builds per row).
+    `db` is an open session — caller owns the transaction/commit, same
+    convention as the rest of this module. Returns the ScoreBreakdown and
+    mutates `company["google_place_id"]` in place if the Google provider
+    newly resolved one (mirrors the prior inline behavior)."""
+    from sqlalchemy import text
+
+    website_provider = WebsiteSignalProvider()
+    dbpr_provider = DbprLicenceSignalProvider()
+    google_provider = build_google_places_provider()
+
+    original_place_id = company.get("google_place_id")
+    signals = (
+        website_provider.collect(company)
+        + dbpr_provider.collect(company)
+        + google_provider.collect(company)
+    )
+    breakdown = calculate_score(signals)
+
+    db.execute(
+        text(
+            "INSERT INTO owner_visibility_scores "
+            "  (company_id, month_key, county_slug, score_total, "
+            "   score_website, score_dbpr, score_google, "
+            "   signal_detail, data_gaps, scored_at) "
+            "VALUES "
+            "  (:company_id, :month_key, :county_slug, :score_total, "
+            "   :score_website, :score_dbpr, :score_google, "
+            "   :signal_detail ::jsonb, :data_gaps, NOW()) "
+            "ON CONFLICT (company_id, month_key) DO UPDATE SET "
+            "  county_slug    = EXCLUDED.county_slug, "
+            "  score_total    = EXCLUDED.score_total, "
+            "  score_website  = EXCLUDED.score_website, "
+            "  score_dbpr     = EXCLUDED.score_dbpr, "
+            "  score_google   = EXCLUDED.score_google, "
+            "  signal_detail  = EXCLUDED.signal_detail, "
+            "  data_gaps      = EXCLUDED.data_gaps, "
+            "  scored_at      = EXCLUDED.scored_at"
+        ),
+        {
+            "company_id": company["company_id"],
+            "month_key": month_key,
+            "county_slug": company["county_slug"],
+            "score_total": breakdown.score_total,
+            "score_website": breakdown.score_website,
+            "score_dbpr": breakdown.score_dbpr,
+            "score_google": breakdown.score_google,
+            "signal_detail": json.dumps(breakdown.signal_detail),
+            "data_gaps": breakdown.data_gaps,
+        },
+    )
+
+    # Persist a newly-resolved google_place_id so future sweeps skip the text-search.
+    if company.get("google_place_id") and company["google_place_id"] != original_place_id:
+        db.execute(
+            text("UPDATE companies SET google_place_id = :place_id WHERE company_id = :company_id"),
+            {"place_id": company["google_place_id"], "company_id": company["company_id"]},
+        )
+
+    return breakdown
+
+
 def run_sweep() -> int:
     """Score all active companies. Returns count of rows upserted."""
     from sqlalchemy import text
 
     month_key = _current_month_key()
-    website_provider = WebsiteSignalProvider()
-    dbpr_provider = DbprLicenceSignalProvider()
-    google_provider = build_google_places_provider()
 
     logger.info("owner_visibility_sweep: starting month=%s", month_key)
 
@@ -73,58 +140,9 @@ def run_sweep() -> int:
             "county_slug": row.county_slug,
             "google_place_id": row.google_place_id,
         }
-
-        signals = (
-            website_provider.collect(company)
-            + dbpr_provider.collect(company)
-            + google_provider.collect(company)
-        )
-        breakdown = calculate_score(signals)
-
         with get_system_db_context() as db:
-            db.execute(
-                text(
-                    "INSERT INTO owner_visibility_scores "
-                    "  (company_id, month_key, county_slug, score_total, "
-                    "   score_website, score_dbpr, score_google, "
-                    "   signal_detail, data_gaps, scored_at) "
-                    "VALUES "
-                    "  (:company_id, :month_key, :county_slug, :score_total, "
-                    "   :score_website, :score_dbpr, :score_google, "
-                    "   :signal_detail::jsonb, :data_gaps, NOW()) "
-                    "ON CONFLICT (company_id, month_key) DO UPDATE SET "
-                    "  county_slug    = EXCLUDED.county_slug, "
-                    "  score_total    = EXCLUDED.score_total, "
-                    "  score_website  = EXCLUDED.score_website, "
-                    "  score_dbpr     = EXCLUDED.score_dbpr, "
-                    "  score_google   = EXCLUDED.score_google, "
-                    "  signal_detail  = EXCLUDED.signal_detail, "
-                    "  data_gaps      = EXCLUDED.data_gaps, "
-                    "  scored_at      = EXCLUDED.scored_at"
-                ),
-                {
-                    "company_id": company["company_id"],
-                    "month_key": month_key,
-                    "county_slug": company["county_slug"],
-                    "score_total": breakdown.score_total,
-                    "score_website": breakdown.score_website,
-                    "score_dbpr": breakdown.score_dbpr,
-                    "score_google": breakdown.score_google,
-                    "signal_detail": json.dumps(breakdown.signal_detail),
-                    "data_gaps": breakdown.data_gaps,
-                },
-            )
+            score_one_company(db, company, month_key)
             upserted += 1
-
-            # Persist a newly-resolved google_place_id so future sweeps skip the text-search.
-            if company.get("google_place_id") and company["google_place_id"] != row.google_place_id:
-                db.execute(
-                    text(
-                        "UPDATE companies SET google_place_id = :place_id "
-                        "WHERE company_id = :company_id"
-                    ),
-                    {"place_id": company["google_place_id"], "company_id": company["company_id"]},
-                )
 
     logger.info("owner_visibility_sweep: done scoring, upserted=%d for month=%s", upserted, month_key)
 
@@ -188,7 +206,7 @@ def _update_county_ranks(month_key: str) -> None:
                         "UPDATE owner_visibility_scores SET "
                         "  county_rank       = :county_rank, "
                         "  county_percentile = :county_percentile, "
-                        "  peer_comparisons  = :peer_comparisons::jsonb "
+                        "  peer_comparisons  = :peer_comparisons ::jsonb "
                         "WHERE score_id = :score_id"
                     ),
                     {

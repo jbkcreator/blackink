@@ -31,6 +31,7 @@ from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
 from src.api.booking_webhook_router import router as booking_webhook_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
+from src.api.public_landing_router import router as public_landing_router
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
 
@@ -46,6 +47,11 @@ _QUEUE_DRAIN_INTERVAL_SECONDS = 10
 _SAFETY_SWEEP_INTERVAL_SECONDS = 300
 _CONFIRMATION_SWEEP_INTERVAL_SECONDS = 30
 _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS = 3600
+# Subtask 3.2.3 — comfortably inside the DoD's "5 minutes" no-show
+# recovery-email budget and the "10 minutes" no-show-prompt window.
+_NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS = 60
+_NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS = 60
+_SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS = 30
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -61,12 +67,18 @@ def _start_background_workers() -> None:
 	from src.tasks.booking_confirmation_sender import run_sweep
 	from src.tasks.calendar_subscription_renewal import run_renewal_sweep
 	from src.tasks.calendar_sync_worker import drain_queue, sweep_all_active_connections
+	from src.tasks.no_show_prompt_sender import run_sweep as no_show_prompt_sweep
+	from src.tasks.no_show_recovery_sender import run_sweep as no_show_recovery_sweep
+	from src.tasks.self_serve_audit_worker import run_sweep as self_serve_audit_sweep
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
 		("calendar_sync_worker.sweep_all_active_connections", _SAFETY_SWEEP_INTERVAL_SECONDS, sweep_all_active_connections),
 		("booking_confirmation_sender.run_sweep", _CONFIRMATION_SWEEP_INTERVAL_SECONDS, run_sweep),
 		("calendar_subscription_renewal.run_renewal_sweep", _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS, run_renewal_sweep),
+		("no_show_prompt_sender.run_sweep", _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS, no_show_prompt_sweep),
+		("no_show_recovery_sender.run_sweep", _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS, no_show_recovery_sweep),
+		("self_serve_audit_worker.run_sweep", _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS, self_serve_audit_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
@@ -96,6 +108,7 @@ app = FastAPI(title="Blackink API", lifespan=lifespan)
 app.include_router(akrash_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
+app.include_router(public_landing_router)
 
 
 @app.get("/healthz")
