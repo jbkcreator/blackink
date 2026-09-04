@@ -130,6 +130,9 @@ def test_attribute_tier1_in_reply_to_match():
         "first_name": "Jane",
         "last_name": "Doe",
         "company_name": "Acme PM",
+        "domain": "acmepm.com",
+        "company_id": "co-acme",
+        "door_count_est": 120,
     }
     # Tier 1 returns a row; tier 2 is never called
     session = _session_with_first(row=dispatch_row)
@@ -147,6 +150,7 @@ def test_attribute_tier1_in_reply_to_match():
     assert result.touch_step == 1
     assert result.contact_name == "Jane Doe"
     assert result.firm_name == "Acme PM"
+    assert result.firm_domain == "acmepm.com"
     # client_id comes from the dispatch row
     assert result.client_id == "client-from-dispatch"
 
@@ -161,6 +165,9 @@ def test_attribute_tier2_sender_email_match():
         "first_name": "Bob",
         "last_name": "Smith",
         "company_name": "Smith Properties",
+        "domain": "smithproperties.com",
+        "company_id": "co-smith",
+        "door_count_est": 80,
     }
     # First call (tier 1) → None; second call (tier 2) → contact_row
     session = _session_sequence([None, contact_row])
@@ -181,7 +188,7 @@ def test_attribute_tier2_sender_email_match():
 
 def test_attribute_tier2_from_address_display_name_stripped():
     """'First Last <email@example.com>' display name is stripped before lookup."""
-    contact_row = {"contact_id": 5, "first_name": "A", "last_name": "B", "company_name": "Co"}
+    contact_row = {"contact_id": 5, "first_name": "A", "last_name": "B", "company_name": "Co", "domain": "co.com", "company_id": "co-5", "door_count_est": 40}
     session = _session_sequence([None, contact_row])
 
     result = attribute(

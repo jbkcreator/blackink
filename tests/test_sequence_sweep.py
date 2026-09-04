@@ -52,6 +52,9 @@ def test_linkedin_card_posted_when_gate_ready():
     assert ok is True
     mock_post.assert_awaited_once()
     assert mock_post.await_args.kwargs["channel_key"] == "setter"
+    # linkedin_task_created event logged after a successful post (v2 line 381)
+    logged_sql = " ".join(str(c.args[0]) for c in session.execute.call_args_list)
+    assert "linkedin_task_created" in logged_sql
 
 
 def test_linkedin_card_skipped_and_logged_when_gate_blocks():

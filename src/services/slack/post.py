@@ -117,10 +117,14 @@ async def open_modal(*, trigger_id: str, view: dict) -> bool:
 		return False
 
 
-async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[dict]] = None) -> Optional[str]:
+async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[dict]] = None,
+                      attachments: Optional[Sequence[dict]] = None,
+                      thread_ts: Optional[str] = None) -> Optional[str]:
 	"""Non-interactive, fire-and-forget posts — #blackink-qa health alerts,
-	#blackink-economics rollups. Returns the message ts on success, else
-	None. Never raises."""
+	#blackink-economics rollups, #sales-replies cards. Returns the message ts on
+	success, else None. Never raises. `attachments` enables a colored side bar
+	(e.g. green attributed / amber unattributed reply cards). `thread_ts` posts
+	the message as a reply in an existing thread."""
 	client = _client_or_none()
 	if client is None:
 		logger.info("[slack.post] Slack not configured — notice not posted (channel_key=%s)", channel_key)
@@ -132,7 +136,12 @@ async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[
 		return None
 
 	try:
-		response = await client.chat_postMessage(channel=channel_id, text=text, blocks=list(blocks) if blocks else None)
+		response = await client.chat_postMessage(
+			channel=channel_id, text=text,
+			blocks=list(blocks) if blocks else None,
+			attachments=list(attachments) if attachments else None,
+			thread_ts=thread_ts,
+		)
 		return response["ts"]
 	except SlackApiError as exc:
 		logger.error("[slack.post] chat.postMessage (notice) failed (channel_key=%s): %s", channel_key, exc.response.get("error") if exc.response else exc)

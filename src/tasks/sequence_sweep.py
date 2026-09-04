@@ -89,6 +89,25 @@ async def _post_due_linkedin_card(order) -> bool:
             return False
 
     posted = await post_work_order_card(order, channel_key="setter")
+    if posted is not None:
+        # Manual-task log (v2 §3.1.2 line 381): no browser/LinkedIn API involved.
+        with get_db_context(client_id=order.client_id) as session:
+            session.execute(
+                text(
+                    "INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
+                    "VALUES (:client_id, 'linkedin_task_created', 'contact', :entity_id, 'sequence_sweep', :payload)"
+                ),
+                {
+                    "client_id": order.client_id,
+                    "entity_id": str(contact_id),
+                    "payload": json.dumps({
+                        "action_id": str(order.action_id),
+                        "touch_step": touch_step,
+                        "run_id": order.payload.get("run_id") if isinstance(order.payload, dict) else None,
+                    }),
+                },
+            )
+            session.commit()
     return posted is not None
 
 

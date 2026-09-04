@@ -134,6 +134,22 @@ def test_dial_task_has_divider():
     assert any(b.get("type") == "divider" for b in blocks)
 
 
+def test_dial_task_shows_door_count_and_ovs_when_present():
+    order = _fake_order(
+        action_class="DIAL_TASK",
+        payload={"run_id": "r1", "door_count": 120, "ovs_lines": ["*OVS* 76/100  ·  county rank #4"]},
+    )
+    txt = str(_dial_task_content_blocks(order))
+    assert "120" in txt
+    assert "76/100" in txt
+
+
+def test_dial_task_omits_ovs_when_absent():
+    order = _fake_order(action_class="DIAL_TASK", payload={"run_id": "r1"})
+    txt = str(_dial_task_content_blocks(order))
+    assert "OVS" not in txt  # no score wired → section omitted
+
+
 def test_simple_action_button_mark_done():
     """_simple_action_button_blocks returns a single actions block with mark_done."""
     order = _fake_order()
@@ -249,8 +265,10 @@ def test_sales_reply_header():
         client_id="client-abc",
         inbound_id="inbound-uuid-1234",
     )
-    assert blocks[0]["type"] == "header"
-    assert "Reply" in blocks[0]["text"]["text"]
+    # Title line leads with who replied.
+    assert blocks[0]["type"] == "section"
+    assert "Jane Doe" in blocks[0]["text"]["text"]
+    assert "replied" in blocks[0]["text"]["text"]
 
 
 def test_sales_reply_attributed_badge():
@@ -259,8 +277,7 @@ def test_sales_reply_attributed_badge():
         run_id="r1", touch_step=1, attribution_status="attributed",
         subject=None, raw_body="text", contact_id=1, client_id="c1", inbound_id="i1",
     )
-    text = str(blocks)
-    assert "✅ attributed" in text
+    assert "Attributed" in str(blocks)
 
 
 def test_sales_reply_unattributed_badge():
@@ -269,8 +286,14 @@ def test_sales_reply_unattributed_badge():
         run_id=None, touch_step=None, attribution_status="unattributed",
         subject=None, raw_body="text", contact_id=None, client_id="c1", inbound_id="i1",
     )
-    text = str(blocks)
-    assert "⚠️ unattributed" in text
+    assert "Unattributed" in str(blocks)
+
+
+def _reply_action_ids(blocks):
+    action_blocks = [b for b in blocks if b.get("type") == "actions"]
+    if not action_blocks:
+        return []
+    return [e["action_id"] for e in action_blocks[0]["elements"]]
 
 
 def test_sales_reply_opt_out_button_present_when_contact_id_known():
@@ -282,22 +305,37 @@ def test_sales_reply_opt_out_button_present_when_contact_id_known():
     )
     action_blocks = [b for b in blocks if b.get("type") == "actions"]
     assert len(action_blocks) == 1
-    btn = action_blocks[0]["elements"][0]
-    assert btn["action_id"] == "opt_out_contact"
+    btn = next(e for e in action_blocks[0]["elements"] if e["action_id"] == "opt_out_contact")
     value = json.loads(btn["value"])
     assert value["contact_id"] == 99
     assert value["client_id"] == "cli-1"
 
 
+def test_sales_reply_reply_in_thread_button_always_present():
+    """Reply in Thread button appears on every card, attributed or not."""
+    attributed = sales_reply_content_blocks(
+        from_address="p@example.com", contact_name="Jane", firm_name="Acme",
+        run_id="r1", touch_step=1, attribution_status="attributed",
+        subject=None, raw_body="hi", contact_id=99, client_id="cli-1", inbound_id="i1",
+    )
+    unattributed = sales_reply_content_blocks(
+        from_address="p@example.com", contact_name=None, firm_name=None,
+        run_id=None, touch_step=None, attribution_status="unattributed",
+        subject=None, raw_body="hi", contact_id=None, client_id="cli-1", inbound_id="i1",
+    )
+    assert "reply_in_thread" in _reply_action_ids(attributed)
+    assert "reply_in_thread" in _reply_action_ids(unattributed)
+
+
 def test_sales_reply_no_opt_out_button_when_unattributed():
-    """No opt_out button on unattributed cards (no contact to target)."""
+    """No opt_out button on unattributed cards (no contact to target) — but the
+    Reply in Thread action block still exists."""
     blocks = sales_reply_content_blocks(
         from_address="p@example.com", contact_name=None, firm_name=None,
         run_id=None, touch_step=None, attribution_status="unattributed",
         subject=None, raw_body="hi", contact_id=None, client_id="cli-1", inbound_id="i1",
     )
-    action_blocks = [b for b in blocks if b.get("type") == "actions"]
-    assert len(action_blocks) == 0
+    assert "opt_out_contact" not in _reply_action_ids(blocks)
 
 
 def test_sales_reply_opt_out_has_confirm_dialog():
@@ -307,8 +345,35 @@ def test_sales_reply_opt_out_has_confirm_dialog():
         run_id=None, touch_step=None, attribution_status="attributed",
         subject=None, raw_body="hi", contact_id=1, client_id="c1", inbound_id="i1",
     )
-    btn = [b for b in blocks if b.get("type") == "actions"][0]["elements"][0]
+    action_block = [b for b in blocks if b.get("type") == "actions"][0]
+    btn = next(e for e in action_block["elements"] if e["action_id"] == "opt_out_contact")
     assert "confirm" in btn
+
+
+def test_sales_reply_shows_domain_and_thread():
+    """Company domain and recent-thread lines render when supplied."""
+    blocks = sales_reply_content_blocks(
+        from_address="p@example.com", contact_name="Jane", firm_name="Acme",
+        run_id="r1", touch_step=1, attribution_status="attributed",
+        subject=None, raw_body="hi", contact_id=1, client_id="c1", inbound_id="i1",
+        firm_domain="acme.com", thread_lines=["➡️ _Sep 01_ — Touch 1 sent", "⬅️ _Sep 02_ — yes"],
+    )
+    txt = str(blocks)
+    assert "acme.com" in txt
+    assert "Recent thread" in txt
+    assert "Touch 1 sent" in txt
+
+
+def test_sales_reply_shows_door_count_and_ovs():
+    blocks = sales_reply_content_blocks(
+        from_address="p@example.com", contact_name="Jane", firm_name="Acme",
+        run_id="r1", touch_step=1, attribution_status="attributed",
+        subject=None, raw_body="hi", contact_id=1, client_id="c1", inbound_id="i1",
+        door_count=200, ovs_lines=["*OVS* 88/100  ·  county rank #2"],
+    )
+    txt = str(blocks)
+    assert "200" in txt
+    assert "88/100" in txt
 
 
 def test_sales_reply_body_blockquoted():
@@ -320,6 +385,6 @@ def test_sales_reply_body_blockquoted():
         contact_id=None, client_id="c1", inbound_id="i1",
     )
     text_sections = [b for b in blocks if b.get("type") == "section"]
-    message_section = next((s for s in text_sections if "Message" in str(s)), None)
+    message_section = next((s for s in text_sections if "> Hello" in str(s)), None)
     assert message_section is not None
-    assert "> Hello" in str(message_section)
+    assert "> World" in str(message_section)

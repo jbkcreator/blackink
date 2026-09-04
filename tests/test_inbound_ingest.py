@@ -34,6 +34,10 @@ def _fake_session(existing=False):
     session = MagicMock()
     exists_result = MagicMock()
     exists_result.first.return_value = MagicMock() if existing else None
+    # _recent_thread calls .mappings().all() — return empty so it renders no thread
+    exists_result.mappings.return_value.all.return_value = []
+    # fetch_latest_ovs guards on to_regclass(...).scalar() — None ⇒ OVS table absent
+    exists_result.scalar.return_value = None
     session.execute.return_value = exists_result
     return session
 
@@ -59,6 +63,9 @@ def _patches(
     attribution.attribution_status = attribution_status
     attribution.contact_name = "Jane Doe" if contact_id else None
     attribution.firm_name = "Acme PM" if contact_id else None
+    attribution.firm_domain = "acmepm.com" if contact_id else None
+    attribution.firm_company_id = "co-1" if contact_id else None
+    attribution.door_count = 120 if contact_id else None
 
     return (
         patch("src.services.inbound_ingest.resolve_client_from_alias", return_value=client_id),
@@ -115,11 +122,23 @@ def test_unattributed_reply_still_posted():
     mock_post.assert_awaited_once()
 
 
+def test_thread_history_posted_as_threaded_replies():
+    """Prior messages post as replies under the card (thread_ts set), oldest→newest."""
+    p1, p2, p3, p4, p5 = _patches(attribution_status="attributed", contact_id=7)
+    with p1, p2, p3, p4, p5 as mock_post, \
+         patch("src.services.inbound_ingest._recent_thread", return_value=["⬅️ newest", "➡️ oldest"]):
+        mock_post.return_value = "1700000000.0001"  # card ts
+        _run(_parsed())
+    threaded = [c for c in mock_post.await_args_list if c.kwargs.get("thread_ts")]
+    assert len(threaded) == 2  # two history lines threaded under the card
+    # oldest posted first (we reverse newest-first list)
+    assert "oldest" in threaded[0].kwargs["text"]
+
+
 def test_display_name_stripped_for_from_address():
     p1, p2, p3, p4, p5 = _patches()
     with p1, p2, p3, p4, p5 as mock_post:
         _run(_parsed(from_raw="Jane Doe <jane@acme.com>"))
-    # Card is posted with the bare email as from_address.
-    assert mock_post.await_args.kwargs["blocks"] is not None
-    # from_address surfaces in the card text.
+    # Card is posted as a colored attachment; from_address is the bare email.
+    assert mock_post.await_args.kwargs["attachments"][0]["blocks"] is not None
     assert "jane@acme.com" in mock_post.await_args.kwargs["text"]

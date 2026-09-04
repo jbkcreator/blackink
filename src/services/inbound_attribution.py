@@ -65,6 +65,9 @@ class AttributionResult:
     attribution_status: str          # 'attributed' or 'unattributed'
     contact_name: Optional[str]      # first + last for card display
     firm_name: Optional[str]         # company_name for card display
+    firm_domain: Optional[str]       # company domain for card display
+    firm_company_id: Optional[str] = None   # company_id — for OVS lookup
+    door_count: Optional[int] = None         # companies.door_count_est
 
 
 def resolve_client_from_alias(session: Session, to_alias: str) -> Optional[str]:
@@ -140,6 +143,7 @@ def attribute(
         attribution_status="unattributed",
         contact_name=None,
         firm_name=None,
+        firm_domain=None,
     )
 
     # Tier 1: In-Reply-To → sequence_touch_dispatches → run → contact
@@ -168,7 +172,8 @@ def _attribute_by_message_id(
         text(
             "SELECT std.run_id::text, std.touch_step, std.client_id, "
             "       sr.contact_id, "
-            "       c.first_name, c.last_name, co.company_name "
+            "       c.first_name, c.last_name, co.company_name, co.domain, "
+            "       co.company_id, co.door_count_est "
             "FROM sequence_touch_dispatches std "
             "JOIN sequence_runs sr ON sr.run_id = std.run_id "
             "JOIN contacts c ON c.contact_id = sr.contact_id "
@@ -201,6 +206,9 @@ def _attribute_by_message_id(
         attribution_status="attributed",
         contact_name=contact_name,
         firm_name=row["company_name"],
+        firm_domain=row["domain"],
+        firm_company_id=row["company_id"],
+        door_count=row["door_count_est"],
     )
 
 
@@ -220,7 +228,8 @@ def _attribute_by_sender_email(
 
     row = session.execute(
         text(
-            "SELECT c.contact_id, c.first_name, c.last_name, co.company_name "
+            "SELECT c.contact_id, c.first_name, c.last_name, co.company_name, co.domain, "
+            "       co.company_id, co.door_count_est "
             "FROM contacts c "
             "JOIN companies co ON co.company_id = c.company_id "
             "WHERE LOWER(c.email) = LOWER(:email) "
@@ -250,4 +259,7 @@ def _attribute_by_sender_email(
         attribution_status="attributed",
         contact_name=contact_name,
         firm_name=row["company_name"],
+        firm_domain=row["domain"],
+        firm_company_id=row["company_id"],
+        door_count=row["door_count_est"],
     )

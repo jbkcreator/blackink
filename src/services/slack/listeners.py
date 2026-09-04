@@ -44,6 +44,7 @@ from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
 from src.core.database import get_db_context
 from src.services import work_orders as wo
+from src.services.ovs_lookup import fetch_latest_ovs, ovs_card_lines
 from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
 from src.services.slack.bolt_app import get_listener_app
@@ -271,29 +272,31 @@ def _dial_task_content_blocks(order: "wo.WorkOrder") -> list:
 	indicator = _calling_hours_indicator()
 	hours_label = _calling_hours_label(indicator)
 
-	return [
-		{"type": "header", "text": {"type": "plain_text", "text": "📞 Touch 2 · Call now", "emoji": True}},
-		{
-			"type": "section",
-			"fields": [
-				{"type": "mrkdwn", "text": f"*Contact*\n{contact_name}"},
-				{"type": "mrkdwn", "text": f"*Firm*\n{firm_name}"},
-				{"type": "mrkdwn", "text": f"*County*\n{county}"},
-				{"type": "mrkdwn", "text": f"*Phone*\n{phone}"},
-			],
-		},
-		{
-			"type": "section",
-			"text": {"type": "mrkdwn", "text": f"{indicator} *{hours_label}*"},
-		},
-		{
-			"type": "context",
-			"elements": [
-				{"type": "mrkdwn", "text": f"run `{run_id_short}`  ·  `{order.action_id[:8]}`"},
-			],
-		},
-		{"type": "divider"},
+	fields = [
+		{"type": "mrkdwn", "text": f"*Contact*\n{contact_name}"},
+		{"type": "mrkdwn", "text": f"*Firm*\n{firm_name}"},
+		{"type": "mrkdwn", "text": f"*County*\n{county}"},
+		{"type": "mrkdwn", "text": f"*Phone*\n{phone}"},
 	]
+	door_count = payload.get("door_count")
+	if door_count is not None:
+		fields.append({"type": "mrkdwn", "text": f"*Doors*\n{door_count}"})
+
+	blocks: list = [
+		{"type": "header", "text": {"type": "plain_text", "text": "📞 Touch 2 · Call now", "emoji": True}},
+		{"type": "section", "fields": fields},
+	]
+	# Owner Visibility Score — shown when Dev-2's score exists; else omitted.
+	ovs_lines = payload.get("ovs_lines")
+	if ovs_lines:
+		blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(ovs_lines)}})
+	blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{indicator} *{hours_label}*"}})
+	blocks.append({
+		"type": "context",
+		"elements": [{"type": "mrkdwn", "text": f"run `{run_id_short}`  ·  `{order.action_id[:8]}`"}],
+	})
+	blocks.append({"type": "divider"})
+	return blocks
 
 
 def _linkedin_task_content_blocks(order: "wo.WorkOrder") -> list:
@@ -384,7 +387,7 @@ def _linkedin_action_buttons(order: "wo.WorkOrder") -> list:
 	if note:
 		elements.append({
 			"type": "button",
-			"text": {"type": "plain_text", "text": "Copy Note (Mobile)"},
+			"text": {"type": "plain_text", "text": "📋 Copy note"},
 			"action_id": "open_linkedin_note",
 			"value": json.dumps({"note": note[:300]}),
 		})
@@ -411,6 +414,10 @@ def sales_reply_content_blocks(
 	contact_id: Optional[int],
 	client_id: str,
 	inbound_id: str,
+	firm_domain: Optional[str] = None,
+	thread_lines: Optional[list] = None,
+	door_count: Optional[int] = None,
+	ovs_lines: Optional[list] = None,
 ) -> list:
 	"""Block Kit layout for a #sales-replies inbound reply card (ticket 28/30).
 
@@ -422,69 +429,87 @@ def sales_reply_content_blocks(
 	Unattributed cards: no opt-out button (no contact to target). Human reads
 	+ routes manually. BCC echoes (our own outbound message_id arriving back)
 	are filtered BEFORE this function is called and never posted."""
-	attribution_badge = "✅ attributed" if attribution_status == "attributed" else "⚠️ unattributed"
+	attributed = attribution_status == "attributed"
+	badge = "🟢 Attributed" if attributed else "🟠 Unattributed"
 	if run_id and touch_step:
 		run_ctx = f"Touch {touch_step} · run `{str(run_id)[:8]}`"
 	elif run_id:
 		run_ctx = f"run `{str(run_id)[:8]}`"
 	else:
-		run_ctx = "no run match"
+		run_ctx = "no matched sequence"
 
 	contact_label = contact_name or from_address
-	firm_label = f"  ·  {firm_name}" if firm_name else ""
+	firm_bits = [b for b in (firm_name, firm_domain) if b]
 
-	# Body preview — first 20 lines, blockquoted
+	# Body preview — first 20 lines, blockquoted.
 	body_lines = (raw_body or "(no body)").splitlines()[:20]
-	quoted = "\n".join(f"> {ln}" for ln in body_lines)
+	quoted = "\n".join(f"> {ln}" for ln in body_lines) or "> (no body)"
+
+	# Title line: who replied, at a glance.
+	title = contact_name or from_address
+	subtitle_bits = [b for b in firm_bits] or [from_address if contact_name else ""]
+	subtitle = "  ·  ".join([b for b in subtitle_bits if b])
 
 	blocks: list = [
-		{"type": "header", "text": {"type": "plain_text", "text": "💬 Reply received", "emoji": True}},
-		{
-			"type": "section",
-			"fields": [
-				{"type": "mrkdwn", "text": f"*From*\n{from_address}"},
-				{"type": "mrkdwn", "text": f"*Contact*\n{contact_label}{firm_label}"},
-				{"type": "mrkdwn", "text": f"*Attribution*\n{attribution_badge}"},
-				{"type": "mrkdwn", "text": f"*Thread*\n{run_ctx}"},
-			],
-		},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*💬 {title}* replied"
+			+ (f"\n{subtitle}" if subtitle else "")}},
+		{"type": "context", "elements": [{"type": "mrkdwn", "text": f"{badge}  ·  {run_ctx}  ·  from `{from_address}`"}]},
 	]
-	if subject:
-		blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Subject*\n_{subject}_"}})
-	blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Message*\n{quoted}"}})
-	blocks.append({
-		"type": "context",
-		"elements": [{"type": "mrkdwn", "text": f"inbound `{inbound_id[:8]}`"}],
-	})
-	blocks.append({"type": "divider"})
 
-	# Opt-out button — only when we have a contact_id to target (never expires,
-	# no payload hash — ticket 15 / spec). Confirm dialog prevents fat-finger.
+	# Compact facts row — only the fields we actually have.
+	facts = []
+	if door_count is not None:
+		facts.append(f"*Doors:* {door_count}")
+	if facts:
+		blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "  ·  ".join(facts)}]})
+
+	# Owner Visibility Score — only when Dev-2's score exists for this firm.
+	if ovs_lines:
+		blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(ovs_lines)}})
+
+	if subject:
+		blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Subject:* {subject}"}]})
+	blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": quoted}})
+
+	# Thread history — last 3 prior messages (v2 §3.1.3). Newest first.
+	if thread_lines:
+		blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": "*Recent thread*"}]})
+		blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(thread_lines)}})
+
+	blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"inbound `{inbound_id[:8]}`"}]})
+
+	# Actions: Reply in Thread (always), Mark Opt-Out (only when a contact_id is
+	# known — never expires, no payload hash, ticket 15/27). Book Meeting is
+	# out of scope until the Task 3.2 booking engine lands.
+	elements: list = [
+		{
+			"type": "button",
+			"text": {"type": "plain_text", "text": "Reply in Thread"},
+			"action_id": "reply_in_thread",
+			"value": json.dumps({"inbound_id": inbound_id, "contact_id": contact_id, "client_id": client_id}),
+		}
+	]
 	if contact_id is not None:
-		blocks.append({
-			"type": "actions",
-			"elements": [
-				{
-					"type": "button",
-					"text": {"type": "plain_text", "text": "Mark Opt-Out"},
-					"style": "danger",
-					"action_id": "opt_out_contact",
-					"value": json.dumps({"contact_id": contact_id, "client_id": client_id}),
-					"confirm": {
-						"title": {"type": "plain_text", "text": "Opt out this contact?"},
-						"text": {
-							"type": "mrkdwn",
-							"text": (
-								f"This will permanently halt *{contact_label}'s* active sequence "
-								"and block future sends *globally across all clients*. Cannot be undone."
-							),
-						},
-						"confirm": {"type": "plain_text", "text": "Yes, opt out"},
-						"deny": {"type": "plain_text", "text": "Cancel"},
-					},
-				}
-			],
+		elements.append({
+			"type": "button",
+			"text": {"type": "plain_text", "text": "Mark Opt-Out"},
+			"style": "danger",
+			"action_id": "opt_out_contact",
+			"value": json.dumps({"contact_id": contact_id, "client_id": client_id}),
+			"confirm": {
+				"title": {"type": "plain_text", "text": "Opt out this contact?"},
+				"text": {
+					"type": "mrkdwn",
+					"text": (
+						f"This will permanently halt *{contact_label}'s* active sequence "
+						"and block future sends *globally across all clients*. Cannot be undone."
+					),
+				},
+				"confirm": {"type": "plain_text", "text": "Yes, opt out"},
+				"deny": {"type": "plain_text", "text": "Cancel"},
+			},
 		})
+	blocks.append({"type": "actions", "elements": elements})
 
 	return blocks
 
@@ -588,7 +613,7 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 			row = session.execute(
 				text(
 					"SELECT c.first_name, c.last_name, c.phone, "
-					"       co.company_name, co.county_slug "
+					"       co.company_name, co.county_slug, co.company_id, co.door_count_est "
 					"FROM contacts c "
 					"JOIN companies co ON co.company_id = c.company_id "
 					"WHERE c.contact_id = :contact_id"
@@ -597,6 +622,9 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 			).mappings().first()
 			if row:
 				contact_data = dict(row)
+				ovs = fetch_latest_ovs(session, row["company_id"])
+				if ovs:
+					contact_data["ovs_lines"] = ovs_card_lines(ovs)
 	except Exception:
 		logger.warning(
 			"[listeners] DIAL_TASK — contact lookup failed, posting with minimal info",
@@ -617,6 +645,8 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 		"firm_name": firm_name,
 		"county": county,
 		"phone": phone,
+		"door_count": contact_data.get("door_count_est"),
+		"ovs_lines": contact_data.get("ovs_lines"),
 	}
 
 	# Stable run/touch key — matches the other touches' convention and
@@ -729,18 +759,23 @@ async def handle_open_linkedin_note(ack, body, respond, action, client):
 		view={
 			"type": "modal",
 			"callback_id": _LINKEDIN_NOTE_MODAL_ID,
-			"title": {"type": "plain_text", "text": "Connection note"},
+			"title": {"type": "plain_text", "text": "Copy connection note"},
 			"close": {"type": "plain_text", "text": "Done"},
 			"blocks": [
 				{
+					"type": "context",
+					"elements": [{"type": "mrkdwn", "text": "Tap the note → *Select all* → *Copy*, then paste into LinkedIn."}],
+				},
+				{
 					"type": "input",
 					"block_id": "note_block",
-					"label": {"type": "plain_text", "text": "Select all and copy"},
+					"label": {"type": "plain_text", "text": "Connection note"},
 					"element": {
 						"type": "plain_text_input",
 						"action_id": "note_text",
 						"multiline": True,
 						"initial_value": note,
+						"focus_on_load": True,
 					},
 					"optional": True,
 				}
@@ -753,6 +788,69 @@ async def handle_open_linkedin_note(ack, body, respond, action, client):
 async def handle_linkedin_note_modal_closed(ack):
 	"""Modal submit is a no-op — the setter just needed to copy the text."""
 	await ack()
+
+
+# ── Reply in Thread — #sales-replies card button (v2 §3.1.3) ────────────
+# Interim manual bridge: the rep composes a reply in a modal, and we post it
+# as a threaded message under the card so the team has the response on record.
+# Actual outbound-email send is out of scope this sprint (no reply-send path).
+
+_REPLY_THREAD_MODAL_ID = "sales_reply_thread_modal"
+
+
+@app.action("reply_in_thread")
+async def handle_reply_in_thread(ack, body, respond, client):
+	"""Open a modal for the rep to compose a threaded reply to the card."""
+	await ack()
+	trigger_id = body.get("trigger_id")
+	channel_id = (body.get("channel") or {}).get("id") or (body.get("container") or {}).get("channel_id")
+	message_ts = (body.get("container") or {}).get("message_ts")
+	if not trigger_id or not channel_id or not message_ts:
+		await respond(response_type="ephemeral", text=":warning: Could not open the reply composer.")
+		return
+	await client.views_open(
+		trigger_id=trigger_id,
+		view={
+			"type": "modal",
+			"callback_id": _REPLY_THREAD_MODAL_ID,
+			"private_metadata": json.dumps({"channel": channel_id, "ts": message_ts}),
+			"title": {"type": "plain_text", "text": "Reply in thread"},
+			"submit": {"type": "plain_text", "text": "Post reply"},
+			"close": {"type": "plain_text", "text": "Cancel"},
+			"blocks": [
+				{
+					"type": "input",
+					"block_id": "reply_block",
+					"label": {"type": "plain_text", "text": "Your reply"},
+					"element": {"type": "plain_text_input", "action_id": "reply_text", "multiline": True},
+				}
+			],
+		},
+	)
+
+
+@app.view(_REPLY_THREAD_MODAL_ID)
+async def handle_reply_thread_modal_submit(ack, body, view, client):
+	"""Post the composed reply as a threaded message under the card."""
+	await ack()
+	user_id = body.get("user", {}).get("id", "")
+	try:
+		meta = json.loads(view.get("private_metadata", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		return
+	channel = meta.get("channel")
+	ts = meta.get("ts")
+	text_val = (
+		view.get("state", {}).get("values", {})
+		.get("reply_block", {}).get("reply_text", {}).get("value", "")
+	)
+	if not channel or not ts or not text_val:
+		return
+	await client.chat_postMessage(
+		channel=channel,
+		thread_ts=ts,
+		text=f":envelope_with_arrow: Reply drafted by <@{user_id}>:\n>{text_val}",
+	)
 
 
 # ── Opt-out — Mark Opt-Out button on #sales-replies cards (ticket 27) ────
@@ -803,7 +901,7 @@ async def handle_opt_out_contact(ack, body, respond, action):
 
 	_log_event(
 		client_id or "system",
-		"contact_opted_out",
+		"opt_out_recorded",
 		entity_id=str(contact_id),
 		actor=f"slack:{user_id}",
 		payload={"contact_id": contact_id},
