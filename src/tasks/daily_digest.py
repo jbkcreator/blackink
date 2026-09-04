@@ -62,6 +62,18 @@ _WINDOW = timedelta(hours=24)
 # DISTINCT counties scored in the window. If "delivered" is later confirmed
 # to mean something else (e.g. a held-back report), this becomes a real
 # event and this one query line changes — nothing else in this module does.
+#
+# client_id != 'DEMO_FRIDAY_SANDBOX' is required, not optional: this is a
+# platform-wide, cross-tenant query with no client_id filter (see
+# _query_metrics' docstring for why), and the permanent demo sandbox
+# (src/tasks/seed_demo_sandbox.py) writes real outbound_touch_dispatched/
+# meeting_booked events under that client_id every time it's re-seeded. An
+# executive overview channel showing synthetic sales-demo activity mixed
+# into real pipeline numbers is a correctness bug, not a cosmetic one —
+# confirmed live: a digest run right after a seeder run reported 80 cold
+# emails / 20 appointments that were entirely sandbox noise, zero real
+# activity. Hardcoded literal, matching the same string already hardcoded
+# in apply_sandbox_dashboard_view.py's WHERE clause.
 _METRICS_SQL = """
     SELECT
         COUNT(*) FILTER (WHERE event_type = 'owner_score_generated') AS scores_generated,
@@ -76,6 +88,7 @@ _METRICS_SQL = """
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
+      AND client_id != 'DEMO_FRIDAY_SANDBOX'
 """
 # No numeric-cast regex guards are needed here (unlike the old
 # avg_response_latency_sec/video_completion_rate_pct columns) — every
