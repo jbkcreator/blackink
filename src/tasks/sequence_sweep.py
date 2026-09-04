@@ -27,11 +27,22 @@ logger = logging.getLogger(__name__)
 
 _EMAIL_TOUCH_ACTION = "DISPATCH_EMAIL_TOUCH"
 
+# Every touch action class the sweep surfaces, mapped to its Slack channel key
+# (config/slack_channels.py). Without DIAL_TASK/LINKEDIN_TASK here they would
+# sit QUEUED forever, never shown to a human (finding #4). LinkedIn has no
+# dedicated channel in the blueprint's fixed vocabulary, so it goes to the
+# setter channel alongside the email cards.
+_ACTION_CHANNEL = {
+    "DISPATCH_EMAIL_TOUCH": "setter",
+    "DIAL_TASK": "dial",
+    "LINKEDIN_TASK": "setter",
+}
 
-async def _post_due_card(order) -> bool:
+
+async def _post_due_card(order, channel_key: str) -> bool:
     from src.services.slack.listeners import post_work_order_card
 
-    posted = await post_work_order_card(order, channel_key="setter")
+    posted = await post_work_order_card(order, channel_key=channel_key)
     return posted is not None
 
 
@@ -67,26 +78,30 @@ def alert_stuck_dispatches(older_than_minutes: int = 30) -> int:
 def run_sweep(client_id=None, limit: int = 100) -> int:
     """Fetch due QUEUED orders and post their approval cards. Returns cards posted."""
     batch = wo.due_batch(client_id=client_id, limit=limit)
-    email_orders = [o for o in batch if o.action_class == _EMAIL_TOUCH_ACTION]
+    touch_orders = [o for o in batch if o.action_class in _ACTION_CHANNEL]
 
-    if not email_orders:
-        logger.info("sequence_sweep: no due email-touch orders")
+    if not touch_orders:
+        logger.info("sequence_sweep: no due touch orders")
         return 0
 
     posted = 0
-    for order in email_orders:
+    for order in touch_orders:
         if order.slack_message_ts:
             # Card already posted — skip to avoid duplicate cards.
             logger.debug("sequence_sweep: action_id=%s already has a card, skipping", order.action_id)
             continue
-        ok = asyncio.run(_post_due_card(order))
+        channel_key = _ACTION_CHANNEL[order.action_class]
+        ok = asyncio.run(_post_due_card(order, channel_key))
         if ok:
             posted += 1
-            logger.info("sequence_sweep: card posted action_id=%s contact=%s", order.action_id, order.entity_id)
+            logger.info(
+                "sequence_sweep: card posted action_id=%s contact=%s class=%s -> #%s",
+                order.action_id, order.entity_id, order.action_class, channel_key,
+            )
         else:
             logger.warning("sequence_sweep: card NOT posted action_id=%s — Slack error", order.action_id)
 
-    logger.info("sequence_sweep: %d/%d cards posted", posted, len(email_orders))
+    logger.info("sequence_sweep: %d/%d cards posted", posted, len(touch_orders))
     return posted
 
 

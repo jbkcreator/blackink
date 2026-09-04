@@ -110,11 +110,18 @@ def enroll_contact(
 
     for touch_step, day_offset in _TOUCH_DAY_OFFSETS.items():
         due_at = now + timedelta(days=day_offset)
+        is_email = touch_step in _EMAIL_TOUCH_STEPS
         action_class = (
-            "DISPATCH_EMAIL_TOUCH" if touch_step in _EMAIL_TOUCH_STEPS
+            "DISPATCH_EMAIL_TOUCH" if is_email
             else "DIAL_TASK" if touch_step == 2
             else "LINKEDIN_TASK"
         )
+        # config_fingerprint["channel"] selects the EXECUTION dispatcher (see
+        # work_orders/dispatchers.py DISPATCHERS). Email touches run the real
+        # send path ("setter"); phone/LinkedIn are human-performed and run the
+        # "manual" dispatcher that only records completion (finding #4) — so an
+        # approved DIAL_TASK is never fed to the email sender.
+        channel = "setter" if is_email else "manual"
         idempotency_key = f"seq:{run_id}:touch:{touch_step}"
         wo.enqueue(
             client_id=client_id,
@@ -126,7 +133,7 @@ def enroll_contact(
             risk_class="LOW",
             recipient=contact_email,
             payload={"run_id": run_id, "touch_step": touch_step},
-            config_fingerprint={"channel": "setter", "run_id": run_id, "touch_step": touch_step},
+            config_fingerprint={"channel": channel, "run_id": run_id, "touch_step": touch_step},
             idempotency_key=idempotency_key,
             due_at=due_at,
         )

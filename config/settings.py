@@ -96,6 +96,12 @@ class AppSettings(BaseSettings):
 	# warmed Google Workspace / Outlook (smtp.gmail.com:587 / smtp.office365.com:587).
 	# smtp_username defaults to the sending mailbox address at send time; set it
 	# only if the SMTP login differs from the From address.
+	# Sender selection guard (review finding #2). "auto" (default) uses the real
+	# SmtpEmailSender when SMTP is configured, else the StubEmailSender — the
+	# convenient dev/test behaviour. "smtp" is fail-closed: build_email_sender()
+	# raises if SMTP is not configured, so a mis-deployed production box cannot
+	# silently record undelivered mail as SENT. "stub" always uses the stub.
+	email_sender_mode: str = Field(default="auto", env="EMAIL_SENDER_MODE")
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
 	smtp_port: int = Field(default=587, env="SMTP_PORT")
 	smtp_use_tls: bool = Field(default=True, env="SMTP_USE_TLS")

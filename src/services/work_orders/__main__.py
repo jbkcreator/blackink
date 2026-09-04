@@ -194,6 +194,21 @@ def cmd_sweep(client_id: str) -> int:
 			failed += 1
 			continue
 
+		# Explicit failure from the dispatcher (finding #3) — a send that failed
+		# or is ambiguous (SEND_FAILED/RECLAIMED/NO_CONTENT/CONTACT_NOT_FOUND).
+		# Route to FAILED + alert instead of silently finalising as DONE.
+		if receipt.get("fail"):
+			finalised = wo.record_execution_result(
+				claimed.client_id, claimed.action_id, success=False, receipt=receipt,
+				error=f"dispatch outcome={receipt.get('outcome')}",
+			)
+			if finalised is None:
+				_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT during fail-finalise — alert #blackink-qa")
+			else:
+				_line(f"action_id={claimed.action_id} FAILED (outcome={receipt.get('outcome')}) — alert #blackink-qa for reconciliation")
+			failed += 1
+			continue
+
 		if receipt.get("defer"):
 			from datetime import timedelta
 			until = datetime.now(timezone.utc) + timedelta(hours=1)
