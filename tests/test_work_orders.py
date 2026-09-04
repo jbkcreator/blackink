@@ -94,6 +94,8 @@ class FakeSession:
 					if r["client_id"] == params["client_id"] and r["idempotency_key"] == params["idempotency_key"]
 				]
 				return _FakeResult(match)
+			if "limit" in keys and "now" in keys:
+				return self._due_batch(params)
 			if "limit" in keys and "action_id" not in keys and "idempotency_key" not in keys:
 				return self._approved_batch(params)
 			raise NotImplementedError(f"FakeSession: unrecognized SELECT param shape: {sorted(keys)}")
@@ -177,6 +179,19 @@ class FakeSession:
 		if "client_id" in params:
 			rows = [r for r in rows if r["client_id"] == params["client_id"]]
 		rows.sort(key=lambda r: r["created_at"])
+		return _FakeResult(rows[: params["limit"]])
+
+	def _due_batch(self, params):
+		now = params["now"]
+		rows = [
+			dict(r) for r in self.table.rows.values()
+			if r["status"] == "QUEUED"
+			and r.get("due_at") is not None
+			and r["due_at"] <= now
+		]
+		if "client_id" in params:
+			rows = [r for r in rows if r["client_id"] == params["client_id"]]
+		rows.sort(key=lambda r: r["due_at"])
 		return _FakeResult(rows[: params["limit"]])
 
 	def _claim_for_execution(self, params):
@@ -637,3 +652,66 @@ def test_reclaim_ignores_rows_that_finished_normally(fake_db):
 
 	assert wo.reclaim_stale_executing(order.client_id) == []
 	assert wo.get(order.client_id, order.action_id).status == "DONE"
+
+
+# ── due_batch — scheduled touch timer ────────────────────────────────────
+
+
+def test_due_batch_returns_past_due_queued_rows(fake_db):
+	past = datetime.now(timezone.utc) - timedelta(minutes=5)
+	future = datetime.now(timezone.utc) + timedelta(hours=2)
+
+	ready = _enqueue(due_at=past)
+	_enqueue(due_at=future)                  # future-due — must not appear
+	approved = _enqueue(due_at=past)         # past-due but APPROVED — must not appear
+	wo.record_decision(approved.client_id, approved.action_id, decision="APPROVED", decided_by="slack:U1")
+
+	batch = wo.due_batch("acme_pm")
+	assert [o.action_id for o in batch] == [ready.action_id]
+
+
+def test_due_batch_excludes_rows_with_no_due_at(fake_db):
+	_enqueue()  # due_at=None — not scheduled, must not appear
+	assert wo.due_batch("acme_pm") == []
+
+
+def test_due_batch_unscoped_aggregates_across_clients(fake_db):
+	past = datetime.now(timezone.utc) - timedelta(minutes=1)
+	a = _enqueue(client_id="client_a", due_at=past)
+	b = _enqueue(client_id="client_b", due_at=past)
+
+	batch = wo.due_batch(None)
+	assert {o.action_id for o in batch} == {a.action_id, b.action_id}
+
+
+# ── Bug A: reclaimed mid-flight → ERROR not DONE ─────────────────────────
+
+
+def test_cmd_sweep_reclaimed_mid_flight_counts_as_failed(monkeypatch, capsys):
+	"""When record_execution_result returns None (row reclaimed mid-flight),
+	cmd_sweep must not log DONE — it must log an error and count as failed."""
+	from src.services.work_orders import __main__ as womain
+	from src.agents.relay import halt_service
+
+	order = SimpleNamespace(
+		action_id="test-action-abc",
+		client_id="test-client",
+		config_fingerprint={"channel": "noop"},
+	)
+
+	monkeypatch.setattr(halt_service, "is_halted", lambda client_id: False)
+	monkeypatch.setattr(womain.wo, "requeue_due_snoozed", lambda client_id: [])
+	monkeypatch.setattr(womain.wo, "reclaim_stale_executing", lambda client_id: [])
+	monkeypatch.setattr(womain.wo, "approved_batch", lambda client_id: [order])
+	monkeypatch.setattr(womain.wo, "claim_for_execution", lambda cid, aid: order)
+	monkeypatch.setattr(womain.wo, "record_execution_result", lambda *a, **kw: None)
+	monkeypatch.setitem(womain.DISPATCHERS, "noop", lambda o: {})
+
+	result = womain.cmd_sweep("test-client")
+	out = capsys.readouterr().out
+
+	assert "DONE" not in out
+	assert "reclaimed" in out.lower() or "mid-flight" in out.lower()
+	assert "0 sent" in out
+	assert "1 failed" in out
+	assert result == 0

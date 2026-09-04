@@ -20,6 +20,7 @@ from typing import Optional
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from sqlalchemy import (
+	ARRAY,
 	CheckConstraint,
 	Date,
 	DateTime,
@@ -34,6 +35,7 @@ from sqlalchemy import (
 	Boolean,
 	UniqueConstraint,
 	func,
+	text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -275,7 +277,13 @@ class Contact(Base):
 	last_outbound_touch_at: Mapped[Optional[datetime]] = mapped_column(
 		DateTime(timezone=True), nullable=True
 	)
-	prospect_objections: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	# Structured objections captured by the 60-second post-meeting Slack
+	# modal (src/services/meeting_outcomes.py), read by the future Owner
+	# Score engine. Mirrored here from meeting_outcomes so Owner Score can
+	# read one contact row rather than joining outcome history.
+	prospect_objections: Mapped[list[str]] = mapped_column(
+		ARRAY(Text), nullable=False, server_default=text("'{}'")
+	)
 	# Week 1 Subtask 1.2.2 (Warm-Channel Waterfall) — literal field names from
 	# the master blueprint's CI-enforced predicate (§3.0.4): SMS eligibility
 	# requires inbound_sms_count > 0 OR booked_appointment_id IS NOT NULL.
@@ -342,6 +350,60 @@ class PmProfile(Base):
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+
+# ============================================================================
+# POST-MEETING OUTCOME CAPTURE — 60-second Slack modal (blueprint §3.1.7).
+# See src/services/meeting_outcomes.py and src/services/slack/listeners.py.
+# ============================================================================
+
+_ATTENDANCE_STATUSES = "'Held','No-Show','Rescheduled'"
+
+
+class MeetingOutcome(Base):
+	"""Current-state record of one completed sales meeting, captured by the
+	60-second post-meeting Slack modal (blueprint §3.1.7).
+
+	Deliberately SEPARATE from the append-only `events` ledger: the DoD
+	requires a second submission for the same meeting to UPDATE rather than
+	duplicate, which an immutable ledger structurally cannot express. Every
+	write here also emits a `meeting_outcome_recorded` event through
+	src/services/events.py for the audit trail — this table is the current
+	state, the ledger is the history.
+
+	Tenant-bearing (direct client_id) — registered in
+	config/tenant_policies.py.
+	"""
+
+	__tablename__ = "meeting_outcomes"
+
+	id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	contact_id: Mapped[int] = mapped_column(
+		BigInteger, ForeignKey("contacts.contact_id"), nullable=False, index=True
+	)
+	meeting_occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	attendance_status: Mapped[str] = mapped_column(String(20), nullable=False)
+	pm_software: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+	door_count_est: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+	objections: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, server_default=text("'{}'"))
+	next_action: Mapped[Optional[str]] = mapped_column(String(280), nullable=True)
+	recorded_by: Mapped[str] = mapped_column(String(100), nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		CheckConstraint(
+			f"attendance_status IN ({_ATTENDANCE_STATUSES})", name="ck_meeting_outcomes_attendance"
+		),
+		UniqueConstraint(
+			"client_id", "contact_id", "meeting_occurred_at", name="uq_meeting_outcomes_meeting"
+		),
 	)
 
 
@@ -702,51 +764,4 @@ class AgentWorkOrder(Base):
 		Index("ix_awo_client_status", "client_id", "status"),
 		Index("ix_awo_entity", "entity_type", "entity_id"),
 		Index("ix_awo_due", "status", "due_at"),
-	)
-
-
-# ============================================================================
-# MEETING OUTCOMES (post-demo Slack form — Week 2 / Sprint 2A)
-# Separate from appointment_outcomes (billing verification). This table
-# captures intelligence gathered during the meeting itself: PM software,
-# door count, stated objections, next action. The freshness guard in
-# src/services/meeting_outcomes.py ensures mirrored fields on contacts and
-# companies always reflect the most recent meeting, not whichever was
-# submitted last.
-# ============================================================================
-
-_ATTENDANCE_STATUSES = "'ATTENDED','NO_SHOW','RESCHEDULED','CANCELLED'"
-
-
-class MeetingOutcome(Base):
-	__tablename__ = "meeting_outcomes"
-
-	outcome_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-	client_id: Mapped[str] = mapped_column(
-		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
-	)
-	contact_id: Mapped[int] = mapped_column(
-		BigInteger, ForeignKey("contacts.contact_id"), nullable=False, index=True
-	)
-	# Denormalized from contact_id.company_id for efficient company-level MAX queries
-	# (avoids a join in the freshness guard). Must always match the contact's company.
-	company_id: Mapped[str] = mapped_column(
-		String(64), ForeignKey("companies.company_id"), nullable=False, index=True
-	)
-	meeting_occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-	attendance_status: Mapped[str] = mapped_column(String(20), nullable=False)
-	pm_software_stated: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-	door_count_stated: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-	objections_stated: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-	next_action: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-	submitted_by: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
-	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-
-	__table_args__ = (
-		CheckConstraint(
-			f"attendance_status IN ({_ATTENDANCE_STATUSES})",
-			name="ck_meeting_outcomes_attendance",
-		),
-		Index("ix_meeting_outcomes_contact_occurred", "contact_id", "meeting_occurred_at"),
-		Index("ix_meeting_outcomes_company_occurred", "company_id", "meeting_occurred_at"),
 	)
