@@ -44,6 +44,10 @@ def sales_demo_setup():
 			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
 		))
 		session.execute(text(
+			"DELETE FROM meeting_outcome_prompt_jobs WHERE booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
+		))
+		session.execute(text(
 			"UPDATE contacts SET outbound_pause_source_booking_id = NULL WHERE outbound_pause_source_booking_id IN "
 			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
 		))
@@ -121,6 +125,7 @@ def sales_demo_setup():
 
 	with get_owner_db_context() as session:
 		session.execute(text("DELETE FROM booking_reminder_jobs WHERE booking_id = :id"), {"id": booking.booking_id})
+		session.execute(text("DELETE FROM meeting_outcome_prompt_jobs WHERE booking_id = :id"), {"id": booking.booking_id})
 	with get_system_db_context() as session:
 		session.execute(text("DELETE FROM bookings WHERE booking_id = :id"), {"id": booking.booking_id})
 		session.execute(text("DELETE FROM calendar_connections WHERE connection_id = :id"), {"id": conn.connection_id})
@@ -444,6 +449,7 @@ def test_30min_reminder_fires_within_60s_of_the_30min_mark_and_sends():
 	finally:
 		with get_owner_db_context() as session:
 			session.execute(text("DELETE FROM booking_reminder_jobs WHERE booking_id = :id"), {"id": booking.booking_id})
+			session.execute(text("DELETE FROM meeting_outcome_prompt_jobs WHERE booking_id = :id"), {"id": booking.booking_id})
 		with get_system_db_context() as session:
 			session.execute(text("DELETE FROM bookings WHERE booking_id = :id"), {"id": booking.booking_id})
 			session.execute(text("DELETE FROM calendar_connections WHERE connection_id = :id"), {"id": conn.connection_id})

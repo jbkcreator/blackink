@@ -117,10 +117,23 @@ async def open_modal(*, trigger_id: str, view: dict) -> bool:
 		return False
 
 
-async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[dict]] = None) -> Optional[str]:
+async def post_notice(
+	*,
+	channel_key: str,
+	text: str,
+	blocks: Optional[Sequence[dict]] = None,
+	thread_ts: Optional[str] = None,
+) -> Optional[str]:
 	"""Non-interactive, fire-and-forget posts — #blackink-qa health alerts,
 	#blackink-economics rollups. Returns the message ts on success, else
-	None. Never raises."""
+	None. Never raises.
+
+	thread_ts (optional) replies in an existing message's thread instead of
+	posting to the channel top level — used by the "Log Outcome" card's
+	4-hour unclicked reminder ping, which the addendum to Subtask 3.2.1
+	requires land "in the same channel/thread" as the card it's nudging.
+	Omitted (None) keeps the historical top-level behavior for every
+	existing caller."""
 	client = _client_or_none()
 	if client is None:
 		logger.info("[slack.post] Slack not configured — notice not posted (channel_key=%s)", channel_key)
@@ -132,7 +145,12 @@ async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[
 		return None
 
 	try:
-		response = await client.chat_postMessage(channel=channel_id, text=text, blocks=list(blocks) if blocks else None)
+		response = await client.chat_postMessage(
+			channel=channel_id,
+			text=text,
+			blocks=list(blocks) if blocks else None,
+			thread_ts=thread_ts,
+		)
 		return response["ts"]
 	except SlackApiError as exc:
 		logger.error("[slack.post] chat.postMessage (notice) failed (channel_key=%s): %s", channel_key, exc.response.get("error") if exc.response else exc)

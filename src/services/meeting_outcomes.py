@@ -124,6 +124,18 @@ def _latest_for_company(session: Session, company_id: str) -> Optional[datetime]
 
 
 def _mirror_contact(session: Session, contact_id: int, objections: Optional[str]) -> None:
+    # Two writes, each a no-op for the other's case, so this is correct
+    # regardless of the caller's tenant scope:
+    #   * the plain UPDATE mirrors for a normally-allocated tenant, whose
+    #     own session can see its own contacts row through RLS;
+    #   * the SECURITY DEFINER function (apply_meeting_outcome_prompt_jobs.py)
+    #     mirrors for a session scoped to BLACKINK_INTERNAL_SALES, whose
+    #     prospect companies have owning_client_id = NULL and are therefore
+    #     RLS-invisible — so the plain UPDATE above silently matches ZERO
+    #     rows for that (only real) caller of this path today.
+    # The function returns early for any non-internal-sales scope, so it can
+    # never double-write; the plain UPDATE matches nothing under internal
+    # sales, so it never does either.
     session.execute(
         text(
             "UPDATE contacts"
@@ -131,6 +143,10 @@ def _mirror_contact(session: Session, contact_id: int, objections: Optional[str]
             " WHERE contact_id = :cid"
         ),
         {"objections": objections, "cid": contact_id},
+    )
+    session.execute(
+        text("SELECT mirror_contact_objections(:cid, :objections)"),
+        {"cid": contact_id, "objections": objections},
     )
 
 
@@ -142,7 +158,9 @@ def _mirror_company(
 ) -> None:
     # COALESCE keeps the existing value when the submitted field is NULL,
     # so a meeting where the rep didn't ask about PM software doesn't erase
-    # a value captured in an earlier meeting.
+    # a value captured in an earlier meeting. See _mirror_contact for why
+    # both this plain UPDATE and the SECURITY DEFINER function are issued —
+    # exactly one of them writes for any given caller's tenant scope.
     session.execute(
         text(
             "UPDATE companies"
@@ -152,4 +170,8 @@ def _mirror_company(
             " WHERE company_id = :coid"
         ),
         {"pm_software": pm_software, "door_count": door_count, "coid": company_id},
+    )
+    session.execute(
+        text("SELECT mirror_company_intelligence(:coid, :pm_software, :door_count)"),
+        {"coid": company_id, "pm_software": pm_software, "door_count": door_count},
     )

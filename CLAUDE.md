@@ -46,6 +46,7 @@ PYTHONPATH=. python migrations/apply_booking_reminder_jobs.py      # Subtask 3.2
 PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py        # Subtask 3.2.3 — No-Show Handler
 PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2.3 — No-Show Handler
 PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
+PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -62,6 +63,7 @@ python -m src.tasks.show_rate_reminder_sender
 python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
+python -m src.tasks.meeting_outcome_prompt_sender
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
@@ -493,6 +495,84 @@ URL is what code can verify. `audit.getblackink.com` requires a DNS
 record and a Cloud Run domain mapping done outside this codebase (same
 manual-runbook posture as sending-domain DNS) — not done as part of this
 change.
+
+### Post-Booking "Log Outcome" Trigger Card (Addendum to Subtask 3.2.1)
+
+Neither spec version assigns ownership of the Slack trigger that opens
+4.2.2's post-meeting outcome modal — this addendum posts that card and
+wires the click. **Scoped to `INTERNAL_SALES_DEMO` only**, like the
+no-show handler and for the same hard reason: `meeting_outcomes.contact_id`/
+`company_id` are `NOT NULL` FKs to `contacts`/`companies`, which only a
+sales-demo booking has (`target_contact_id`/`target_company_id`); a
+`CLIENT_OWNER_BOOKING` links to `owner_contacts` and could never produce
+an outcome row.
+
+On every `meeting_booked` for such a booking,
+`src/services/booking_ingest.py`'s `schedule_meeting_outcome_prompt()`
+(third sibling to `schedule_show_rate_reminders()`/
+`schedule_no_show_prompt()`, same insert/reschedule/cancel call sites and
+lifecycle) upserts one `meeting_outcome_prompt_jobs` row at the meeting's
+own `scheduled_at` — never a guessed end time; the click, not any timer,
+signals the meeting is done. Cancelling the booking transitions the
+pending job to `CANCELLED` (no outcome prompt for a meeting that never
+happened). `src/tasks/meeting_outcome_prompt_sender.py` sweeps
+(self-heal → claim → post → follow-up) via
+`src/services/meeting_outcome_prompts.py`'s `SKIP LOCKED` pattern.
+
+The card is a real `agent_work_orders` row, so its SHA-256 payload-hash
+binding (over payload + `recipient` + config) is the existing shared
+`src/services/slack/payload_hash.py` — no second implementation. The
+button's `recipient` is the assigned closer's Slack id, bound into the
+hash preimage; `@app.action("log_meeting_outcome")` rejects a click from
+anyone else (`"assigned to a different closer"`). **The 24-hour card
+expiry is deliberately NOT part of the hash** (that preimage is FIXED —
+adding a timestamp window would change every digest and force a
+`HASH_VERSION` bump), so it's an explicit `order.created_at + 24h` check
+in both the click handler and the `@app.view` submit handler, rejected
+with the same `"This action has expired or was altered"` message as an
+altered card. An unclicked card gets exactly one threaded reminder ping
+at `posted_at + 4h`; at `posted_at + 24h` the job goes `EXPIRED` and the
+sweep stops examining it — matching how every other expired card behaves.
+
+The card @mentions and authorizes against `calendar_connections.
+rep_slack_user_id` — **manually provisioned per rep** (same runbook
+posture as `public_booking_url`; no code path sets it, no Slack-directory
+lookup exists here). A connection without it can't produce an attributable
+card, so the job stays `BLOCKED`/`MISSING_REP_SLACK_USER_ID` (as does an
+unresolved `target_contact_id` → `UNRESOLVED_TARGET`); the sweep's
+self-heal step promotes both back to `PENDING` the moment the underlying
+data appears, the same pattern the show-rate reminder uses for
+`MISSING_OVS_*`.
+
+`open_meeting_outcome_modal()` and the global
+`@app.view("meeting_outcome_submit")` submit handler are **built here**
+(4.2.2's own were never built in this repo — whoever owns 4.2.2 reconciles
+against this, not a second copy). The submit handler re-verifies auth,
+hash and the 24h window (a view_submission is a separate request and the
+modal can sit open), refuses if a NO_SHOW was already logged from the
+`#blackink-command` "Mark No-Show" card (the two surfaces log the same
+meeting), then in one transaction records the outcome, marks the work
+order `DONE`, and logs `meeting_outcome_recorded` carrying the clicked
+card's own `contact_id`.
+
+**Fixes a pre-existing silent no-op:** `meeting_outcomes.py`'s intelligence
+mirror (`contacts.prospect_objections`, `companies.current_pm_software`/
+`door_count_est`) was a plain `UPDATE`, which matches **zero rows** under a
+`BLACKINK_INTERNAL_SALES`-scoped session — those tables are RLS-scoped via
+`companies.owning_client_id`, `NULL` for every unallocated prospect. Two
+new hardened `SECURITY DEFINER` functions
+(`mirror_contact_objections`/`mirror_company_intelligence`, in
+`apply_meeting_outcome_prompt_jobs.py`, same caller-scope-gated pattern as
+`pause_contact_after_no_show()`) do the write for that scope; the plain
+`UPDATE` stays for any normally-allocated tenant. Each is a no-op for the
+other's case, so exactly one writes — this also silently fixed the same
+gap in 3.2.3's existing `mark_no_show` path.
+
+**Open after this work:** `rep_slack_user_id` is manual, so the
+"@mention the correct closer" DoD line can't be verified until an operator
+provisions it; the real-Slack click→modal→submit round-trip needs a live
+workspace + `SLACK_BOT_TOKEN` this environment lacks (manual verification
+item).
 
 ## Tooling Rules
 

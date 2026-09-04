@@ -74,6 +74,9 @@ TENANT_POLICIES = {
 	# Subtask 3.2.3 — No-Show Handler. Both carry their own client_id column.
 	"no_show_prompt_jobs": {"mode": "direct", "column": "client_id"},
 	"no_show_recovery_jobs": {"mode": "direct", "column": "client_id"},
+	# Addendum to Subtask 3.2.1 — "Log Outcome" trigger card. Carries its own
+	# client_id column (copied from bookings.client_id at schedule time).
+	"meeting_outcome_prompt_jobs": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

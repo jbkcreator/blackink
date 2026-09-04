@@ -354,6 +354,26 @@ _BLACKINK_INTERNAL_SALES = "BLACKINK_INTERNAL_SALES"
 
 @pytest.fixture
 def sales_demo_connection():
+	# Defensive pre-clean: this client_id + external_calendar_id='rep-primary'
+	# namespace is shared with several other live-DB fixtures (no-show,
+	# show-rate, meeting-outcome). A row left behind by a prior fixture or a
+	# prior interrupted session would otherwise collide with the partial
+	# unique index on (client_id, provider, external_calendar_id). Clear all
+	# FK-dependent job rows before the bookings, and the bookings before the
+	# connections.
+	with get_owner_db_context() as session:
+		for tbl in ("meeting_outcome_prompt_jobs", "no_show_prompt_jobs", "no_show_recovery_jobs", "booking_reminder_jobs"):
+			session.execute(text(
+				f"DELETE FROM {tbl} WHERE booking_id IN "
+				"(SELECT booking_id FROM bookings WHERE client_id = :cid)"
+			), {"cid": _BLACKINK_INTERNAL_SALES})
+		session.execute(text(
+			"UPDATE contacts SET outbound_pause_source_booking_id = NULL WHERE outbound_pause_source_booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = :cid)"
+		), {"cid": _BLACKINK_INTERNAL_SALES})
+	with get_system_db_context() as session:
+		session.execute(text("DELETE FROM bookings WHERE client_id = :cid"), {"cid": _BLACKINK_INTERNAL_SALES})
+		session.execute(text("DELETE FROM calendar_connections WHERE client_id = :cid"), {"cid": _BLACKINK_INTERNAL_SALES})
 	with get_system_db_context() as session:
 		row = session.execute(
 			text(
@@ -379,6 +399,8 @@ def sales_demo_connection():
 		session.execute(text("DELETE FROM no_show_prompt_jobs WHERE booking_id IN "
 							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
 		session.execute(text("DELETE FROM no_show_recovery_jobs WHERE booking_id IN "
+							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
+		session.execute(text("DELETE FROM meeting_outcome_prompt_jobs WHERE booking_id IN "
 							  "(SELECT booking_id FROM bookings WHERE calendar_connection_id = :id)"), {"id": connection_id})
 		# A test may have paused a contact whose outbound_pause_source_booking_id
 		# FK-references one of these bookings (directly, or via trigger_recovery())

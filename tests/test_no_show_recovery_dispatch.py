@@ -34,6 +34,10 @@ def no_show_booking():
 			"DELETE FROM booking_reminder_jobs WHERE booking_id IN "
 			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
 		))
+		session.execute(text(
+			"DELETE FROM meeting_outcome_prompt_jobs WHERE booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
+		))
 		# A previous run's trigger_recovery() may have left
 		# contacts.outbound_pause_source_booking_id pointing at a booking
 		# this fixture is about to delete -- clear the FK reference first

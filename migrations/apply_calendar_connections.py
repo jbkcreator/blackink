@@ -137,6 +137,20 @@ DDL = [
 		WHERE is_default_sales_booking = TRUE AND connection_scope = 'INTERNAL_SALES_DEMO'
 	""",
 
+	# ── Addendum to Subtask 3.2.1 — "Log Outcome" trigger card ───────────────
+	# The Slack user id of the closer who owns this calendar. Manually
+	# provisioned per INTERNAL_SALES_DEMO rep, exactly like public_booking_url
+	# above — no code path anywhere sets it, and there is no Slack-directory
+	# lookup in this repo to derive it from the rep's calendar email.
+	#
+	# Two DoD lines depend on it: the card @mentions the assigned closer, and
+	# the click handler rejects a click from anyone else. A connection without
+	# it therefore cannot produce an attributable card at all — the job row
+	# stays BLOCKED (MISSING_REP_SLACK_USER_ID) rather than posting a button
+	# that no one can be verified against, and the sweep's self-heal step
+	# promotes it the moment this column is filled in.
+	"ALTER TABLE calendar_connections ADD COLUMN IF NOT EXISTS rep_slack_user_id VARCHAR(20)",
+
 	"CREATE INDEX IF NOT EXISTS ix_calendar_connections_client ON calendar_connections (client_id)",
 	# DELETE granted alongside SELECT/INSERT/UPDATE — same convention as
 	# contacts/companies, needed for test-fixture teardown, not just

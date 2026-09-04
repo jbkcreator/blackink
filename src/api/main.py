@@ -52,6 +52,7 @@ _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS = 3600
 _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS = 60
 _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS = 30
+_MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -70,6 +71,7 @@ def _start_background_workers() -> None:
 	from src.tasks.no_show_prompt_sender import run_sweep as no_show_prompt_sweep
 	from src.tasks.no_show_recovery_sender import run_sweep as no_show_recovery_sweep
 	from src.tasks.self_serve_audit_worker import run_sweep as self_serve_audit_sweep
+	from src.tasks.meeting_outcome_prompt_sender import run_sweep as meeting_outcome_prompt_sweep
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -79,6 +81,7 @@ def _start_background_workers() -> None:
 		("no_show_prompt_sender.run_sweep", _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS, no_show_prompt_sweep),
 		("no_show_recovery_sender.run_sweep", _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS, no_show_recovery_sweep),
 		("self_serve_audit_worker.run_sweep", _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS, self_serve_audit_sweep),
+		("meeting_outcome_prompt_sender.run_sweep", _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS, meeting_outcome_prompt_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)

@@ -420,6 +420,99 @@ def schedule_no_show_prompt(
 		)
 
 
+def schedule_meeting_outcome_prompt(
+	session: Session,
+	*,
+	client_id: str,
+	booking_id: int,
+	old_event_status: Optional[str],
+	old_scheduled_at: Optional[datetime],
+	new_event_status: str,
+	new_scheduled_at: Optional[datetime],
+	as_of: Optional[datetime] = None,
+) -> None:
+	"""Addendum to Subtask 3.2.1 — the "Log Outcome" trigger card. Third
+	sibling to schedule_show_rate_reminders()/schedule_no_show_prompt():
+	identical signature, identical call sites (insert, reschedule AND
+	cancellation), identical lifecycle rules.
+
+	scheduled_for is the meeting's own start time, never a guessed end time
+	— the card exists to give the closer a button to press whenever their
+	meeting actually wraps; the click, not any timer, is what signals "the
+	meeting is done."
+
+	Unlike the no-show prompt, an unresolved target_contact_id here is not
+	the only blocking input: the card must @mention (and later authorize) the
+	assigned closer, which needs calendar_connections.rep_slack_user_id.
+	Both blocking conditions are re-checked at post time by
+	src/services/meeting_outcome_prompts.py, which is also where the
+	self-heal that lifts them lives — this function only needs to get the
+	row scheduled, so it does the cheap target check it already has a query
+	for and leaves the connection lookup to the poster."""
+	as_of = as_of or datetime.now(timezone.utc)
+
+	if new_event_status == "CANCELLED":
+		# No outcome prompt for a meeting that never happened. Same
+		# status set as the two siblings: a SENT card is left alone (it's
+		# already in the channel; its own 24h expiry closes it out).
+		session.execute(
+			text(
+				"UPDATE meeting_outcome_prompt_jobs SET status = 'CANCELLED', updated_at = NOW() "
+				"WHERE booking_id = :bid AND status IN ('PENDING', 'BLOCKED', 'SENDING')"
+			),
+			{"bid": booking_id},
+		)
+		return
+
+	if new_event_status != "CONFIRMED" or new_scheduled_at is None:
+		return
+
+	is_new = old_event_status is None
+	is_reschedule = not is_new and old_scheduled_at != new_scheduled_at
+	if not is_new and not is_reschedule:
+		return  # unchanged CONFIRMED booking — no-op
+
+	target_contact_id = session.execute(
+		text("SELECT target_contact_id FROM bookings WHERE booking_id = :bid"),
+		{"bid": booking_id},
+	).scalar()
+
+	if target_contact_id is None:
+		status, last_error = "BLOCKED", "UNRESOLVED_TARGET"
+	elif new_scheduled_at <= as_of:
+		status = "SKIPPED"
+		last_error = f"scheduled_for ({new_scheduled_at.isoformat()}) already past at {'creation' if is_new else 'reschedule'} time"
+	else:
+		status, last_error = "PENDING", None
+
+	if is_new:
+		session.execute(
+			text(
+				"INSERT INTO meeting_outcome_prompt_jobs (client_id, booking_id, scheduled_for, status, last_error) "
+				"VALUES (:client_id, :booking_id, :scheduled_for, :status, :last_error) "
+				"ON CONFLICT (booking_id) DO NOTHING"
+			),
+			{
+				"client_id": client_id, "booking_id": booking_id, "scheduled_for": new_scheduled_at,
+				"status": status, "last_error": last_error,
+			},
+		)
+	else:
+		# Reschedule: only touch rows still PENDING/BLOCKED — a SENT card is
+		# never re-posted, and a CANCELLED/EXPIRED one is never revived.
+		session.execute(
+			text(
+				"UPDATE meeting_outcome_prompt_jobs SET scheduled_for = :scheduled_for, status = :status, "
+				"last_error = :last_error, updated_at = NOW() "
+				"WHERE booking_id = :booking_id AND status IN ('PENDING', 'BLOCKED')"
+			),
+			{
+				"scheduled_for": new_scheduled_at, "status": status, "last_error": last_error,
+				"booking_id": booking_id,
+			},
+		)
+
+
 def _resume_if_rebooked(session: Session, *, contact_id: int, new_booking_id: int) -> None:
 	"""Subtask 3.2.3. Clears a contact's outbound pause ONLY when the
 	contact has actually rebooked under a genuinely new, distinct
@@ -479,6 +572,11 @@ def _process_event(
 					new_event_status="CANCELLED", new_scheduled_at=None,
 				)
 				schedule_no_show_prompt(
+					session, client_id=connection.client_id, booking_id=booking_id,
+					old_event_status="CONFIRMED", old_scheduled_at=None,
+					new_event_status="CANCELLED", new_scheduled_at=None,
+				)
+				schedule_meeting_outcome_prompt(
 					session, client_id=connection.client_id, booking_id=booking_id,
 					old_event_status="CONFIRMED", old_scheduled_at=None,
 					new_event_status="CANCELLED", new_scheduled_at=None,
@@ -567,6 +665,11 @@ def _process_event(
 				old_event_status=None, old_scheduled_at=None,
 				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
 			)
+			schedule_meeting_outcome_prompt(
+				session, client_id=connection.client_id, booking_id=result["booking_id"],
+				old_event_status=None, old_scheduled_at=None,
+				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+			)
 	else:
 		if result["old_scheduled_at"] is not None and result["scheduled_at"] != result["old_scheduled_at"]:
 			_record_event(session, connection.client_id, "booking_rescheduled", result["booking_id"], {
@@ -582,6 +685,11 @@ def _process_event(
 					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
 				)
 				schedule_no_show_prompt(
+					session, client_id=connection.client_id, booking_id=result["booking_id"],
+					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
+					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+				)
+				schedule_meeting_outcome_prompt(
 					session, client_id=connection.client_id, booking_id=result["booking_id"],
 					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
 					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],

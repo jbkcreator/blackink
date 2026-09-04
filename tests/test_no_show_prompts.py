@@ -42,6 +42,10 @@ def sales_demo_booking():
 			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
 		))
 		session.execute(text(
+			"DELETE FROM meeting_outcome_prompt_jobs WHERE booking_id IN "
+			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
+		))
+		session.execute(text(
 			"UPDATE contacts SET outbound_pause_source_booking_id = NULL WHERE outbound_pause_source_booking_id IN "
 			"(SELECT booking_id FROM bookings WHERE client_id = 'BLACKINK_INTERNAL_SALES')"
 		))
