@@ -30,6 +30,7 @@ PYTHONPATH=. python migrations/apply_events.py
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
 PYTHONPATH=. python migrations/apply_agent_work_orders.py   # before RLS, after clients
+PYTHONPATH=. python migrations/apply_meeting_outcomes.py    # adds meeting_outcomes table + contacts.prospect_objections
 PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # adds google_place_id to companies
 PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
 PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # OVS engine scoring table
