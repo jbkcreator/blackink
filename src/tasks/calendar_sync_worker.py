@@ -71,7 +71,13 @@ def sweep_all_active_connections() -> int:
 	swept = 0
 	with get_system_db_context() as session:
 		connections = session.execute(
-			text("SELECT connection_id, provider FROM calendar_connections WHERE status = 'ACTIVE'")
+			# GoHighLevel connections carry no OAuth tokens and have no fetch/
+			# baseline sync -- their bookings arrive only via the webhook POST
+			# (process_ghl_event). Routing one through _client_for() would build
+			# a MicrosoftGraphClient and call Graph with no credentials, failing
+			# every sweep. They are intentionally excluded from the safety net.
+			text("SELECT connection_id, provider FROM calendar_connections "
+			     "WHERE status = 'ACTIVE' AND provider IN ('GOOGLE', 'MICROSOFT')")
 		).fetchall()
 		for row in connections:
 			client = _client_for(session, row.provider)

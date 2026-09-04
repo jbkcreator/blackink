@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import smtplib
+import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from email.mime.application import MIMEApplication
@@ -62,8 +63,6 @@ class SmtpEmailProvider(EmailProvider):
 		self._from_address = from_address
 
 	def send(self, to: str, reply_to: str, bcc: str, subject: str, html_body: str, ics_attachment: bytes) -> str:
-		import uuid
-
 		msg = MIMEMultipart()
 		msg["From"] = self._from_address
 		msg["To"] = to

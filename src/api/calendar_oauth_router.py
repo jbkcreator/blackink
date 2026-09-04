@@ -111,6 +111,7 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				access_token_encrypted=encrypt_token(tokens.access_token), token_expires_at=tokens.expires_at,
 			)
 			client = GoogleCalendarClient(session)
+			subscription_expires_at = None
 			if get_settings().skip_calendar_watch_registration:
 				logger.warning(
 					"SKIP_CALENDAR_WATCH_REGISTRATION is set — connecting client %s's Google calendar "
@@ -124,8 +125,12 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 				# access token available via get_valid_access_token(); the row
 				# doesn't exist yet, so we pass a lightweight stand-in exposing
 				# just what that call needs.
-				client.register_watch(existing_row, channel_id, _webhook_url(provider), verification_secret)
-			subscription_expires_at = None
+				watch = client.register_watch(existing_row, channel_id, _webhook_url(provider), verification_secret)
+				# Persist Google's returned watch expiry. Without it the row's
+				# expires_at stays NULL, and calendar_subscription_renewal treats
+				# the connection as perpetually due — creating a brand-new watch
+				# channel on every hourly sweep instead of renewing near expiry.
+				subscription_expires_at = watch.get("expires_at")
 		else:
 			me_calendar = requests.get(
 				"https://graph.microsoft.com/v1.0/me/calendar",
