@@ -60,6 +60,9 @@ DDL = [
     END $$
     """,
 
+    # ── contacts: ensure audit_loss_dollars_est exists (OVS revenue model) ─────
+    "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS audit_loss_dollars_est NUMERIC(10,2)",
+
     # ── pm_profiles: drop ghost-shopper speed-benchmark columns ───────────────
     "ALTER TABLE pm_profiles DROP COLUMN IF EXISTS average_speed_to_lead_seconds",
     "ALTER TABLE pm_profiles DROP COLUMN IF EXISTS top10_speed_to_lead_seconds",
