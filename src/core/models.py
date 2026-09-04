@@ -7,15 +7,17 @@ trivially idempotent). Verified via Base.metadata.create_all() in
 tests/test_schema.py, never used for runtime queries (those go through
 sqlalchemy.text() with named binds per project convention).
 
-Week 1 scope only (migrations 1-5 in the Dev 1 plan): County, Client,
-CountyAllocation, ClientPmBook, Company, Contact. RawProspectCompany/
-RawProspectContact, Event, ComplianceGateCheck, OwnerEntity/OwnerEntityLink
-land in Week 2 (migrations 6-11) — see
+Week 1 scope: County, Client, CountyAllocation, ClientPmBook, Company,
+Contact, PmProfile. RawProspectCompany/RawProspectContact, Event,
+ComplianceGateCheck, OwnerEntity/OwnerEntityLink were already brought
+forward from the original Week 2 plan during Week 0 build-out — see
 C:\\Users\\HEU-Vishnu\\.claude\\plans\\dev-1-data-synthetic-fox.md.
 """
 
 from datetime import datetime, date
 from typing import Optional
+
+from sqlalchemy.dialects.postgresql import ARRAY
 
 from sqlalchemy import (
 	CheckConstraint,
@@ -56,6 +58,18 @@ class County(Base):
 	county_slug: Mapped[str] = mapped_column(String(60), primary_key=True)
 	county_name: Mapped[str] = mapped_column(String(100), nullable=False)
 	state: Mapped[str] = mapped_column(String(2), nullable=False)
+
+
+class UsAreaCodeTimezone(Base):
+	"""US NANP phone area code -> IANA timezone, used to compute quiet hours
+	(9pm-8am recipient local time, Week 1 Subtask 1.2.2). Representative
+	seed set, not the full ~300-code NANP list — an area code missing here
+	fails closed (SMS withheld) rather than assumed clear."""
+
+	__tablename__ = "us_area_code_timezones"
+
+	area_code: Mapped[str] = mapped_column(String(3), primary_key=True)
+	iana_timezone: Mapped[str] = mapped_column(String(50), nullable=False)
 
 
 class Client(Base):
@@ -210,6 +224,12 @@ class Company(Base):
 			name="ck_companies_entity_type",
 		),
 		Index("ix_companies_county_status", "county_slug", "status"),
+		# Week 1 Subtask 1.1.1's idx_companies_domain requirement — named
+		# explicitly. domain already carries a UNIQUE constraint (which
+		# creates its own index, companies_domain_key), but the sprint doc's
+		# DoD checks for this literal index name via \di, so it's declared
+		# separately rather than relying on the constraint's auto-named one.
+		Index("idx_companies_domain", "domain"),
 	)
 
 
@@ -230,7 +250,10 @@ class Contact(Base):
 
 	contact_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
 	company_id: Mapped[str] = mapped_column(
-		String(64), ForeignKey("companies.company_id"), nullable=False, index=True
+		String(64),
+		ForeignKey("companies.company_id", ondelete="CASCADE"),
+		nullable=False,
+		index=True,
 	)
 	contact_role_type: Mapped[str] = mapped_column(String(20), nullable=False)
 	first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -253,6 +276,11 @@ class Contact(Base):
 		DateTime(timezone=True), nullable=True
 	)
 	prospect_objections: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	# Week 1 Subtask 1.2.2 (Warm-Channel Waterfall) — literal field names from
+	# the master blueprint's CI-enforced predicate (§3.0.4): SMS eligibility
+	# requires inbound_sms_count > 0 OR booked_appointment_id IS NOT NULL.
+	booked_appointment_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	inbound_sms_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -273,6 +301,47 @@ class Contact(Base):
 		),
 		UniqueConstraint("company_id", "contact_role_type", name="uq_contacts_company_role"),
 		Index("ix_contacts_email", "email", unique=True, postgresql_where=(email.isnot(None))),
+		# Week 1 Subtask 1.1.1's idx_contacts_lookup requirement.
+		Index("idx_contacts_lookup", "email", "company_id", "compliance_eligibility"),
+	)
+
+
+class PmProfile(Base):
+	"""One operating profile per client company (Week 1, Subtask 1.1.1).
+
+	geographic_coverage_counties is an ARRAY of county_slug values, NOT the
+	blueprint's literal geographic_coverage_polygon JSONB lat/lng field — the
+	client's own correction ("the unit is the COUNTY... there is no metro
+	layer") makes territory a set of counties, not geographic coordinates.
+	County membership is validated app-side against counties.county_slug;
+	Postgres has no native FK-on-array-element constraint.
+
+	Tenant-scoped via the parent company's owning_client_id (join mode, same
+	as Contact) — see config/tenant_policies.py."""
+
+	__tablename__ = "pm_profiles"
+
+	profile_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	company_id: Mapped[str] = mapped_column(
+		String(64),
+		ForeignKey("companies.company_id", ondelete="CASCADE"),
+		nullable=False,
+		unique=True,
+	)
+	specialty_tags: Mapped[list] = mapped_column(ARRAY(Text), nullable=False, default=list)
+	languages_supported: Mapped[list] = mapped_column(
+		ARRAY(Text), nullable=False, default=lambda: ["English"]
+	)
+	asset_class_strengths: Mapped[list] = mapped_column(
+		ARRAY(Text), nullable=False, default=lambda: ["Single Family", "Small Multifamily"]
+	)
+	geographic_coverage_counties: Mapped[list] = mapped_column(ARRAY(String(60)), nullable=False, default=list)
+	historical_close_rate: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+	average_speed_to_lead_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+	show_rate_percentage: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False, default=0)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
 	)
 
 
@@ -389,7 +458,9 @@ class RawProspectContact(Base):
 		BigInteger, ForeignKey("raw_prospect_companies.id"), nullable=False, index=True
 	)
 	role: Mapped[str] = mapped_column(String(20), nullable=False)
-	name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+	first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	title: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
 	email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 	phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 	source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
@@ -429,6 +500,13 @@ class Event(Base):
 	__table_args__ = (
 		Index("ix_events_client_created", "client_id", "created_at"),
 		Index("ix_events_entity", "entity_type", "entity_id"),
+		# Named to satisfy Week 1 Subtask 1.1.1's idx_events_client_type
+		# requirement; columns are (client_id, event_type, created_at) — this
+		# schema uses created_at, not the blueprint's occurred_at (no such
+		# column exists here), and event_type/entity_type/entity_id are the
+		# generic polymorphic design kept from Week 0 (see plan doc's
+		# contradiction ledger, item 3).
+		Index("idx_events_client_type", "client_id", "event_type", "created_at"),
 	)
 
 
@@ -452,6 +530,43 @@ class ComplianceGateCheck(Base):
 
 	__table_args__ = (
 		CheckConstraint("status IN ('PASS','FAIL','ABSTAIN')", name="ck_compliance_gate_checks_status"),
+	)
+
+
+class SmsDispatchLog(Base):
+	"""DB-layer backstop of the three-layer cold-SMS block (Week 1 Subtask
+	1.2.3, master blueprint §3.1.2/§3.0.4). The CHECK constraint enforces
+	the same predicate as campaign_readiness_gate.is_engaged() directly at
+	the database engine, independent of the application-layer linter in
+	src/services/sms_dispatch.py. No SMS vendor is contracted yet (same
+	situation as the DNC vendor) — this table exists because neither the
+	blueprint nor the DoD gives a schema for "an outbound SMS record"."""
+
+	__tablename__ = "sms_dispatch_log"
+
+	dispatch_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	contact_id: Mapped[int] = mapped_column(
+		BigInteger, ForeignKey("contacts.contact_id"), nullable=False, index=True
+	)
+	inbound_sms_count_at_send: Mapped[int] = mapped_column(Integer, nullable=False)
+	booked_appointment_id_at_send: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	status: Mapped[str] = mapped_column(String(20), nullable=False, default="SENT")
+	provider_message_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	idempotency_key: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+	__table_args__ = (
+		CheckConstraint(
+			"status IN ('PENDING','SENT','FAILED','BLOCKED','UNKNOWN')", name="ck_sms_dispatch_log_status"
+		),
+		CheckConstraint(
+			"inbound_sms_count_at_send > 0 OR booked_appointment_id_at_send IS NOT NULL",
+			name="ck_sms_dispatch_log_not_cold",
+		),
+		UniqueConstraint("client_id", "idempotency_key", name="uq_sms_dispatch_log_client_idempotency_key"),
 	)
 
 
