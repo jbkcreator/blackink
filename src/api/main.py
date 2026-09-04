@@ -17,10 +17,15 @@ from fastapi import FastAPI
 
 from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
+from src.api.sandbox_router import router as sandbox_router
+from src.api.metrics_router import router as metrics_router
+from src.api.meetings_router import router as meetings_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
 
+
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # PR review finding: src.services.events._pending_buffer is process-local,
@@ -73,6 +78,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Blackink API", lifespan=lifespan)
 
 app.include_router(akrash_router)
+app.include_router(sandbox_router)
+app.include_router(metrics_router)
+app.include_router(meetings_router)
 
 
 @app.get("/healthz")
