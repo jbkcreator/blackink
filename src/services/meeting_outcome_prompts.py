@@ -104,17 +104,21 @@ def self_heal_blocked(session: Session) -> int:
 
 
 def claim_prompts(session: Session, *, claim_time: datetime, limit: int = 20) -> List[int]:
-	"""PENDING rows whose scheduled_for has arrived, plus claim-expired
-	SENDING rows (a worker that crashed mid-post). BLOCKED, SKIPPED,
-	CANCELLED, EXPIRED and SENT are never reclaimed — a BLOCKED row only
-	returns to PENDING via self_heal_blocked()."""
+	"""PENDING rows whose scheduled_for has arrived AND whose retry backoff
+	(next_retry_at) has elapsed, plus claim-expired SENDING rows (a worker
+	that crashed mid-post). BLOCKED, SKIPPED, CANCELLED, EXPIRED and SENT are
+	never reclaimed — a BLOCKED row only returns to PENDING via
+	self_heal_blocked(). A transient Slack post failure re-queues the row as
+	PENDING with a next_retry_at backoff (see post_prompt), so it is picked up
+	again here rather than stranded — the reason next_retry_at is honored."""
 	rows = session.execute(
 		text(
 			f"""
 			UPDATE meeting_outcome_prompt_jobs SET status = 'SENDING', claimed_at = :claim_time
 			WHERE prompt_job_id IN (
 				SELECT prompt_job_id FROM meeting_outcome_prompt_jobs
-				WHERE (status = 'PENDING' AND scheduled_for <= :claim_time)
+				WHERE (status = 'PENDING' AND scheduled_for <= :claim_time
+				       AND (next_retry_at IS NULL OR next_retry_at <= :claim_time))
 				   OR (status = 'SENDING' AND claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
 				ORDER BY prompt_job_id FOR UPDATE SKIP LOCKED LIMIT :limit
 			)
@@ -126,6 +130,12 @@ def claim_prompts(session: Session, *, claim_time: datetime, limit: int = 20) ->
 	return [r.prompt_job_id for r in rows]
 
 
+# A transient Slack failure is retried this many times (bounded exponential
+# backoff) before the job is marked terminally FAILED. Comfortably covers a
+# short Slack outage without retrying forever.
+_MAX_POST_ATTEMPTS = 5
+
+
 def _mark(session: Session, prompt_job_id: int, status: str, *, error: Optional[str] = None) -> None:
 	session.execute(
 		text(
@@ -133,6 +143,32 @@ def _mark(session: Session, prompt_job_id: int, status: str, *, error: Optional[
 			"updated_at = NOW() WHERE prompt_job_id = :id"
 		),
 		{"status": status, "error": error, "id": prompt_job_id},
+	)
+
+
+def _mark_post_failure(session: Session, prompt_job_id: int, attempts: int, error: str) -> None:
+	"""A Slack post failed. If the bounded attempt budget is exhausted, mark
+	terminally FAILED; otherwise re-queue as PENDING with an exponential
+	backoff so a later sweep retries — a transient Slack outage must not
+	permanently strand the closer's card."""
+	next_attempts = attempts + 1
+	if next_attempts >= _MAX_POST_ATTEMPTS:
+		session.execute(
+			text(
+				"UPDATE meeting_outcome_prompt_jobs SET status = 'FAILED', attempts = :n, "
+				"last_error = :err, updated_at = NOW() WHERE prompt_job_id = :id"
+			),
+			{"n": next_attempts, "err": error, "id": prompt_job_id},
+		)
+		return
+	backoff_minutes = 2 ** next_attempts
+	session.execute(
+		text(
+			"UPDATE meeting_outcome_prompt_jobs SET status = 'PENDING', attempts = :n, "
+			"last_error = :err, next_retry_at = NOW() + (:mins || ' minutes')::interval, "
+			"updated_at = NOW() WHERE prompt_job_id = :id"
+		),
+		{"n": next_attempts, "err": error, "mins": str(backoff_minutes), "id": prompt_job_id},
 	)
 
 
@@ -192,7 +228,7 @@ async def post_prompt(session: Session, prompt_job_id: int, *, as_of: datetime) 
 	the rep mapping can all have moved since the row was scheduled."""
 	job = session.execute(
 		text(
-			"SELECT j.prompt_job_id, j.booking_id, j.scheduled_for, b.client_id, b.event_status, "
+			"SELECT j.prompt_job_id, j.booking_id, j.scheduled_for, j.attempts, b.client_id, b.event_status, "
 			"b.scheduled_at, b.target_contact_id, b.target_company_id, b.client_rep_email, "
 			"b.calendar_connection_id, cc.rep_slack_user_id, c.first_name, c.last_name, co.company_name "
 			"FROM meeting_outcome_prompt_jobs j "
@@ -302,7 +338,10 @@ async def post_prompt(session: Session, prompt_job_id: int, *, as_of: datetime) 
 		),
 	)
 	if posted is None:
-		_mark(session, prompt_job_id, "FAILED", error="Slack post failed or unconfigured")
+		# Transient Slack failure (API/channel/config hiccup) — re-queue with a
+		# bounded backoff rather than terminally FAILED on the first miss, so a
+		# short outage at meeting time doesn't permanently strand the card.
+		_mark_post_failure(session, prompt_job_id, job.attempts, "Slack post failed or unconfigured")
 		return
 
 	wo.set_slack_message(

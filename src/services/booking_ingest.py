@@ -452,13 +452,17 @@ def schedule_meeting_outcome_prompt(
 	as_of = as_of or datetime.now(timezone.utc)
 
 	if new_event_status == "CANCELLED":
-		# No outcome prompt for a meeting that never happened. Same
-		# status set as the two siblings: a SENT card is left alone (it's
-		# already in the channel; its own 24h expiry closes it out).
+		# No outcome prompt for a meeting that never happened — and a card
+		# ALREADY posted (SENT) must be invalidated too, not left live for its
+		# 24h TTL: otherwise a booking cancelled after its card was posted
+		# could still be clicked and submitted as attended/no-show. The job
+		# goes CANCELLED here; the click and submit handlers additionally
+		# re-check the booking's live status, so the already-posted Slack card
+		# becomes inert the moment it's used.
 		session.execute(
 			text(
 				"UPDATE meeting_outcome_prompt_jobs SET status = 'CANCELLED', updated_at = NOW() "
-				"WHERE booking_id = :bid AND status IN ('PENDING', 'BLOCKED', 'SENDING')"
+				"WHERE booking_id = :bid AND status IN ('PENDING', 'BLOCKED', 'SENDING', 'SENT')"
 			),
 			{"bid": booking_id},
 		)

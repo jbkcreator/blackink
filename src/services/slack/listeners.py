@@ -51,6 +51,7 @@ from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
 from src.services.slack.bolt_app import get_listener_app
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -615,7 +616,14 @@ async def handle_mark_no_show(ack, body, respond, action):
 			await respond(response_type="ephemeral", text=":information_source: Already marked no-show by someone else.")
 			return
 
-		trigger_recovery(session, booking_id=booking_id, submitted_by=f"slack:{user_id}")
+		try:
+			trigger_recovery(session, booking_id=booking_id, submitted_by=f"slack:{user_id}")
+		except IntegrityError:
+			# Lost the race to a concurrent submit (this surface or the setter-
+			# channel outcome modal) between already_recorded() and the insert —
+			# the unique meeting-outcome index caught the duplicate. Not an error.
+			await respond(response_type="ephemeral", text=":information_source: Already marked no-show by someone else.")
+			return
 
 	await respond(response_type="in_channel", text=f":x: Marked no-show for booking `{booking_id}` by <@{user_id}> — recovery email enqueued.")
 
@@ -634,6 +642,19 @@ _ATTENDANCE_OPTIONS = [
 	("RESCHEDULED", "Rescheduled"),
 	("CANCELLED", "Cancelled"),
 ]
+_ATTENDANCE_VALUES = frozenset(v for v, _ in _ATTENDANCE_OPTIONS)
+
+
+def _booking_is_cancelled(session, booking_id) -> bool:
+	"""Live booking-status read shared by the click and submit paths — a
+	booking cancelled after its card was posted must be rejected in both."""
+	if booking_id is None:
+		return False
+	row = session.execute(
+		text("SELECT event_status FROM bookings WHERE booking_id = :bid"),
+		{"bid": booking_id},
+	).first()
+	return row is None or row.event_status == "CANCELLED"
 
 
 def _meeting_outcome_expired(order: "wo.WorkOrder", *, now: datetime) -> bool:
@@ -766,6 +787,14 @@ async def handle_log_meeting_outcome(ack, body, respond, action, client):
 		return
 
 	payload = order.payload or {}
+
+	# Live cancellation re-check before opening the modal — a booking cancelled
+	# after this card was posted must not even present a form to fill in.
+	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
+		if _booking_is_cancelled(session, payload.get("booking_id")):
+			await respond(response_type="ephemeral", text=":information_source: This meeting was cancelled — no outcome can be logged.")
+			return
+
 	private_metadata = json.dumps(
 		{
 			"client_id": order.client_id,
@@ -856,46 +885,71 @@ async def handle_meeting_outcome_submit(ack, body, view):
 		return
 
 	attendance_status = _modal_value(view, "attendance_block", "attendance_status")
+	if attendance_status not in _ATTENDANCE_VALUES:
+		# Validated before any write so a bad value can never leave a claimed
+		# work order behind (record_meeting_outcome would otherwise raise after
+		# the claim). Normally unreachable — the modal is a constrained select.
+		await ack(response_action="errors", errors={"attendance_block": "Invalid outcome — pick one of the listed options."})
+		return
 	pm_software = _modal_value(view, "pm_software_block", "pm_software_stated") or None
 	objections = _modal_value(view, "objections_block", "objections_stated") or None
 	next_action = _modal_value(view, "next_action_block", "next_action") or None
 
 	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
+		# Live cancellation re-check: a booking cancelled AFTER its card was
+		# posted must not still be recordable. The card's hash/expiry/status all
+		# still look valid, so this is the only guard that catches it.
+		if _booking_is_cancelled(session, booking_id):
+			await ack(response_action="errors", errors={"attendance_block": "This meeting was cancelled — no outcome can be logged."})
+			return
+
 		# A NO_SHOW may already have been logged from the #blackink-command
-		# "Mark No-Show" card — the two surfaces log the same meeting, and
-		# whichever fires first closes the question.
+		# "Mark No-Show" card — the two surfaces log the same meeting.
 		if booking_id is not None and outcome_recorded_for_booking(session, booking_id):
 			await ack(response_action="errors", errors={"attendance_block": "An outcome was already logged for this meeting."})
 			return
 
-		try:
-			record_meeting_outcome(
-				session,
-				MeetingOutcomeRecord(
-					client_id=_INTERNAL_SALES_CLIENT_ID,
-					contact_id=contact_id,
-					company_id=company_id,
-					meeting_occurred_at=meeting_occurred_at,
-					attendance_status=attendance_status,
-					pm_software_stated=pm_software,
-					door_count_stated=door_count,
-					objections_stated=objections,
-					next_action=next_action,
-					submitted_by=f"slack:{user_id}",
-				),
-			)
-		except ValueError:
-			await ack(response_action="errors", errors={"attendance_block": "Invalid outcome — pick one of the listed options."})
-			return
-
-		session.execute(
+		# Atomically CLAIM the work order before inserting the outcome — this is
+		# the concurrency gate for two simultaneous submissions of the SAME
+		# card: only one UPDATE ... WHERE status='QUEUED' can win (row lock
+		# serializes them), and the loser records nothing.
+		claimed = session.execute(
 			text(
 				"UPDATE agent_work_orders SET status = 'DONE', decided_by = :decided_by, "
 				"decided_at = NOW(), updated_at = NOW() "
-				"WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED'"
+				"WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED' "
+				"RETURNING action_id"
 			),
 			{"decided_by": f"slack:{user_id}", "action_id": action_id, "client_id": client_id},
-		)
+		).first()
+		if claimed is None:
+			await ack(response_action="errors", errors={"attendance_block": "An outcome was already logged for this meeting."})
+			return
+
+		try:
+			# Savepoint so the unique-index backstop (a cross-surface race with
+			# the no-show click, which has no work order to gate it) rolls back
+			# only the failed insert — the work-order claim above still commits,
+			# leaving the card correctly resolved.
+			with session.begin_nested():
+				record_meeting_outcome(
+					session,
+					MeetingOutcomeRecord(
+						client_id=_INTERNAL_SALES_CLIENT_ID,
+						contact_id=contact_id,
+						company_id=company_id,
+						meeting_occurred_at=meeting_occurred_at,
+						attendance_status=attendance_status,
+						pm_software_stated=pm_software,
+						door_count_stated=door_count,
+						objections_stated=objections,
+						next_action=next_action,
+						submitted_by=f"slack:{user_id}",
+					),
+				)
+		except IntegrityError:
+			await ack(response_action="errors", errors={"attendance_block": "An outcome was already logged for this meeting."})
+			return
 
 	await ack()
 

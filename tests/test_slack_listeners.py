@@ -574,6 +574,9 @@ async def test_log_outcome_opens_modal_for_assigned_closer(monkeypatch):
 	order = _outcome_order()
 	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
 	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	# The click handler now does a live booking-cancel re-check before opening
+	# the modal; this pure-unit test has no real booking, so stub it not-cancelled.
+	monkeypatch.setattr(listeners, "_booking_is_cancelled", lambda session, booking_id: False)
 	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
 	body = {"user": {"id": "U1"}, "trigger_id": "trg-1"}
 	action = {"action_id": "log_meeting_outcome", "value": json.dumps(_outcome_button_value(order))}

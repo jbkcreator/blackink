@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy import text
 
-from src.core.database import get_owner_db_context, get_system_db_context
+from src.core.database import get_db_context, get_owner_db_context, get_system_db_context
 from src.services import work_orders as wo
 from src.services.booking_ingest import schedule_meeting_outcome_prompt
 from src.services.meeting_outcome_prompts import (
@@ -515,3 +515,139 @@ def test_post_prompt_blocked_when_email_unresolvable_and_no_column(sales_demo):
 	row = _job_status(sales_demo["prompt_job_id"])
 	assert row.status == "BLOCKED"
 	assert row.last_error == "MISSING_REP_SLACK_USER_ID"
+
+
+# ── Review PR #22: concurrency, retry, and post-cancel rejection ────────
+
+def _attempts_and_retry(prompt_job_id):
+	with get_system_db_context() as session:
+		return session.execute(text(
+			"SELECT status, attempts, next_retry_at FROM meeting_outcome_prompt_jobs WHERE prompt_job_id = :id"
+		), {"id": prompt_job_id}).one()
+
+
+def _outcome_count(contact_id):
+	with get_owner_db_context() as session:
+		return session.execute(text(
+			"SELECT COUNT(*) FROM meeting_outcomes WHERE contact_id = :c"
+		), {"c": contact_id}).scalar()
+
+
+def _submit_meta(order, sales_demo):
+	return json.dumps({
+		"client_id": order.client_id, "action_id": order.action_id,
+		"payload_hash": payload_hash.compute(order),
+		"booking_id": sales_demo["booking_id"], "contact_id": sales_demo["contact_id"],
+		"company_id": sales_demo["company_id"],
+		"meeting_occurred_at": sales_demo["scheduled_at"].isoformat(),
+		"channel_id": order.slack_channel_id, "message_ts": order.slack_message_ts,
+	})
+
+
+# Finding 1 — exactly one outcome even when the card is submitted twice.
+
+def test_second_submit_of_same_card_records_no_duplicate(sales_demo):
+	import asyncio
+	from src.services.slack import listeners
+
+	order = _posted_order(sales_demo)
+	meta = _submit_meta(order, sales_demo)
+	body = {"user": {"id": _REP}}
+
+	with patch.object(listeners, "approver_authorized", lambda user_id, client_id=None: True), \
+	     patch.object(listeners.post, "update_card", AsyncMock(return_value=True)), \
+	     patch.object(listeners, "_log_event", lambda *a, **k: None):
+		asyncio.run(listeners.handle_meeting_outcome_submit(AsyncMock(), body, _submit_view(order, private_meta=meta)))
+		# The work order is now DONE; a second submit must be rejected by the
+		# atomic claim (WHERE status='QUEUED'), recording nothing more.
+		ack2 = AsyncMock()
+		asyncio.run(listeners.handle_meeting_outcome_submit(ack2, body, _submit_view(order, private_meta=meta)))
+
+	assert ack2.await_args.kwargs.get("response_action") == "errors"
+	assert _outcome_count(sales_demo["contact_id"]) == 1
+
+
+def test_unique_index_blocks_duplicate_outcome_insert(sales_demo):
+	"""The DB backstop: a second insert for the same (contact_id,
+	meeting_occurred_at) raises IntegrityError regardless of the app path."""
+	from sqlalchemy.exc import IntegrityError
+	from src.services.meeting_outcomes import MeetingOutcomeRecord, record_meeting_outcome
+	rec = MeetingOutcomeRecord(
+		client_id=_BLACKINK_INTERNAL_SALES, contact_id=sales_demo["contact_id"],
+		company_id=sales_demo["company_id"], meeting_occurred_at=sales_demo["scheduled_at"],
+		attendance_status="ATTENDED",
+	)
+	with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+		record_meeting_outcome(session, rec)
+	with pytest.raises(IntegrityError):
+		with get_db_context(client_id=_BLACKINK_INTERNAL_SALES) as session:
+			record_meeting_outcome(session, rec)
+
+
+# Finding 2 — a transient Slack post failure is retried, not stranded.
+
+def test_transient_post_failure_requeues_with_backoff_then_succeeds(sales_demo):
+	import asyncio
+	# First post attempt fails (Slack unconfigured/outage) -> back to PENDING.
+	with patch("src.services.meeting_outcome_prompts.post.post_action_card", AsyncMock(return_value=None)):
+		with get_system_db_context() as session:
+			asyncio.run(post_prompt(session, sales_demo["prompt_job_id"], as_of=datetime.now(timezone.utc)))
+	r = _attempts_and_retry(sales_demo["prompt_job_id"])
+	assert r.status == "PENDING", "a transient post failure must not be terminal"
+	assert r.attempts == 1
+	assert r.next_retry_at is not None
+
+	# Clear the backoff and let a later sweep post successfully.
+	with get_system_db_context() as session:
+		session.execute(text("UPDATE meeting_outcome_prompt_jobs SET next_retry_at = NULL WHERE prompt_job_id = :id"),
+						{"id": sales_demo["prompt_job_id"]})
+	with patch("src.services.meeting_outcome_prompts.post.post_action_card",
+			   AsyncMock(return_value={"channel_id": "C", "message_ts": "1.1"})):
+		with get_system_db_context() as session:
+			asyncio.run(post_prompt(session, sales_demo["prompt_job_id"], as_of=datetime.now(timezone.utc)))
+	assert _attempts_and_retry(sales_demo["prompt_job_id"]).status == "SENT"
+
+
+def test_post_failure_becomes_terminal_after_max_attempts(sales_demo):
+	import asyncio
+	from src.services.meeting_outcome_prompts import _MAX_POST_ATTEMPTS
+	with get_system_db_context() as session:
+		session.execute(text("UPDATE meeting_outcome_prompt_jobs SET attempts = :n WHERE prompt_job_id = :id"),
+						{"n": _MAX_POST_ATTEMPTS - 1, "id": sales_demo["prompt_job_id"]})
+	with patch("src.services.meeting_outcome_prompts.post.post_action_card", AsyncMock(return_value=None)):
+		with get_system_db_context() as session:
+			asyncio.run(post_prompt(session, sales_demo["prompt_job_id"], as_of=datetime.now(timezone.utc)))
+	assert _attempts_and_retry(sales_demo["prompt_job_id"]).status == "FAILED"
+
+
+# Finding 3 — a booking cancelled after its card was posted is rejected.
+
+def test_cancel_marks_a_sent_job_cancelled(sales_demo):
+	# Drive the job to SENT first, then cancel.
+	_posted_order(sales_demo)
+	assert _job_status(sales_demo["prompt_job_id"]).status == "SENT"
+	with get_system_db_context() as session:
+		schedule_meeting_outcome_prompt(
+			session, client_id=_BLACKINK_INTERNAL_SALES, booking_id=sales_demo["booking_id"],
+			old_event_status="CONFIRMED", old_scheduled_at=None,
+			new_event_status="CANCELLED", new_scheduled_at=None,
+		)
+	assert _job_status(sales_demo["prompt_job_id"]).status == "CANCELLED"
+
+
+def test_submit_rejected_after_booking_cancelled(sales_demo):
+	import asyncio
+	from src.services.slack import listeners
+	order = _posted_order(sales_demo)
+	meta = _submit_meta(order, sales_demo)
+	with get_system_db_context() as session:
+		session.execute(text("UPDATE bookings SET event_status = 'CANCELLED' WHERE booking_id = :b"),
+						{"b": sales_demo["booking_id"]})
+	ack = AsyncMock()
+	with patch.object(listeners, "approver_authorized", lambda user_id, client_id=None: True):
+		asyncio.run(listeners.handle_meeting_outcome_submit(ack, {"user": {"id": _REP}}, _submit_view(order, private_meta=meta)))
+	assert ack.await_args.kwargs.get("response_action") == "errors"
+	assert "cancelled" in str(ack.await_args.kwargs["errors"]).lower()
+	assert _outcome_count(sales_demo["contact_id"]) == 0
+	# work order untouched
+	assert wo.get(_BLACKINK_INTERNAL_SALES, order.action_id).status == "QUEUED"

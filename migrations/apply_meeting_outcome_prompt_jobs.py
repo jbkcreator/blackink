@@ -79,6 +79,28 @@ DDL = [
 		)
 	)
 	""",
+	# Retry accounting for transient Slack post failures — a temporary Slack
+	# outage at meeting time must NOT permanently strand the card. post_prompt()
+	# re-queues a failed post with a bounded exponential backoff (attempts /
+	# next_retry_at) rather than marking it terminally FAILED on the first miss.
+	"ALTER TABLE meeting_outcome_prompt_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
+	"ALTER TABLE meeting_outcome_prompt_jobs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ",
+
+	# Database-level idempotency backstop for meeting_outcomes: exactly one
+	# outcome per meeting. A meeting is identified by (contact_id,
+	# meeting_occurred_at) — a contact cannot be in two meetings at the same
+	# instant — which is also the pair booking-linked lookups already key on
+	# (bookings.target_contact_id + bookings.scheduled_at). Without this, two
+	# concurrent modal submissions (or a modal submit racing a "Mark No-Show"
+	# click on the same meeting) can both pass the app-level "already recorded?"
+	# check and insert duplicate, possibly-conflicting outcome rows. The app
+	# layer now also claims the work order atomically before inserting, but this
+	# constraint is the last line that holds regardless of how the write was
+	# issued. CREATE UNIQUE INDEX IF NOT EXISTS is the idempotent form (Postgres
+	# has no ADD CONSTRAINT IF NOT EXISTS).
+	"CREATE UNIQUE INDEX IF NOT EXISTS uq_meeting_outcomes_contact_meeting "
+	"ON meeting_outcomes (contact_id, meeting_occurred_at)",
+
 	"CREATE INDEX IF NOT EXISTS ix_meeting_outcome_prompt_jobs_booking ON meeting_outcome_prompt_jobs (booking_id)",
 	"CREATE INDEX IF NOT EXISTS ix_meeting_outcome_prompt_jobs_status ON meeting_outcome_prompt_jobs (status)",
 	# Supports the 4h-ping / 24h-expiry sweep over already-posted cards.
