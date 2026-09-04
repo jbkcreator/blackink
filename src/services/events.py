@@ -175,3 +175,44 @@ def flush_pending() -> int:
 			still_pending.append(event)
 	_pending_buffer[:] = still_pending
 	return flushed
+
+
+def log_touch_dispatched(
+	session: Session,
+	client_id: str,
+	contact_id: int,
+	touch_step: int,
+	dispatch_id: str,
+	mailbox_id: int,
+	sending_domain: str,
+	template_version: str,
+	recipient_email: str,
+) -> None:
+	"""Log an outbound_touch_dispatched event via log_event() — the single
+	write path (see module docstring). entity is the contact
+	(entity_type='contact', entity_id=contact_id) and actor is
+	'cold_outbound_sequencer' per wayfinder ticket 03. dispatch_id rides
+	along in the payload as a non-required extra field for traceability
+	back to the sequence_touch_dispatches row that produced this event."""
+	payload = {
+		"touch_step": touch_step,
+		"channel": "email",
+		"recipient_email": recipient_email,
+		"dispatch_id": dispatch_id,
+		"mailbox_id": mailbox_id,
+		"sending_domain": sending_domain,
+		"template_version": template_version,
+	}
+	log_event(
+		client_id,
+		"outbound_touch_dispatched",
+		entity_type="contact",
+		entity_id=str(contact_id),
+		payload=payload,
+		actor="cold_outbound_sequencer",
+		session=session,
+	)
+	logger.info(
+		"events: outbound_touch_dispatched client=%s contact=%s touch=%d dispatch=%s",
+		client_id, contact_id, touch_step, dispatch_id,
+	)

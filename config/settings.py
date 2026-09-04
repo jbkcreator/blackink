@@ -33,7 +33,16 @@ class AppSettings(BaseSettings):
 	)
 
 	debug: bool = Field(default=True, env="DEBUG")
+	# Deployment environment. Anything other than "development"/"test" is treated
+	# as production for fail-closed guards (e.g. the email sender must not fall
+	# back to the transmit-nothing stub in production). Default is development so
+	# local dev and CI stay convenient; production must set ENVIRONMENT=production.
+	environment: str = Field(default="development", env="ENVIRONMENT")
 	app_base_url: str = Field(default="http://localhost:8000", env="APP_BASE_URL")
+
+	@property
+	def is_production(self) -> bool:
+		return (self.environment or "development").strip().lower() not in {"development", "dev", "test", "testing", "local"}
 
 	# ── Database ─────────────────────────────────────────────────────────────
 	# Generic fallback DSN (used by tooling/tests that don't care which role).
@@ -88,6 +97,28 @@ class AppSettings(BaseSettings):
 	deliverability_spam_complaint_threshold_pct: float = Field(
 		default=0.08, env="DELIVERABILITY_SPAM_COMPLAINT_THRESHOLD_PCT"
 	)
+
+	# ── Outbound email (SMTP per warmed mailbox — wayfinder ticket 05) ────────
+	# When smtp_host + smtp_password are set, build_email_sender() returns a real
+	# SmtpEmailSender; otherwise it falls back to the StubEmailSender (mints a
+	# Message-ID, transmits nothing). Per blueprint §475/§853 mailboxes are
+	# warmed Google Workspace / Outlook (smtp.gmail.com:587 / smtp.office365.com:587).
+	# smtp_username defaults to the sending mailbox address at send time; set it
+	# only if the SMTP login differs from the From address.
+	# Sender selection guard (review finding #2). "auto" (default) uses the real
+	# SmtpEmailSender when SMTP is configured, else the StubEmailSender — the
+	# convenient dev/test behaviour. "smtp" is fail-closed: build_email_sender()
+	# raises if SMTP is not configured, so a mis-deployed production box cannot
+	# silently record undelivered mail as SENT. "stub" always uses the stub.
+	email_sender_mode: str = Field(default="auto", env="EMAIL_SENDER_MODE")
+	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
+	smtp_port: int = Field(default=587, env="SMTP_PORT")
+	smtp_use_tls: bool = Field(default=True, env="SMTP_USE_TLS")
+	smtp_username: Optional[str] = Field(default=None, env="SMTP_USERNAME")
+	smtp_password: Optional[SecretStr] = Field(default=None, env="SMTP_PASSWORD")
+	# §768: Reply-To points at the client's own inbox; every send is BCC'd.
+	email_reply_to: Optional[str] = Field(default=None, env="EMAIL_REPLY_TO")
+	email_bcc: Optional[str] = Field(default=None, env="EMAIL_BCC")
 
 	# ── Slack ────────────────────────────────────────────────────────────────
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")

@@ -87,12 +87,15 @@ def _quarantine_and_swap(session: Session, domain_row, trip: Trip) -> None:
 		},
 	)
 
+	# Reserve domains have cluster_label IS NULL in the current inventory —
+	# they are global, not cluster-bound. Filtering by cluster would match
+	# nothing and silently skip promotion every time. Pick any available reserve.
 	reserve = session.execute(
 		text(
-			"SELECT id FROM sending_domains WHERE cluster_label = :cluster AND is_reserve = TRUE "
+			"SELECT id FROM sending_domains WHERE is_reserve = TRUE "
 			"AND quarantine_state = 'reserve' LIMIT 1 FOR UPDATE SKIP LOCKED"
 		),
-		{"cluster": domain_row.cluster_label},
+		{},
 	).fetchone()
 
 	if reserve is not None:

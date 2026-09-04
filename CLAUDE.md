@@ -34,9 +34,12 @@ PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
 PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
+PYTHONPATH=. python migrations/apply_mailbox_last_used.py    # adds mailboxes.last_used_at (LRU rotation) — after sending_domains
 PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
 PYTHONPATH=. python migrations/apply_meeting_outcomes.py
 PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
+PYTHONPATH=. python migrations/apply_sequence_runs.py       # Dev 3 — after agent_work_orders
+PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py  # Dev 3 — after sequence_runs
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -45,6 +48,8 @@ python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
 python -m src.tasks.hunter_nightly_sweep
+python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
+python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most

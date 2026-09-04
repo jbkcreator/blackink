@@ -64,9 +64,12 @@ jobs:
           PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
           PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
           PYTHONPATH=. python migrations/apply_sending_domains.py
+          PYTHONPATH=. python migrations/apply_mailbox_last_used.py
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_meeting_outcomes.py
           PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
+          PYTHONPATH=. python migrations/apply_sequence_runs.py
+          PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       - name: Run tenant leakage suite
         run: PYTHONPATH=. pytest tests/test_tenant_isolation.py -v

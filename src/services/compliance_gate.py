@@ -131,7 +131,8 @@ def _check_dnc(contact, dnc_provider: DncProvider) -> GateCheckResult:
 		# Live check: unchecked contact needs a fresh lookup, not an
 		# automatic ABSTAIN, so the gate can actually clear a new contact.
 		if not contact.phone:
-			return GateCheckResult("dnc_clean", ABSTAIN, "no phone on file to check")
+			# No phone means the DNC registry has nothing to say — not a hit.
+			return GateCheckResult("dnc_clean", PASS, "no phone on file — DNC registry not applicable")
 		result = dnc_provider.check(contact.phone)
 		if result is None:
 			return GateCheckResult("dnc_clean", ABSTAIN, "DNC check returned unknown (no vendor / lookup failed)")
@@ -177,16 +178,19 @@ def _check_non_poach(session: Session, company_id: str) -> GateCheckResult:
 	return GateCheckResult("non_poach", PASS, "no conflicting claim found")
 
 
-def evaluate_compliance_gate(
+def evaluate_enrollment_gate(
 	session: Session,
 	contact,
 	requesting_client_id: str,
 	dnc_provider: Optional[DncProvider] = None,
 	email_provider: Optional[EmailVerificationProvider] = None,
 ) -> ComplianceGateResult:
-	"""Evaluate every gate predicate for a contact, persist each result to
-	compliance_gate_checks (not committed — caller owns the transaction),
-	and return the aggregate result."""
+	"""Full gate for enrolling a contact into a new sequence.
+
+	Includes the 14-day cross-enrollment cooldown — this is the per-enrollment
+	fatigue guard that prevents re-enrolling a recently-touched contact across
+	campaigns. Does NOT run mid-sequence (use evaluate_touch_gate for that).
+	"""
 	dnc_provider = dnc_provider or StubDncProvider()
 
 	checks = (
@@ -200,3 +204,45 @@ def evaluate_compliance_gate(
 		_record(session, contact.contact_id, requesting_client_id, check)
 
 	return ComplianceGateResult(contact_id=contact.contact_id, checks=checks)
+
+
+def evaluate_touch_gate(
+	session: Session,
+	contact,
+	requesting_client_id: str,
+	dnc_provider: Optional[DncProvider] = None,
+	email_provider: Optional[EmailVerificationProvider] = None,
+) -> ComplianceGateResult:
+	"""Per-touch gate for a contact already enrolled in an active sequence.
+
+	Omits the 14-day cooldown — a contact in an active sequence must not be
+	blocked by the cross-enrollment fatigue guard mid-flight. All other checks
+	(eligibility, DNC, non-poach) still run on every touch.
+	"""
+	dnc_provider = dnc_provider or StubDncProvider()
+
+	checks = (
+		_check_deterministic_columns(contact),
+		_check_dnc(contact, dnc_provider),
+		_check_non_poach(session, contact.company_id),
+	)
+
+	for check in checks:
+		_record(session, contact.contact_id, requesting_client_id, check)
+
+	return ComplianceGateResult(contact_id=contact.contact_id, checks=checks)
+
+
+def evaluate_compliance_gate(
+	session: Session,
+	contact,
+	requesting_client_id: str,
+	dnc_provider: Optional[DncProvider] = None,
+	email_provider: Optional[EmailVerificationProvider] = None,
+) -> ComplianceGateResult:
+	"""Shim — delegates to evaluate_enrollment_gate. Kept for backward compat."""
+	return evaluate_enrollment_gate(
+		session, contact, requesting_client_id,
+		dnc_provider=dnc_provider,
+		email_provider=email_provider,
+	)

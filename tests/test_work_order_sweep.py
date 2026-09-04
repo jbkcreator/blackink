@@ -91,3 +91,60 @@ def test_reclaimed_orders_are_dispatched_on_the_same_sweep(monkeypatch):
 
 	assert runner.cmd_sweep("acme_pm") == 0
 	assert results == [(order.action_id, True)]
+
+
+def _fail_order():
+	from types import SimpleNamespace
+
+	return SimpleNamespace(
+		action_id="fail1",
+		client_id="acme_pm",
+		action_class="DISPATCH_EMAIL_TOUCH",
+		config_fingerprint={"channel": "setter"},
+	)
+
+
+@pytest.mark.parametrize("outcome", ["SEND_FAILED", "NO_CONTENT", "RECLAIMED"])
+def test_failed_dispatch_outcomes_do_not_become_done(monkeypatch, outcome):
+	"""Finding #3: a dispatcher receipt carrying fail=True must finalise the
+	work order as FAILED (success=False), never silently as DONE."""
+	order = _fail_order()
+
+	monkeypatch.setattr(runner.halt_service, "is_halted", lambda client_id=None: False)
+	monkeypatch.setattr(runner.wo, "requeue_due_snoozed", lambda cid: [])
+	monkeypatch.setattr(runner.wo, "reclaim_stale_executing", lambda cid: [])
+	monkeypatch.setattr(runner.wo, "approved_batch", lambda cid: [order])
+	monkeypatch.setattr(runner.wo, "claim_for_execution", lambda cid, aid: order)
+	# The dispatcher signals failure via receipt["fail"].
+	monkeypatch.setattr(runner, "DISPATCHERS", {"setter": lambda o: {"outcome": outcome, "fail": True}})
+
+	results = []
+	monkeypatch.setattr(
+		runner.wo, "record_execution_result",
+		lambda cid, aid, *, success, receipt, error=None: (results.append((aid, success)), order)[1],
+	)
+
+	assert runner.cmd_sweep("acme_pm") == 0
+	assert results == [(order.action_id, False)]
+
+
+def test_defer_outcome_snoozes_not_done(monkeypatch):
+	"""Finding #3 corollary: transient availability defers (SNOOZE), not DONE."""
+	order = _fail_order()
+
+	monkeypatch.setattr(runner.halt_service, "is_halted", lambda client_id=None: False)
+	monkeypatch.setattr(runner.wo, "requeue_due_snoozed", lambda cid: [])
+	monkeypatch.setattr(runner.wo, "reclaim_stale_executing", lambda cid: [])
+	monkeypatch.setattr(runner.wo, "approved_batch", lambda cid: [order])
+	monkeypatch.setattr(runner.wo, "claim_for_execution", lambda cid, aid: order)
+	monkeypatch.setattr(runner, "DISPATCHERS", {"setter": lambda o: {"outcome": "VOLUME_CAP", "defer": True}})
+
+	deferred = []
+	monkeypatch.setattr(runner.wo, "defer_execution", lambda cid, aid, *, until: (deferred.append(aid), order)[1])
+	monkeypatch.setattr(
+		runner.wo, "record_execution_result",
+		lambda cid, aid, *, success, receipt, error=None: pytest.fail("must not finalise a deferred order"),
+	)
+
+	assert runner.cmd_sweep("acme_pm") == 0
+	assert deferred == [order.action_id]

@@ -148,7 +148,21 @@ def _card_button_blocks(order: "wo.WorkOrder") -> list:
 
 
 def _card_text(order: "wo.WorkOrder") -> str:
-	subject = order.payload.get("subject") if isinstance(order.payload, dict) else None
+	payload = order.payload if isinstance(order.payload, dict) else {}
+
+	if order.action_class == "DISPATCH_EMAIL_TOUCH":
+		touch_step = payload.get("touch_step", "?")
+		run_id_short = str(payload.get("run_id", ""))[:8]
+		subject = payload.get("subject") or f"Touch {touch_step} — cold outreach sequence"
+		body_preview = payload.get("body_preview") or "(email copy generated at send time — placeholder pending Dev 2 assets)"
+		return (
+			f"*Email Touch {touch_step}* (`{order.action_id[:8]}`) — run `{run_id_short}`\n"
+			f"To: `{order.recipient or 'n/a'}`\n"
+			f"Subject: _{subject}_\n"
+			f"{body_preview}"
+		)
+
+	subject = payload.get("subject")
 	preview = subject or str(order.payload)[:120]
 	return (
 		f"*{order.action_class}* (`{order.action_id[:8]}`)\n"
@@ -170,7 +184,45 @@ async def post_work_order_card(order: "wo.WorkOrder", *, channel_key: str) -> Op
 	return order
 
 
+def _email_touch_content_blocks(order: "wo.WorkOrder") -> list:
+	"""Rich Block Kit layout for a DISPATCH_EMAIL_TOUCH approval card: a header,
+	a To/Touch fields row, the subject, a blockquoted body preview, and a
+	context line for the attachment + run/action ids. Subject/body/attachment
+	fill from the work-order payload once real copy is composed there (ticket 25);
+	until then they show a clear 'pending' placeholder rather than a raw dict."""
+	payload = order.payload if isinstance(order.payload, dict) else {}
+	touch_step = payload.get("touch_step", "?")
+	run_id_short = str(payload.get("run_id", ""))[:8]
+	subject = payload.get("subject") or f"Touch {touch_step} — cold outreach sequence"
+	body_preview = payload.get("body_preview") or "_Email copy is generated at send time — placeholder pending client copy (C2) and the Owner Visibility Score PDF (Dev 2, C3)._"
+	attachment = payload.get("attachment_name") or "Owner Visibility Score PDF (pending Dev 2)"
+	# Body preview as a blockquote, capped so the card stays compact.
+	quoted = "\n".join(f"> {ln}" for ln in body_preview.splitlines()[:6]) or f"> {body_preview}"
+
+	return [
+		{"type": "header", "text": {"type": "plain_text", "text": f"\U0001F4E7 Email Touch {touch_step} · Approval needed", "emoji": True}},
+		{
+			"type": "section",
+			"fields": [
+				{"type": "mrkdwn", "text": f"*To*\n{order.recipient or 'n/a'}"},
+				{"type": "mrkdwn", "text": f"*Touch*\nStep {touch_step} of 5"},
+			],
+		},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Subject*\n{subject}"}},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Preview*\n{quoted}"}},
+		{
+			"type": "context",
+			"elements": [
+				{"type": "mrkdwn", "text": f"\U0001F4CE {attachment}  ·  run `{run_id_short}`  ·  `{order.action_id[:8]}`"},
+			],
+		},
+		{"type": "divider"},
+	]
+
+
 def _card_text_blocks(order: "wo.WorkOrder") -> list:
+	if order.action_class == "DISPATCH_EMAIL_TOUCH":
+		return _email_touch_content_blocks(order) + _card_button_blocks(order)
 	return [{"type": "section", "text": {"type": "mrkdwn", "text": _card_text(order)}}] + _card_button_blocks(order)
 
 
@@ -245,6 +297,12 @@ async def _finalize_terminal_decision(order: "wo.WorkOrder", *, decision: str, u
 		# work_orders.record_decision caught it. Not an error; just no-op.
 		await respond(response_type="ephemeral", text=":information_source: This was just decided by someone else.")
 		return
+	# Decrement Cora's approval backlog for human review decisions so the
+	# throttle can resume when the queue clears. SKIPPED/SNOOZED are not
+	# "reviewed" — only a genuine approve or reject counts as a resolved draft.
+	if decision in {"APPROVED", "REJECTED"}:
+		from src.agents.cora.throttle import notify_approval_resolved
+		notify_approval_resolved()
 	_log_event(order.client_id, "work_order_decided", entity_id=order.action_id, actor=f"slack:{user_id}", payload={"decision": decision})
 	if decided.slack_channel_id and decided.slack_message_ts:
 		await post.update_card(
