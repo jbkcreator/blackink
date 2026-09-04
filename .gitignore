@@ -50,3 +50,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local scratch files and test data (never committed)
+/scratch/
+/data/

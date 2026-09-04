@@ -33,3 +33,9 @@ fakeredis>=2.0
 gspread>=6.0
 google-auth>=2.0
 
+# Owner Visibility Score engine (Dev 2)
+beautifulsoup4>=4.12
+lxml>=5.0
+googlemaps>=4.10
+fpdf2>=2.7
+

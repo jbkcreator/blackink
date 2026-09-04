@@ -44,11 +44,9 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
-      # Same migration order as tenant_leakage_nightly.yml and CLAUDE.md's
-      # "Migrations" block — must include every migration that creates a
-      # table any test in tests/ touches, or a test fails with an
-      # UndefinedTable error that reads like a schema bug rather than a
-      # stale CI list.
+      # Migration order must match CLAUDE.md and tenant_leakage_nightly.yml.
+      # Every table in config/tenant_policies.py must be created before
+      # apply_rls_policies.py runs or it aborts with UndefinedTable.
       - name: Apply migrations
         run: |
           PYTHONPATH=. python migrations/apply_db_roles.py
@@ -74,11 +72,9 @@ jobs:
           PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
           PYTHONPATH=. python migrations/apply_sequence_runs.py
           PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py
+          PYTHONPATH=. python migrations/apply_companies_google_place_id.py
+          PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py
+          PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
-      # Full suite — this is what actually gates a PR on every change, not
-      # just the tenant-leakage path-filtered nightly. Runs
-      # tests/test_sms_dispatch.py (the cold-SMS application-layer linter)
-      # among everything else, closing the gap where that file existed but
-      # was never wired into any CI workflow.
       - name: Run full test suite
         run: PYTHONPATH=. pytest tests/ -v
