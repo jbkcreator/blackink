@@ -33,7 +33,16 @@ class AppSettings(BaseSettings):
 	)
 
 	debug: bool = Field(default=True, env="DEBUG")
+	# Deployment environment. Anything other than "development"/"test" is treated
+	# as production for fail-closed guards (e.g. the email sender must not fall
+	# back to the transmit-nothing stub in production). Default is development so
+	# local dev and CI stay convenient; production must set ENVIRONMENT=production.
+	environment: str = Field(default="development", env="ENVIRONMENT")
 	app_base_url: str = Field(default="http://localhost:8000", env="APP_BASE_URL")
+
+	@property
+	def is_production(self) -> bool:
+		return (self.environment or "development").strip().lower() not in {"development", "dev", "test", "testing", "local"}
 
 	# ── Database ─────────────────────────────────────────────────────────────
 	# Generic fallback DSN (used by tooling/tests that don't care which role).

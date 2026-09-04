@@ -193,5 +193,14 @@ def build_email_sender() -> EmailSender:
     # auto
     if configured:
         return _build_smtp_sender(s)
-    logger.info("build_email_sender: SMTP not configured (mode=auto) — using StubEmailSender")
+    # Fail-closed in production: "auto" must NOT silently degrade to the stub on
+    # a real deployment (would record undelivered mail as SENT). Only dev/test/CI
+    # may fall back. Set EMAIL_SENDER_MODE=stub to opt in explicitly.
+    if s.is_production:
+        raise EmailSenderNotConfigured(
+            "EMAIL_SENDER_MODE=auto with SMTP unconfigured is not allowed in "
+            f"ENVIRONMENT={s.environment!r} — set SMTP_HOST/SMTP_PASSWORD, or "
+            "EMAIL_SENDER_MODE=stub to send nothing on purpose."
+        )
+    logger.info("build_email_sender: SMTP not configured (mode=auto, non-production) — using StubEmailSender")
     return StubEmailSender()
