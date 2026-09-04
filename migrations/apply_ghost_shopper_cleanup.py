@@ -36,8 +36,11 @@ DDL = [
     "ALTER TABLE contacts DROP COLUMN IF EXISTS sendspark_video_id",
     "ALTER TABLE contacts DROP COLUMN IF EXISTS sendspark_landing_url",
 
-    # ── contacts: rename audit_pdf_url -> ovs_pdf_url (OVS now owns this) ────
-    # Guarded so re-running after the rename is a no-op.
+    # ── contacts: ensure ovs_pdf_url exists (OVS sweep writes here) ──────────
+    # Three cases, all idempotent:
+    #   1. audit_pdf_url exists (ghost-shopper was deployed): rename it.
+    #   2. ovs_pdf_url already exists: no-op.
+    #   3. Neither exists (fresh DB, ghost-shopper never ran): add the column.
     """
     DO $$
     BEGIN
@@ -47,6 +50,12 @@ DDL = [
               AND column_name = 'audit_pdf_url'
         ) THEN
             ALTER TABLE contacts RENAME COLUMN audit_pdf_url TO ovs_pdf_url;
+        ELSIF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name  = 'contacts'
+              AND column_name = 'ovs_pdf_url'
+        ) THEN
+            ALTER TABLE contacts ADD COLUMN ovs_pdf_url TEXT;
         END IF;
     END $$
     """,
