@@ -373,6 +373,28 @@ def approved_batch(client_id: Optional[str] = None, *, limit: int = 50) -> list:
 	return [_row_to_order(dict(r)) for r in rows]
 
 
+def due_batch(client_id: Optional[str] = None, *, limit: int = 50) -> list:
+	"""QUEUED rows whose due_at has arrived, oldest first — what the sequencer's
+	timer loop reads to trigger scheduled touches. client_id=None aggregates
+	across all tenants via get_system_db_context() — batch-only, never src/api/."""
+	now = datetime.now(timezone.utc)
+	where = ["status = 'QUEUED'", "due_at IS NOT NULL", "due_at <= :now"]
+	params: dict = {"now": now, "limit": limit}
+	if client_id is not None:
+		where.append("client_id = :client_id")
+		params["client_id"] = client_id
+
+	sql = f"SELECT {_COLUMNS_SQL} FROM agent_work_orders WHERE {' AND '.join(where)} ORDER BY due_at ASC LIMIT :limit"
+
+	if client_id is not None:
+		with get_db_context(client_id=client_id) as session:
+			rows = session.execute(text(sql), params).mappings().all()
+	else:
+		with get_system_db_context() as session:
+			rows = session.execute(text(sql), params).mappings().all()
+	return [_row_to_order(dict(r)) for r in rows]
+
+
 def requeue_due_snoozed(client_id: str) -> list:
 	"""SNOOZED rows whose due_at has passed -> QUEUED, so a snooze actually
 	expires. Returns the revived orders (callers re-post their cards).
@@ -439,6 +461,27 @@ def reclaim_stale_executing(client_id: str, *, older_than: timedelta = STALE_EXE
 			{"client_id": client_id, "cutoff": cutoff},
 		).mappings().all()
 		return [str(r["action_id"]) for r in rows]
+
+
+def defer_execution(client_id: str, action_id: str, *, until: datetime) -> Optional[WorkOrder]:
+	"""Transitions a claimed (EXECUTING) row back to SNOOZED with a pushed
+	due_at — the non-terminal outcome for a touch that could not send for a
+	transient, self-healing reason (all mailboxes at their rolling-24h cap,
+	ticket 08: DEFER, do not dead-letter). requeue_due_snoozed revives it once
+	due_at passes. Guarded WHERE status = 'EXECUTING' so only the claim path
+	that owns the row can defer it. Returns None if the row was not EXECUTING."""
+	with get_db_context(client_id=client_id) as session:
+		result = session.execute(
+			text(
+				"UPDATE agent_work_orders "
+				"SET status = 'SNOOZED', due_at = :until, updated_at = NOW() "
+				"WHERE action_id = :action_id AND client_id = :client_id AND status = 'EXECUTING'"
+			),
+			{"until": until, "action_id": action_id, "client_id": client_id},
+		)
+		if result.rowcount == 0:
+			return None
+	return get(client_id, action_id)
 
 
 def claim_for_execution(client_id: str, action_id: str) -> Optional[WorkOrder]:

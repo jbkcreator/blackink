@@ -104,9 +104,11 @@ def test_dnc_abstains_when_never_checked_and_provider_unknown():
 	assert result.status == ABSTAIN
 
 
-def test_dnc_abstains_with_no_phone_on_file():
+def test_dnc_passes_with_no_phone_on_file():
+	"""No phone → DNC registry not applicable → PASS (not ABSTAIN).
+	A missing phone is not a registry hit; the registry has nothing to say."""
 	result = _check_dnc(_contact(dnc_checked_at=None, phone=None), _AlwaysClearDnc())
-	assert result.status == ABSTAIN
+	assert result.status == PASS
 
 
 def test_dnc_fails_when_provider_reports_listed():
