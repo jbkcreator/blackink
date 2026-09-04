@@ -209,6 +209,44 @@ class AppSettings(BaseSettings):
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 
+	# ── Calendar OAuth (Subtask 3.2.1 — Inbound Booking Engine) ─────────────
+	# No Calendly per client comment W1-8 (Blackink_Source_of_Truth.md line
+	# 577) — Google Calendar + Microsoft Graph only. Unlike the DNC/SMS/
+	# RentCast vendors, no third party here is genuinely absent — these are
+	# OAuth apps this project registers itself; unset means "not registered
+	# yet", a required completion gate, not a permanently-deferred provider.
+	google_oauth_client_id: Optional[str] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_ID")
+	google_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_SECRET")
+	microsoft_oauth_client_id: Optional[str] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_ID")
+	microsoft_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_SECRET")
+	# Fernet key (urlsafe base64, 32 bytes) — encrypts OAuth tokens and SMTP
+	# passwords at rest. See src/core/token_crypto.py.
+	token_encryption_key: Optional[SecretStr] = Field(default=None, env="TOKEN_ENCRYPTION_KEY")
+	# Signs connect-link and OAuth `state` tokens (src/services/calendar_oauth.py).
+	# Deliberately its own secret, not a reuse of akrash_ingest_jwt_secret —
+	# these two token families protect unrelated systems and must be able to
+	# rotate independently.
+	calendar_oauth_state_secret: Optional[SecretStr] = Field(default=None, env="CALENDAR_OAUTH_STATE_SECRET")
+	calendar_webhook_base_url: str = Field(
+		default="http://localhost:8000", env="CALENDAR_WEBHOOK_BASE_URL",
+		description="Public base URL the providers POST notifications to — must be internet-reachable in prod.",
+	)
+	# Local-testing-only escape hatch: Google/Microsoft's watch()/subscription
+	# registration calls reject a non-public, non-domain-verified callback
+	# URL (localhost) at registration time — this lets the OAuth callback
+	# complete anyway (real token exchange + real baseline sync still run),
+	# just without a live push subscription. Never set True outside local
+	# dev — a connection created this way never receives real-time webhook
+	# notifications, only whatever calendar_sync_worker's periodic safety
+	# sweep picks up.
+	skip_calendar_watch_registration: bool = Field(default=False, env="SKIP_CALENDAR_WATCH_REGISTRATION")
+
+	# ── Booking confirmation email (Subtask 3.2.1) ──────────────────────────
+	# Default False: per explicit instruction, a missing/disabled real
+	# email provider must be a visible launch blocker (booking_confirmation_
+	# blocked event), never a silent no-op or a stub quietly satisfying a test.
+	email_sending_enabled: bool = Field(default=False, env="EMAIL_SENDING_ENABLED")
+
 	# ── Oxylabs residential proxy ────────────────────────────────────────────
 	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
 	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")

@@ -39,6 +39,11 @@ jobs:
       AKRASH_INGEST_DB_PASSWORD: test_only_password
       REDIS_URL: redis://localhost:6379/0
       ADMIN_JWT_SECRET: ci-test-secret-not-for-production
+      # Test-only Fernet key (not a real secret) — required by
+      # src/core/token_crypto.py's encrypt_token()/decrypt_token(), which
+      # tests/test_calendar_oauth_callback.py and tests/test_token_crypto.py
+      # exercise for real rather than mocking.
+      TOKEN_ENCRYPTION_KEY: sWHdVufCbVgVcqllGh3tCpyvFNKIBKO9kVkfoippIwk=
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -69,6 +74,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
           PYTHONPATH=. python migrations/apply_sending_domains.py
           PYTHONPATH=. python migrations/apply_mailbox_last_used.py
+          PYTHONPATH=. python migrations/apply_mailbox_smtp_credentials.py
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_meeting_outcomes.py
           PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
@@ -79,6 +85,9 @@ jobs:
           PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
           PYTHONPATH=. python migrations/apply_ovs_audit_requests.py
           PYTHONPATH=. python migrations/apply_admin_users.py
+          PYTHONPATH=. python migrations/apply_owner_contacts.py
+          PYTHONPATH=. python migrations/apply_calendar_connections.py
+          PYTHONPATH=. python migrations/apply_bookings.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       - name: Run full test suite
         run: PYTHONPATH=. pytest tests/ -v
