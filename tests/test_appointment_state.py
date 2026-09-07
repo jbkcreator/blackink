@@ -6,9 +6,15 @@ opportunity_id / reschedule_count being preserved across a no-show recovery.
 The DB-level checks (is_billable truth table, CHECK constraints, indices) live
 in tests/test_appointment_ops_live.py.
 """
+from unittest.mock import MagicMock
+
 import pytest
 
 from src.services import appointment_state as st
+from src.services.appointments import (
+	begin_no_show_recovery_for_appointment,
+	reschedule_appointment,
+)
 
 
 def test_first_two_reschedules_increment_and_stay_rescheduled():
@@ -60,3 +66,70 @@ def test_opportunity_id_is_never_part_of_a_transition():
 	# anchor, so a rescheduled/recovered row keeps the original by construction.
 	t = st.apply_reschedule(st.BOOKED, 0)
 	assert not hasattr(t, "opportunity_id")
+
+
+# ── src/services/appointments.py — the production write path (PR #25 review) ──
+# apply_reschedule()/begin_no_show_recovery() above are pure and had NO
+# production caller before this module existed; these tests prove the actual
+# write path delegates to them rather than reimplementing the rules, and that
+# a forced-LOST reschedule never moves scheduled_for.
+
+
+def _fake_session(state, reschedule_count):
+	session = MagicMock()
+	session.execute.return_value.first.return_value = MagicMock(
+		state=state, reschedule_count=reschedule_count
+	)
+	return session
+
+
+def test_reschedule_appointment_delegates_to_apply_reschedule_and_moves_scheduled_for():
+	session = _fake_session(st.BOOKED, 0)
+	transition = reschedule_appointment(
+		session, client_id="acme", appointment_id="a1", new_scheduled_for="2026-02-01"
+	)
+	assert (transition.state, transition.reschedule_count) == (st.RESCHEDULED, 1)
+	update_sql = str(session.execute.call_args_list[-1][0][0])
+	update_params = session.execute.call_args_list[-1][0][1]
+	assert "scheduled_for" in update_sql
+	assert update_params["scheduled_for"] == "2026-02-01"
+	assert update_params["state"] == st.RESCHEDULED
+	assert "opportunity_id" not in update_sql
+
+
+def test_reschedule_appointment_third_attempt_lands_in_lost_not_an_error():
+	# At the cap already — the production write path must actually succeed and
+	# persist LOST, not raise (this is finding 1: previously nothing called
+	# apply_reschedule() in production, so a real third reschedule only ever
+	# hit the migration trigger's RAISE EXCEPTION).
+	session = _fake_session(st.RESCHEDULED, 2)
+	transition = reschedule_appointment(
+		session, client_id="acme", appointment_id="a1", new_scheduled_for="2026-02-01"
+	)
+	assert transition.state == st.LOST
+	assert transition.reschedule_count == st.MAX_RESCHEDULES
+	update_sql = str(session.execute.call_args_list[-1][0][0])
+	update_params = session.execute.call_args_list[-1][0][1]
+	# scheduled_for is NEVER moved on the forced-LOST branch — there is no new
+	# meeting to move to.
+	assert "scheduled_for" not in update_sql
+	assert update_params["state"] == st.LOST
+
+
+def test_reschedule_appointment_raises_for_unknown_appointment():
+	session = MagicMock()
+	session.execute.return_value.first.return_value = None
+	with pytest.raises(st.InvalidTransition):
+		reschedule_appointment(session, client_id="acme", appointment_id="missing")
+
+
+def test_begin_no_show_recovery_for_appointment_delegates_and_persists():
+	session = _fake_session(st.CONFIRMED_3H, 1)
+	transition = begin_no_show_recovery_for_appointment(
+		session, client_id="acme", appointment_id="a1"
+	)
+	assert transition.state == st.NO_SHOW_RECOVERY
+	assert transition.reschedule_count == 1
+	update_params = session.execute.call_args_list[-1][0][1]
+	assert update_params["state"] == st.NO_SHOW_RECOVERY
+	assert update_params["reschedule_count"] == 1

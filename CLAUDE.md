@@ -639,8 +639,20 @@ many appointment rows across reschedule / no-show-recovery / rebook chains;
 exactly-once billing idempotency is enforced at settlement, not by this
 index. The nine-state transition rules — reschedule capped at 2 (the third
 forces `LOST`), `opportunity_id` retained across reschedule and no-show
-recovery — live in `src/services/appointment_state.py` (a generated column
-can express a value but not a transition guard).
+recovery — are pure functions in `src/services/appointment_state.py` (a
+generated column can express a value but not a transition guard), applied by
+the single production write path `src/services/appointments.py`
+(`reschedule_appointment()` / `begin_no_show_recovery_for_appointment()`) —
+every reschedule MUST go through it, or a real third reschedule only hits the
+migration trigger's `reschedule_count > 2` backstop and errors instead of
+landing in `LOST`. The trigger's INSERT-time company/contact
+ownership check is a one-time creation snapshot, never re-validated on
+UPDATE — `county_allocation_reassessment.py` reassigns
+`companies.owning_client_id` as normal operation, so a live re-check would
+permanently block the original tenant from updating its own pre-existing
+appointment rows after a routine reassignment. `client_id`/`company_id`/
+`contact_id` are immutable once set instead, closing the same tenant-hop
+without that live re-check.
 
 ## Tooling Rules
 

@@ -62,17 +62,39 @@ appointment_id.
 
 State-machine rules ("reschedule capped at 2 → LOST", "opportunity_id retained
 across reschedules and no-show recovery") are enforced in the application layer
-— see src/services/appointment_state.py — since a computed generated column
-cannot express a transition guard. A BEFORE UPDATE trigger
-(`trg_appointments_guard_transition` / `appointments_guard_transition()`) is
-the enforcement backstop (PR #25 review fix): it rejects
-`reschedule_count > 2`, rejects `reschedule_count` decreasing, and rejects any
-change to `opportunity_id` — the two invariants the module docstring calls
-"hard" but that, before this trigger, only held if every caller remembered to
-route through appointment_state.py. Direct UPDATE access on the table stays
-(needed for state/timestamp columns the trigger does not touch), but the two
-billing-critical invariants can no longer be bypassed by a stray hand-written
-UPDATE.
+— the pure rules in src/services/appointment_state.py, applied by the single
+production write path in src/services/appointments.py
+(`reschedule_appointment()` / `begin_no_show_recovery_for_appointment()`) —
+since a computed generated column cannot express a transition guard. Every
+reschedule MUST go through that function: it is what actually turns the third
+reschedule into `state = 'LOST'` with `reschedule_count` left at 2, so the
+trigger's `> 2` guard is never tripped by the legitimate path (PR #25 review
+finding 1 — the pure helper existed but nothing production called it, so a real
+third reschedule only ever hit the trigger's EXCEPTION and left the row in its
+previous state).
+
+The BEFORE INSERT OR UPDATE trigger (`trg_appointments_guard_transition` /
+`appointments_guard_transition()`) is the enforcement backstop, not the
+mechanism: it rejects `reschedule_count > 2`, rejects `reschedule_count`
+decreasing, and rejects any change to `opportunity_id` — invariants that, before
+it existed, only held if every caller remembered to route through
+appointment_state.py. Direct UPDATE access on the table stays (needed for
+state/timestamp columns the trigger does not touch), but the billing-critical
+invariants can no longer be bypassed by a stray hand-written UPDATE.
+
+── Ownership is an INSERT-time snapshot, not a live re-check (PR #25 review) ──
+The trigger resolves companies.owning_client_id (and the contact's, via its
+company) only on INSERT. `companies` is a shared prospect pool whose
+owning_client_id is *mutable by design* —
+src/tasks/county_allocation_reassessment.py reassigns it on every 30-day
+window. Re-validating it on UPDATE meant that a routine reassessment moving a
+company from Client A to Client B permanently blocked Client A from updating
+its own pre-existing appointment rows — recording attendance or either
+confirmation timestamp would raise, wedging the billing gate for those rows.
+What makes the creation-time check durable instead of merely unenforced is that
+the UPDATE branch now freezes the tenancy triple: client_id, company_id and
+contact_id are all immutable once set, so an existing row can never be
+re-pointed at another tenant's company/contact either.
 
 Idempotent: CREATE TYPE guarded by a catalog check, everything else
 CREATE ... IF NOT EXISTS. Run BEFORE apply_rls_policies.py, AFTER apply_clients
@@ -268,8 +290,8 @@ DDL = [
 	#     composite-FK equivalent for company_id/contact_id — companies is a
 	#     shared prospect pool (owning_client_id reassigned by
 	#     county_allocation_reassessment.py), so a static composite FK would
-	#     break the moment ownership legitimately moves. Checked at write time
-	#     instead, against the live owning_client_id.
+	#     break the moment ownership legitimately moves. Checked at INSERT time
+	#     instead — a creation-time snapshot, never re-validated on UPDATE.
 	"""
 	CREATE OR REPLACE FUNCTION appointments_guard_transition() RETURNS TRIGGER AS $$
 	DECLARE
@@ -282,27 +304,50 @@ DDL = [
 			IF NEW.reschedule_count < OLD.reschedule_count THEN
 				RAISE EXCEPTION 'reschedule_count cannot decrease (appointment %)', OLD.appointment_id;
 			END IF;
+			-- The tenancy triple is frozen at creation. This is what makes the
+			-- INSERT-time ownership check below a durable snapshot rather than a
+			-- merely-unenforced one: an existing row can never be re-pointed at
+			-- another tenant's company/contact, and the INSERT path can't create
+			-- one there to begin with.
+			IF NEW.client_id IS DISTINCT FROM OLD.client_id THEN
+				RAISE EXCEPTION 'client_id is immutable once set (tenant boundary, appointment %)', OLD.appointment_id;
+			END IF;
+			IF NEW.company_id IS DISTINCT FROM OLD.company_id THEN
+				RAISE EXCEPTION 'company_id is immutable once set (appointment %)', OLD.appointment_id;
+			END IF;
+			IF NEW.contact_id IS DISTINCT FROM OLD.contact_id THEN
+				RAISE EXCEPTION 'contact_id is immutable once set (appointment %)', OLD.appointment_id;
+			END IF;
 		END IF;
 		IF NEW.reschedule_count > 2 THEN
 			RAISE EXCEPTION 'reschedule_count cannot exceed 2 — a third reschedule must set state to LOST instead (appointment %)', NEW.appointment_id;
 		END IF;
 
-		IF NEW.company_id IS NOT NULL THEN
-			SELECT owning_client_id INTO v_owning_client_id
-			FROM companies WHERE company_id = NEW.company_id;
-			IF v_owning_client_id IS DISTINCT FROM NEW.client_id THEN
-				RAISE EXCEPTION 'company % is not owned by client % (owning_client_id=%)',
-					NEW.company_id, NEW.client_id, v_owning_client_id;
+		-- Ownership is verified ONCE, at creation, against ownership as it stood
+		-- then — never re-validated on UPDATE. companies.owning_client_id is
+		-- mutable by design (src/tasks/county_allocation_reassessment.py
+		-- reassigns it every 30-day window); re-checking it here would make a
+		-- routine reassessment permanently block the original tenant from
+		-- recording attendance/confirmation on its OWN pre-existing appointment
+		-- rows — a hard block on the billing gate. See PR #25 review finding 2.
+		IF TG_OP = 'INSERT' THEN
+			IF NEW.company_id IS NOT NULL THEN
+				SELECT owning_client_id INTO v_owning_client_id
+				FROM companies WHERE company_id = NEW.company_id;
+				IF v_owning_client_id IS DISTINCT FROM NEW.client_id THEN
+					RAISE EXCEPTION 'company % is not owned by client % (owning_client_id=%)',
+						NEW.company_id, NEW.client_id, v_owning_client_id;
+				END IF;
 			END IF;
-		END IF;
 
-		IF NEW.contact_id IS NOT NULL THEN
-			SELECT c.owning_client_id INTO v_owning_client_id
-			FROM contacts ct JOIN companies c ON c.company_id = ct.company_id
-			WHERE ct.contact_id = NEW.contact_id;
-			IF v_owning_client_id IS DISTINCT FROM NEW.client_id THEN
-				RAISE EXCEPTION 'contact % is not owned by client % (owning_client_id=%)',
-					NEW.contact_id, NEW.client_id, v_owning_client_id;
+			IF NEW.contact_id IS NOT NULL THEN
+				SELECT c.owning_client_id INTO v_owning_client_id
+				FROM contacts ct JOIN companies c ON c.company_id = ct.company_id
+				WHERE ct.contact_id = NEW.contact_id;
+				IF v_owning_client_id IS DISTINCT FROM NEW.client_id THEN
+					RAISE EXCEPTION 'contact % is not owned by client % (owning_client_id=%)',
+						NEW.contact_id, NEW.client_id, v_owning_client_id;
+				END IF;
 			END IF;
 		END IF;
 
