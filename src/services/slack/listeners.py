@@ -33,6 +33,7 @@ not whether the request is genuine) applies in this file.
 
 from __future__ import annotations
 
+import hmac as _hmac
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -910,3 +911,114 @@ async def handle_log_meeting_outcome(ack, body, respond, action, client):
 		contact_id=value.get("contact_id"),
 		meeting_occurred_at=value.get("meeting_occurred_at"),
 	)
+
+
+# ── Context card claim (Subtask 2.1.2 — Reply Triage Agent) ─────────────────
+
+_CONTEXT_CARD_TTL = timedelta(hours=24)
+
+
+@app.action("claim_context_card")
+async def handle_claim_context_card(ack, body, respond, action, client):
+	"""Rep clicks "Claim this lead" on a HOT_LEAD/WHALE_OWNER/OBJECTION card.
+
+	Verifies the card hash and 24-hour expiry, then:
+	  - Sets claimed_at / claimed_by on the inbound_messages row
+	  - Updates the Slack card in place to show who claimed it
+
+	Ephemeral errors on: expired card, wrong hash, already claimed,
+	row not found. Never raises — the rep sees a clear message in Slack.
+	"""
+	await ack()
+	user_id = body.get("user", {}).get("id", "unknown")
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	db_id = value.get("db_id")
+	card_client_id = value.get("client_id")
+	provided_hash = value.get("card_hash", "")
+
+	if not db_id or not card_client_id:
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload — missing db_id or client_id.")
+		return
+
+	with get_system_db_context() as session:
+		row = session.execute(
+			text(
+				"SELECT id, intent, card_posted_at, card_ts, card_channel_id, "
+				"       claimed_at, claimed_by, status "
+				"FROM inbound_messages WHERE id = :id"
+			),
+			{"id": db_id},
+		).mappings().first()
+
+	if row is None:
+		await respond(response_type="ephemeral", text=":warning: Lead not found.")
+		return
+
+	if row["status"] not in ("ROUTED",):
+		await respond(response_type="ephemeral", text=f":information_source: This lead is already in status `{row['status']}` — no claim needed.")
+		return
+
+	# 24-hour expiry check.
+	card_posted_at = row["card_posted_at"]
+	if card_posted_at is None:
+		await respond(response_type="ephemeral", text=":warning: Card metadata missing — cannot verify. Contact support.")
+		return
+	if card_posted_at.tzinfo is None:
+		card_posted_at = card_posted_at.replace(tzinfo=timezone.utc)
+	if datetime.now(timezone.utc) > card_posted_at + _CONTEXT_CARD_TTL:
+		await respond(response_type="ephemeral", text=":warning: This card has expired (>24 hours). The lead may have been reallocated.")
+		return
+
+	# Hash verification — import deferred to avoid circular import at module load.
+	from src.agents.respond.context_cards import compute_card_hash
+	card_posted_at_iso = card_posted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+	expected = compute_card_hash(db_id, card_client_id, row["intent"] or "", card_posted_at_iso)
+	if not _hmac.compare_digest(provided_hash, expected):
+		await respond(response_type="ephemeral", text=":warning: This action has expired or was altered.")
+		return
+
+	# Already claimed?
+	if row["claimed_at"] is not None:
+		await respond(response_type="ephemeral", text=f":information_source: Already claimed by <@{row['claimed_by']}>.")
+		return
+
+	# Claim it — WHERE clause guards against a race between two reps.
+	with get_system_db_context() as session:
+		result = session.execute(
+			text(
+				"UPDATE inbound_messages "
+				"SET claimed_at = NOW(), claimed_by = :uid "
+				"WHERE id = :id AND claimed_at IS NULL "
+				"RETURNING id"
+			),
+			{"uid": user_id, "id": db_id},
+		).first()
+		session.commit()
+
+	if result is None:
+		await respond(response_type="ephemeral", text=":information_source: Another rep just claimed this lead — you were a fraction of a second too slow.")
+		return
+
+	# Update the Slack card in place.
+	intent_label = (row["intent"] or "LEAD").replace("_", " ").title()
+	if row["card_ts"] and row["card_channel_id"]:
+		await client.chat_update(
+			channel=row["card_channel_id"],
+			ts=row["card_ts"],
+			text=f"✅ {intent_label} — claimed by <@{user_id}>",
+			blocks=[
+				{
+					"type": "section",
+					"text": {
+						"type": "mrkdwn",
+						"text": f"✅ *{intent_label}* — claimed by <@{user_id}>",
+					},
+				}
+			],
+		)
+	await respond(response_type="ephemeral", text=f":white_check_mark: You've claimed this lead. Get in touch fast!")

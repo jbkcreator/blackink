@@ -47,6 +47,7 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is

@@ -29,12 +29,14 @@ import signal
 import socket
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from sqlalchemy import text
 
 from src.agents.respond import queue
 from src.agents.respond.classifier import ClassificationResult, classify
+from src.agents.respond.context_cards import CONTEXT_CARD_INTENTS, post_context_card
 from src.agents.respond.intents import Intent
 from src.core.database import Database
 
@@ -61,7 +63,7 @@ def _consumer_name() -> str:
 def _load_row(db: Any, db_id: int) -> Optional[Dict[str, Any]]:
     row = db.execute(
         text(
-            "SELECT id, client_id, sender_email, subject, body_text, status "
+            "SELECT id, client_id, sender_email, subject, body_text, status, received_at "
             "FROM inbound_messages WHERE id = :id"
         ),
         {"id": db_id},
@@ -76,7 +78,20 @@ def _mark_processing(db: Any, db_id: int) -> None:
     )
 
 
-def _write_result(db: Any, db_id: int, result: ClassificationResult, final_status: str) -> None:
+def _compute_sla(intent: Intent, received_at: datetime) -> datetime:
+    if received_at.tzinfo is None:
+        received_at = received_at.replace(tzinfo=timezone.utc)
+    delta = timedelta(minutes=15) if intent in (Intent.HOT_LEAD, Intent.WHALE_OWNER) else timedelta(minutes=60)
+    return received_at + delta
+
+
+def _write_result(
+    db: Any,
+    db_id: int,
+    result: ClassificationResult,
+    final_status: str,
+    sla_due_at: Optional[datetime] = None,
+) -> None:
     db.execute(
         text(
             "UPDATE inbound_messages "
@@ -84,7 +99,8 @@ def _write_result(db: Any, db_id: int, result: ClassificationResult, final_statu
             "    intent = :intent, "
             "    intent_confidence = :confidence, "
             "    classified_at = NOW(), "
-            "    classification_meta = :meta ::jsonb "
+            "    classification_meta = :meta ::jsonb, "
+            "    sla_due_at = :sla_due_at "
             "WHERE id = :id"
         ),
         {
@@ -94,8 +110,10 @@ def _write_result(db: Any, db_id: int, result: ClassificationResult, final_statu
             "confidence": result.confidence,
             "meta": json.dumps({
                 "reasoning": result.reasoning,
+                "objection_subtype": result.objection_subtype,
                 **result.meta,
             }),
+            "sla_due_at": sla_due_at,
         },
     )
 
@@ -113,10 +131,23 @@ async def _post_slack_alert(channel_key: str, text_body: str) -> None:
         logger.warning("respond.worker: Slack alert failed: %s", exc)
 
 
-def _route(db: Any, db_id: int, client_id: str, sender_email: str, result: ClassificationResult) -> str:
+def _route(
+    db: Any,
+    db_id: int,
+    client_id: str,
+    sender_email: str,
+    received_at: Any,
+    result: ClassificationResult,
+) -> str:
     """Determine terminal status, write it, fire any side-effects. Returns final status."""
+    if isinstance(received_at, datetime):
+        received_at_dt = received_at if received_at.tzinfo else received_at.replace(tzinfo=timezone.utc)
+    else:
+        received_at_dt = datetime.now(timezone.utc)
+
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
-    _write_result(db, db_id, result, final_status)
+    sla_due_at = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
+    _write_result(db, db_id, result, final_status, sla_due_at=sla_due_at)
     db.commit()
 
     if result.intent == Intent.UNSUBSCRIBE:
@@ -135,7 +166,40 @@ def _route(db: Any, db_id: int, client_id: str, sender_email: str, result: Class
         )
         asyncio.run(_post_slack_alert("command", msg))
 
+    elif result.intent in CONTEXT_CARD_INTENTS and sla_due_at:
+        card_meta = asyncio.run(post_context_card(
+            db_id=db_id,
+            client_id=client_id,
+            sender_email=sender_email,
+            received_at=received_at_dt,
+            intent=result.intent,
+            result=result,
+            sla_due_at=sla_due_at,
+        ))
+        if card_meta:
+            _write_card_meta(db_id, card_meta)
+
     return final_status
+
+
+def _write_card_meta(db_id: int, card_meta: dict) -> None:
+    """Persist Slack card identifiers back to the row after a successful post."""
+    db_obj = Database()
+    with db_obj.system_session_scope() as db:
+        db.execute(
+            text(
+                "UPDATE inbound_messages "
+                "SET card_ts = :ts, card_channel_id = :channel, card_posted_at = :posted_at "
+                "WHERE id = :id"
+            ),
+            {
+                "id": db_id,
+                "ts": card_meta["card_ts"],
+                "channel": card_meta["card_channel_id"],
+                "posted_at": card_meta["card_posted_at_iso"],
+            },
+        )
+        db.commit()
 
 
 def _process_message(msg: queue.InboundQueueMessage) -> None:
@@ -175,6 +239,7 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
             db_id=msg.db_id,
             client_id=row["client_id"],
             sender_email=row.get("sender_email") or "",
+            received_at=row.get("received_at") or datetime.now(timezone.utc),
             result=result,
         )
 

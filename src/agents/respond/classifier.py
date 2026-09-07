@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from src.agents.respond.intents import Intent, is_legal_grief, is_unsubscribe
 
@@ -48,6 +48,9 @@ Never return either of those classes.
 
 Required JSON format:
 {"intent": "<CLASS>", "confidence": <0.0-1.0>, "reasoning": "<one sentence max>"}
+
+If intent is OBJECTION, also include "objection_subtype" with exactly one of:
+"pricing", "timing", "existing_agency", "capacity", "other"
 """
 
 _DETERMINISTIC_CLASSES = {Intent.UNSUBSCRIBE, Intent.LEGAL_GRIEF}
@@ -59,6 +62,7 @@ class ClassificationResult:
     confidence: float
     reasoning: str
     meta: Dict[str, Any] = field(default_factory=dict)
+    objection_subtype: Optional[str] = None  # "pricing"|"timing"|"existing_agency"|"capacity"|"other" — OBJECTION only
 
 
 def _fallback() -> ClassificationResult:
@@ -129,11 +133,16 @@ def _call_model(client: Any, model: str, user_content: str) -> ClassificationRes
 
     confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0))))
     reasoning = str(parsed.get("reasoning", ""))[:500]
+    objection_subtype: Optional[str] = None
+    if intent == Intent.OBJECTION:
+        raw_subtype = str(parsed.get("objection_subtype", "other")).lower().strip()
+        objection_subtype = raw_subtype if raw_subtype in {"pricing", "timing", "existing_agency", "capacity"} else "other"
     return ClassificationResult(
         intent=intent,
         confidence=confidence,
         reasoning=reasoning,
         meta={"path": "llm", "model": model, "raw": raw[:1000]},
+        objection_subtype=objection_subtype,
     )
 
 
