@@ -268,6 +268,102 @@ def test_link_booking_to_owner_rejects_cross_tenant_link(calendar_connection):
 			link_booking_to_owner(session, booking_a.booking_id, owner_b.owner_contact_id)
 
 
+def test_link_booking_to_owner_resets_missing_email_failure_to_pending(calendar_connection):
+	"""PR #17 review finding 4: a booking whose confirmation attempt failed
+	because it had no owner_contact yet (FAILED_PERMANENT, set the instant
+	owner_email is NULL — see send_confirmation_for_booking) must become
+	claimable again once reconciliation supplies a real owner, or the
+	confirmation email is lost forever (claim_confirmations never reclaims
+	FAILED_PERMANENT)."""
+	connection_id = calendar_connection[CANARY_A]
+	with get_db_context(client_id=CANARY_A) as session:
+		booking = session.execute(
+			text(
+				"INSERT INTO bookings (client_id, provider, calendar_connection_id, external_event_id, "
+				"event_status, confirmation_status, confirmation_last_error, confirmation_attempts, raw_payload) "
+				"VALUES (:cid, 'GOOGLE', :conn, 'evt-reconcile-missing-email', 'CONFIRMED', 'FAILED_PERMANENT', "
+				"'no owner_contact email on file', 1, '{}') RETURNING booking_id"
+			),
+			{"cid": CANARY_A, "conn": connection_id},
+		).one()
+		owner = session.execute(
+			text(
+				"INSERT INTO owner_contacts (client_id, full_name, email) "
+				"VALUES (:cid, 'Reconciled Owner', 'reconciled@example.com') RETURNING owner_contact_id"
+			),
+			{"cid": CANARY_A},
+		).one()
+
+		link_booking_to_owner(session, booking.booking_id, owner.owner_contact_id)
+
+		final = session.execute(text("SELECT * FROM bookings WHERE booking_id = :id"), {"id": booking.booking_id}).one()
+		assert final.confirmation_status == "PENDING"
+		assert final.confirmation_attempts == 0
+		assert final.confirmation_last_error is None
+		assert final.owner_contact_id == owner.owner_contact_id
+
+
+def test_link_booking_to_owner_does_not_resurrect_other_failure_reasons(calendar_connection):
+	"""A FAILED_PERMANENT booking from a genuine provider error (max
+	attempts exhausted) must NOT be silently reset just because an owner
+	got matched later — only the specific missing-owner-email reason this
+	fix targets is resurrected."""
+	connection_id = calendar_connection[CANARY_A]
+	with get_db_context(client_id=CANARY_A) as session:
+		booking = session.execute(
+			text(
+				"INSERT INTO bookings (client_id, provider, calendar_connection_id, external_event_id, "
+				"event_status, confirmation_status, confirmation_last_error, confirmation_attempts, raw_payload) "
+				"VALUES (:cid, 'GOOGLE', :conn, 'evt-reconcile-real-failure', 'CONFIRMED', 'FAILED_PERMANENT', "
+				"'SMTP 550 mailbox unavailable', 5, '{}') RETURNING booking_id"
+			),
+			{"cid": CANARY_A, "conn": connection_id},
+		).one()
+		owner = session.execute(
+			text(
+				"INSERT INTO owner_contacts (client_id, full_name, email) "
+				"VALUES (:cid, 'Reconciled Owner Two', 'reconciled2@example.com') RETURNING owner_contact_id"
+			),
+			{"cid": CANARY_A},
+		).one()
+
+		link_booking_to_owner(session, booking.booking_id, owner.owner_contact_id)
+
+		final = session.execute(text("SELECT * FROM bookings WHERE booking_id = :id"), {"id": booking.booking_id}).one()
+		assert final.confirmation_status == "FAILED_PERMANENT"
+		assert final.confirmation_attempts == 5
+		assert final.owner_contact_id == owner.owner_contact_id
+
+
+def test_link_booking_to_owner_does_not_touch_not_required(calendar_connection):
+	"""A baseline-suppressed booking (NOT_REQUIRED, permanent by design —
+	pre-dates the connection) must stay NOT_REQUIRED after reconciliation,
+	never resurrected into the confirmation queue."""
+	connection_id = calendar_connection[CANARY_A]
+	with get_db_context(client_id=CANARY_A) as session:
+		booking = session.execute(
+			text(
+				"INSERT INTO bookings (client_id, provider, calendar_connection_id, external_event_id, "
+				"event_status, confirmation_status, raw_payload) "
+				"VALUES (:cid, 'GOOGLE', :conn, 'evt-reconcile-not-required', 'CONFIRMED', 'NOT_REQUIRED', '{}') "
+				"RETURNING booking_id"
+			),
+			{"cid": CANARY_A, "conn": connection_id},
+		).one()
+		owner = session.execute(
+			text(
+				"INSERT INTO owner_contacts (client_id, full_name, email) "
+				"VALUES (:cid, 'Reconciled Owner Three', 'reconciled3@example.com') RETURNING owner_contact_id"
+			),
+			{"cid": CANARY_A},
+		).one()
+
+		link_booking_to_owner(session, booking.booking_id, owner.owner_contact_id)
+
+		final = session.execute(text("SELECT * FROM bookings WHERE booking_id = :id"), {"id": booking.booking_id}).one()
+		assert final.confirmation_status == "NOT_REQUIRED"
+
+
 def test_calendar_connections_and_bookings_are_tenant_isolated(calendar_connection):
 	with get_db_context(client_id=CANARY_A) as session:
 		sync_connection_locked(session, calendar_connection[CANARY_A], _FakeProviderClient(incremental_events=[_tagged_event("evt-isolated")]))

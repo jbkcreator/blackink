@@ -13,9 +13,13 @@ from dataclasses import dataclass
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.services.meeting_outcomes import MeetingOutcomeRecord, record_meeting_outcome
-
 _INTERNAL_SALES_CLIENT_ID = "BLACKINK_INTERNAL_SALES"
+
+# The canonical meeting_outcomes vocabulary (blueprint §3.1.7 / base's
+# record_outcome) is 'Held' / 'No-Show' / 'Rescheduled' — NOT the stack's
+# former 'NO_SHOW'. The no-show flow records this value and the idempotency
+# query below keys on it.
+_NO_SHOW_ATTENDANCE = "No-Show"
 
 
 @dataclass(frozen=True)
@@ -32,7 +36,7 @@ def already_recorded(session: Session, booking_id: int) -> bool:
 		text(
 			"SELECT 1 FROM meeting_outcomes mo "
 			"JOIN bookings b ON b.target_contact_id = mo.contact_id "
-			"WHERE b.booking_id = :bid AND mo.attendance_status = 'NO_SHOW' "
+			"WHERE b.booking_id = :bid AND mo.attendance_status = 'No-Show' "
 			"AND mo.meeting_occurred_at = b.scheduled_at LIMIT 1"
 		),
 		{"bid": booking_id},
@@ -58,16 +62,24 @@ def trigger_recovery(session: Session, *, booking_id: int, submitted_by: str) ->
 	if already_recorded(session, booking_id):
 		return NoShowResult(already_recorded=True)
 
-	record_meeting_outcome(
-		session,
-		MeetingOutcomeRecord(
-			client_id=_INTERNAL_SALES_CLIENT_ID,
-			contact_id=booking.target_contact_id,
-			company_id=booking.target_company_id,
-			meeting_occurred_at=booking.scheduled_at,
-			attendance_status="NO_SHOW",
-			submitted_by=submitted_by,
+	# Inline the meeting_outcomes INSERT rather than calling base's
+	# record_outcome(): that function opens its OWN get_db_context() session,
+	# which would split this write off from the pause + enqueue below and
+	# break the single-transaction guarantee this flow depends on. The row
+	# is minimal — a No-Show carries no PM-software / door-count / objections —
+	# so only the NOT NULL columns are set; objections defaults to '{}'. The
+	# unique (client_id, contact_id, meeting_occurred_at) makes it idempotent
+	# against a concurrent modal/no-show race.
+	session.execute(
+		text(
+			"INSERT INTO meeting_outcomes (client_id, contact_id, meeting_occurred_at, attendance_status, recorded_by) "
+			"VALUES (:client_id, :contact_id, :occurred, :attendance, :recorded_by) "
+			"ON CONFLICT (client_id, contact_id, meeting_occurred_at) DO NOTHING"
 		),
+		{
+			"client_id": _INTERNAL_SALES_CLIENT_ID, "contact_id": booking.target_contact_id,
+			"occurred": booking.scheduled_at, "attendance": _NO_SHOW_ATTENDANCE, "recorded_by": submitted_by,
+		},
 	)
 
 	session.execute(

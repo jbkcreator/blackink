@@ -23,7 +23,11 @@ from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_system_db_context
-from src.services.calendar_providers import GoogleCalendarClient, MicrosoftGraphClient
+from src.services.calendar_providers import (
+	GoogleCalendarClient,
+	MicrosoftGraphClient,
+	expires_at_ms_to_datetime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,9 +88,14 @@ def run_renewal_sweep() -> int:
 							"verification_secret = :secret, expires_at = :expires_at, updated_at = NOW() "
 							"WHERE connection_id = :id"
 						),
-						{"sub": new_channel_id, "secret": verification_secret, "expires_at": result.get("expires_at"), "id": connection.connection_id},
+						{
+							"sub": new_channel_id,
+							"secret": verification_secret,
+							"expires_at": expires_at_ms_to_datetime(result.get("expires_at_ms")),
+							"id": connection.connection_id,
+						},
 					)
-				else:
+				elif row.provider == "MICROSOFT":
 					client = MicrosoftGraphClient(session)
 					verification_secret = secrets.token_urlsafe(32)
 					result = client.register_subscription(
@@ -105,6 +114,17 @@ def run_renewal_sweep() -> int:
 							"id": connection.connection_id,
 						},
 					)
+				else:
+					# The due-connections query already filters to
+					# GOOGLE/MICROSOFT — this branch exists so a future
+					# third provider fails safe (skipped, logged) instead
+					# of silently falling into either provider's renewal
+					# path with the wrong tokens/API shape.
+					logger.warning(
+						"calendar_subscription_renewal: unexpected provider %s for connection %s, skipping",
+						row.provider, row.connection_id,
+					)
+					continue
 				renewed += 1
 			except Exception:
 				logger.exception("calendar_subscription_renewal: renewal failed for connection %s", row.connection_id)

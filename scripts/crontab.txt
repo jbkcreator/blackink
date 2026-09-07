@@ -1,0 +1,24 @@
+# Blackink scheduled jobs.
+#
+# Install on the server with:
+#   crontab scripts/crontab.txt
+#
+# Verify what's currently installed with:
+#   crontab -l
+#
+# cron does NOT inherit your interactive shell's environment (no .bashrc,
+# no exported vars) — every job below sets PYTHONPATH explicitly rather
+# than relying on it being set elsewhere, and reads DB/Slack credentials
+# from .env in the repo root via the app's own settings loader (unchanged).
+# Adjust the venv/repo paths below only if the actual server layout differs
+# from /root/blackink.
+#
+# One-time setup before installing this file:
+#   mkdir -p /root/blackink/logs
+
+# ── Daily pipeline digest -> #blackink-command ──────────────────────────
+# 8:00 AM America/New_York, per the blueprint's default. Reads the last 24h
+# of activity from the events table and posts a 7-metric summary to Slack.
+0 8 * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.daily_digest >> /root/blackink/logs/daily_digest.log 2>&1
+
+# ── Add future scheduled jobs below this line ───────────────────────────

@@ -29,12 +29,17 @@ PYTHONPATH=. python migrations/apply_pm_profiles.py
 PYTHONPATH=. python migrations/apply_owner_entities.py
 PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
+PYTHONPATH=. python migrations/apply_sandbox_dashboard_view.py   # read-only view over companies+events, not tenant-bearing — safe any time after both
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
 PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
 PYTHONPATH=. python migrations/apply_sending_domains.py
-PYTHONPATH=. python migrations/apply_agent_work_orders.py   # before RLS, after clients
-PYTHONPATH=. python migrations/apply_meeting_outcomes.py    # adds meeting_outcomes table + contacts.prospect_objections
+PYTHONPATH=. python migrations/apply_mailbox_last_used.py    # adds mailboxes.last_used_at (LRU rotation) — after sending_domains
+PYTHONPATH=. python migrations/apply_agent_work_orders.py   # Dev 3 — before RLS, after clients
+PYTHONPATH=. python migrations/apply_meeting_outcomes.py    # adds meeting_outcomes table
+PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
+PYTHONPATH=. python migrations/apply_sequence_runs.py       # Dev 3 — after agent_work_orders
+PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py  # Dev 3 — after sequence_runs
 PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # adds google_place_id to companies
 PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
 PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # OVS engine scoring table
@@ -62,6 +67,8 @@ python -m src.tasks.show_rate_reminder_sender
 python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
+python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
+python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
