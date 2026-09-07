@@ -34,12 +34,16 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgresql://blackink_owner:test_only_password@localhost:5432/blackink_test
+      DATABASE_URL_APP: postgresql://blackink_app:test_only_password@localhost:5432/blackink_test
+      DATABASE_URL_SYSTEM: postgresql://blackink_system:test_only_password@localhost:5432/blackink_test
       BLACKINK_APP_DB_PASSWORD: test_only_password
       BLACKINK_SYSTEM_DB_PASSWORD: test_only_password
       AKRASH_INGEST_DB_PASSWORD: test_only_password
       REDIS_URL: redis://localhost:6379/0
+      ADMIN_JWT_SECRET: ci-test-secret-not-for-production
       # Test-only keys (not real secrets) — required by
-      # src/core/token_crypto.py (calendar OAuth tests) and
+      # src/core/token_crypto.py's encrypt_token()/decrypt_token() (calendar
+      # OAuth tests, tests/test_token_crypto.py) and
       # src/services/no_show_prompts.py (Subtask 3.2.3's Mark No-Show
       # token tests), both of which exercise real
       # encryption/HMAC rather than mocking it.
@@ -69,6 +73,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_owner_entities.py
           PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
           PYTHONPATH=. python migrations/apply_events.py
+          PYTHONPATH=. python migrations/apply_sandbox_dashboard_view.py
           PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
           PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
           PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
@@ -83,6 +88,8 @@ jobs:
           PYTHONPATH=. python migrations/apply_companies_google_place_id.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py
           PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
+          PYTHONPATH=. python migrations/apply_ovs_audit_requests.py
+          PYTHONPATH=. python migrations/apply_admin_users.py
           PYTHONPATH=. python migrations/apply_owner_contacts.py
           PYTHONPATH=. python migrations/apply_calendar_connections.py
           PYTHONPATH=. python migrations/apply_bookings.py

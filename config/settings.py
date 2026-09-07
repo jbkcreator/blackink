@@ -199,6 +199,13 @@ class AppSettings(BaseSettings):
 	# before any halt can be issued or resumed. Recommended: 32+ bytes of entropy.
 	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
 
+	# ── Internal admin API ───────────────────────────────────────────────────
+	# HS256 signing secret for admin JWT tokens (internal dashboard auth).
+	# Fail-closed: if unset the /auth/login endpoint returns 503.
+	# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+	admin_jwt_secret: Optional[SecretStr] = Field(default=None, env="ADMIN_JWT_SECRET")
+	admin_jwt_expiry_hours: int = Field(default=8, env="ADMIN_JWT_EXPIRY_HOURS")
+
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
 

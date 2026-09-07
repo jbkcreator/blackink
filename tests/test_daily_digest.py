@@ -64,6 +64,16 @@ def test_main_flushes_buffered_events_before_posting():
     mock_flush.assert_called_once()
 
 
+def test_metrics_sql_excludes_the_demo_sandbox_client():
+    """Confirmed live: a digest run right after re-seeding the permanent
+    demo sandbox reported synthetic sandbox activity (cold emails,
+    appointments) as if it were real cross-client pipeline data, because
+    this platform-wide query has no client_id filter at all. The sandbox's
+    client_id must be explicitly excluded."""
+    assert "DEMO_FRIDAY_SANDBOX" in _METRICS_SQL
+    assert "client_id != 'DEMO_FRIDAY_SANDBOX'" in _METRICS_SQL or "client_id <> 'DEMO_FRIDAY_SANDBOX'" in _METRICS_SQL
+
+
 def test_metrics_sql_uses_owner_score_generated_not_ghost_shopper():
     """v2 spec correction: the digest must read from owner_score_generated,
     never from the permanently-deferred ghost-shopper events."""

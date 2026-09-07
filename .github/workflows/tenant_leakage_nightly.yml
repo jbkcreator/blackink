@@ -74,6 +74,8 @@ jobs:
           PYTHONPATH=. python migrations/apply_companies_google_place_id.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py
           PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
+          PYTHONPATH=. python migrations/apply_ovs_audit_requests.py
+          PYTHONPATH=. python migrations/apply_admin_users.py
           PYTHONPATH=. python migrations/apply_owner_contacts.py
           PYTHONPATH=. python migrations/apply_calendar_connections.py
           PYTHONPATH=. python migrations/apply_bookings.py

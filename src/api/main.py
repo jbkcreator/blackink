@@ -29,6 +29,11 @@ from fastapi import FastAPI
 
 from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
+from src.api.auth_router import router as auth_router
+from src.api.sandbox_router import router as sandbox_router
+from src.api.metrics_router import router as metrics_router
+from src.api.meetings_router import router as meetings_router
+from src.api.ovs_router import router as ovs_router
 from src.api.booking_webhook_router import router as booking_webhook_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
 from src.api.public_landing_router import router as public_landing_router
@@ -147,6 +152,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Blackink API", lifespan=lifespan)
 
 app.include_router(akrash_router)
+app.include_router(auth_router)
+app.include_router(sandbox_router)
+app.include_router(metrics_router)
+app.include_router(meetings_router)
+app.include_router(ovs_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
 app.include_router(public_landing_router)
