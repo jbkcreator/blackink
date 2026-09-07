@@ -185,12 +185,48 @@ def cmd_sweep(client_id: str) -> int:
 		try:
 			receipt = dispatcher(claimed)
 		except Exception as exc:
-			wo.record_execution_result(claimed.client_id, claimed.action_id, success=False, receipt={}, error=str(exc))
-			_line(f"action_id={claimed.action_id} dispatch FAILED: {exc}")
+			finalised = wo.record_execution_result(claimed.client_id, claimed.action_id, success=False, receipt={}, error=str(exc))
+			if finalised is None:
+				# None means row was reclaimed mid-flight — alert #blackink-qa
+				_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT during failure — result unrecordable; alert #blackink-qa")
+			else:
+				_line(f"action_id={claimed.action_id} dispatch FAILED: {exc}")
 			failed += 1
 			continue
 
-		wo.record_execution_result(claimed.client_id, claimed.action_id, success=True, receipt=receipt)
+		# Explicit failure from the dispatcher (finding #3) — a send that failed
+		# or is ambiguous (SEND_FAILED/RECLAIMED/NO_CONTENT/CONTACT_NOT_FOUND).
+		# Route to FAILED + alert instead of silently finalising as DONE.
+		if receipt.get("fail"):
+			finalised = wo.record_execution_result(
+				claimed.client_id, claimed.action_id, success=False, receipt=receipt,
+				error=f"dispatch outcome={receipt.get('outcome')}",
+			)
+			if finalised is None:
+				_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT during fail-finalise — alert #blackink-qa")
+			else:
+				_line(f"action_id={claimed.action_id} FAILED (outcome={receipt.get('outcome')}) — alert #blackink-qa for reconciliation")
+			failed += 1
+			continue
+
+		if receipt.get("defer"):
+			from datetime import timedelta
+			until = datetime.now(timezone.utc) + timedelta(hours=1)
+			deferred_row = wo.defer_execution(claimed.client_id, claimed.action_id, until=until)
+			if deferred_row is None:
+				_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT during defer — alert #blackink-qa")
+				failed += 1
+			else:
+				_line(f"action_id={claimed.action_id} DEFERRED (mailboxes at 24h cap) -> SNOOZED until {until.isoformat()}")
+				deferred += 1
+			continue
+
+		finalised = wo.record_execution_result(claimed.client_id, claimed.action_id, success=True, receipt=receipt)
+		if finalised is None:
+			# None means row was reclaimed mid-flight — alert #blackink-qa
+			_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT — dispatch ran but result unrecordable; alert #blackink-qa")
+			failed += 1
+			continue
 		_line(f"action_id={claimed.action_id} DONE")
 		sent += 1
 

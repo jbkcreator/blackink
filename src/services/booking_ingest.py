@@ -832,4 +832,22 @@ def link_booking_to_owner(session: Session, booking_id: int, owner_contact_id: i
 		),
 		{"ocid": owner_contact_id, "bid": booking_id},
 	)
+	# A booking that reached the confirmation queue before this reconciliation
+	# always failed immediately with this exact error (send_confirmation_for_booking
+	# marks FAILED_PERMANENT the instant owner_email is NULL) — that status is
+	# never reclaimed by claim_confirmations(), so without this reset the
+	# confirmation email is lost permanently. Scoped to this one error string:
+	# NOT_REQUIRED bookings (baseline-suppressed, pre-dating the connection)
+	# must stay untouched forever regardless of reconciliation, and a
+	# FAILED_PERMANENT from a real provider error (max attempts exhausted)
+	# must not be silently resurrected just because an owner got matched.
+	session.execute(
+		text(
+			"UPDATE bookings SET confirmation_status = 'PENDING', confirmation_attempts = 0, "
+			"confirmation_last_error = NULL, confirmation_next_retry_at = NULL, updated_at = NOW() "
+			"WHERE booking_id = :bid AND confirmation_status = 'FAILED_PERMANENT' "
+			"AND confirmation_last_error = 'no owner_contact email on file'"
+		),
+		{"bid": booking_id},
+	)
 	_record_event(session, booking.client_id, "booking_reconciled", booking_id, {"owner_contact_id": owner_contact_id})

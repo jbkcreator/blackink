@@ -32,6 +32,18 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
+
+def expires_at_ms_to_datetime(expires_at_ms: Optional[str]) -> Optional[datetime]:
+    """Google's watch registration returns `expiration` as an epoch-ms
+    string (per the Google Calendar API's own JSON convention for that
+    field) — converts it to a real TIMESTAMPTZ value so
+    calendar_connections.expires_at is populated the same way for both
+    providers, instead of Google connections permanently carrying a NULL
+    expiry that makes every renewal sweep tick treat them as due."""
+    if expires_at_ms is None:
+        return None
+    return datetime.fromtimestamp(int(expires_at_ms) / 1000, tz=timezone.utc)
+
 import requests
 
 from src.services.booking_ingest import (
@@ -149,22 +161,11 @@ class GoogleCalendarClient:
 		)
 		resp.raise_for_status()
 		body = resp.json()
-		# Google returns `expiration` as a Unix timestamp in MILLISECONDS,
-		# as a string. Parse it to a tz-aware datetime here so every caller
-		# persists calendar_connections.expires_at consistently — without a
-		# stored expiry the renewal sweep treats the connection as perpetually
-		# due and creates a fresh watch channel on every tick.
-		expiration_ms = body.get("expiration")
-		expires_at = (
-			datetime.fromtimestamp(int(expiration_ms) / 1000, tz=timezone.utc)
-			if expiration_ms
-			else None
-		)
-		return {
-			"resource_id": body["resourceId"],
-			"expires_at_ms": expiration_ms,
-			"expires_at": expires_at,
-		}
+		# Google returns `expiration` as a Unix timestamp in MILLISECONDS, as a
+		# string. It is handed back raw; every caller converts it through
+		# expires_at_ms_to_datetime() before persisting expires_at — one
+		# conversion path, so a caller can't accidentally store the raw ms.
+		return {"resource_id": body["resourceId"], "expires_at_ms": body.get("expiration")}
 
 
 def _is_tagged_microsoft(item: dict) -> bool:

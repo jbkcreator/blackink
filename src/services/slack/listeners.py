@@ -39,19 +39,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+from datetime import datetime as _datetime
+
 from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
-from src.core.database import get_db_context
+from src.core.database import get_db_context, get_system_db_context
 from src.services import work_orders as wo
-from src.services.meeting_outcome_prompts import outcome_recorded_for_booking
-from src.services.meeting_outcomes import MeetingOutcomeRecord, record_meeting_outcome
 from src.services.no_show_prompts import verify_no_show_token
 from src.services.no_show_recovery import already_recorded, trigger_recovery
+from src.services.events import log_event as _shared_log_event, MalformedEventError
+from src.services.meeting_outcomes import record_outcome
 from src.services.slack import payload_hash, post
 from src.services.slack.auth import approver_authorized
 from src.services.slack.bolt_app import get_listener_app
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 
 logger = logging.getLogger(__name__)
 
@@ -93,25 +94,14 @@ def _snooze_until(duration_key: str, now: Optional[datetime] = None) -> datetime
 
 
 def _log_event(client_id: str, event_type: str, *, entity_id: str, actor: str, payload: dict) -> None:
-	"""Matches the raw-SQL pattern already established in
-	src/tasks/promotion_sweep.py — no shared events-writer helper exists
-	yet in this codebase, so this stays consistent with that rather than
-	introducing a new abstraction for one caller."""
+	"""Thin adapter over src.services.events.log_event — kept as a private
+	wrapper (not a call-site-by-call-site rewrite) so this diff stays
+	minimal; entity_type is fixed at 'work_order' here because every
+	existing caller in this file logs against a work order."""
 	try:
-		with get_db_context(client_id=client_id) as session:
-			session.execute(
-				text(
-					"INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
-					"VALUES (:client_id, :event_type, 'work_order', :entity_id, :actor, :payload)"
-				),
-				{
-					"client_id": client_id,
-					"event_type": event_type,
-					"entity_id": entity_id,
-					"actor": actor,
-					"payload": json.dumps(payload),
-				},
-			)
+		_shared_log_event(client_id, event_type, entity_type="work_order", entity_id=entity_id, actor=actor, payload=payload)
+	except MalformedEventError:
+		logger.error("[listeners] malformed event payload, not written (event_type=%s)", event_type, exc_info=True)
 	except Exception:
 		logger.error("[listeners] failed to write events row (event_type=%s)", event_type, exc_info=True)
 
@@ -160,7 +150,21 @@ def _card_button_blocks(order: "wo.WorkOrder") -> list:
 
 
 def _card_text(order: "wo.WorkOrder") -> str:
-	subject = order.payload.get("subject") if isinstance(order.payload, dict) else None
+	payload = order.payload if isinstance(order.payload, dict) else {}
+
+	if order.action_class == "DISPATCH_EMAIL_TOUCH":
+		touch_step = payload.get("touch_step", "?")
+		run_id_short = str(payload.get("run_id", ""))[:8]
+		subject = payload.get("subject") or f"Touch {touch_step} — cold outreach sequence"
+		body_preview = payload.get("body_preview") or "(email copy generated at send time — placeholder pending Dev 2 assets)"
+		return (
+			f"*Email Touch {touch_step}* (`{order.action_id[:8]}`) — run `{run_id_short}`\n"
+			f"To: `{order.recipient or 'n/a'}`\n"
+			f"Subject: _{subject}_\n"
+			f"{body_preview}"
+		)
+
+	subject = payload.get("subject")
 	preview = subject or str(order.payload)[:120]
 	return (
 		f"*{order.action_class}* (`{order.action_id[:8]}`)\n"
@@ -182,7 +186,45 @@ async def post_work_order_card(order: "wo.WorkOrder", *, channel_key: str) -> Op
 	return order
 
 
+def _email_touch_content_blocks(order: "wo.WorkOrder") -> list:
+	"""Rich Block Kit layout for a DISPATCH_EMAIL_TOUCH approval card: a header,
+	a To/Touch fields row, the subject, a blockquoted body preview, and a
+	context line for the attachment + run/action ids. Subject/body/attachment
+	fill from the work-order payload once real copy is composed there (ticket 25);
+	until then they show a clear 'pending' placeholder rather than a raw dict."""
+	payload = order.payload if isinstance(order.payload, dict) else {}
+	touch_step = payload.get("touch_step", "?")
+	run_id_short = str(payload.get("run_id", ""))[:8]
+	subject = payload.get("subject") or f"Touch {touch_step} — cold outreach sequence"
+	body_preview = payload.get("body_preview") or "_Email copy is generated at send time — placeholder pending client copy (C2) and the Owner Visibility Score PDF (Dev 2, C3)._"
+	attachment = payload.get("attachment_name") or "Owner Visibility Score PDF (pending Dev 2)"
+	# Body preview as a blockquote, capped so the card stays compact.
+	quoted = "\n".join(f"> {ln}" for ln in body_preview.splitlines()[:6]) or f"> {body_preview}"
+
+	return [
+		{"type": "header", "text": {"type": "plain_text", "text": f"\U0001F4E7 Email Touch {touch_step} · Approval needed", "emoji": True}},
+		{
+			"type": "section",
+			"fields": [
+				{"type": "mrkdwn", "text": f"*To*\n{order.recipient or 'n/a'}"},
+				{"type": "mrkdwn", "text": f"*Touch*\nStep {touch_step} of 5"},
+			],
+		},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Subject*\n{subject}"}},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Preview*\n{quoted}"}},
+		{
+			"type": "context",
+			"elements": [
+				{"type": "mrkdwn", "text": f"\U0001F4CE {attachment}  ·  run `{run_id_short}`  ·  `{order.action_id[:8]}`"},
+			],
+		},
+		{"type": "divider"},
+	]
+
+
 def _card_text_blocks(order: "wo.WorkOrder") -> list:
+	if order.action_class == "DISPATCH_EMAIL_TOUCH":
+		return _email_touch_content_blocks(order) + _card_button_blocks(order)
 	return [{"type": "section", "text": {"type": "mrkdwn", "text": _card_text(order)}}] + _card_button_blocks(order)
 
 
@@ -257,6 +299,12 @@ async def _finalize_terminal_decision(order: "wo.WorkOrder", *, decision: str, u
 		# work_orders.record_decision caught it. Not an error; just no-op.
 		await respond(response_type="ephemeral", text=":information_source: This was just decided by someone else.")
 		return
+	# Decrement Cora's approval backlog for human review decisions so the
+	# throttle can resume when the queue clears. SKIPPED/SNOOZED are not
+	# "reviewed" — only a genuine approve or reject counts as a resolved draft.
+	if decision in {"APPROVED", "REJECTED"}:
+		from src.agents.cora.throttle import notify_approval_resolved
+		notify_approval_resolved()
 	_log_event(order.client_id, "work_order_decided", entity_id=order.action_id, actor=f"slack:{user_id}", payload={"decision": decision})
 	if decided.slack_channel_id and decided.slack_message_ts:
 		await post.update_card(
@@ -616,38 +664,193 @@ async def handle_mark_no_show(ack, body, respond, action):
 			await respond(response_type="ephemeral", text=":information_source: Already marked no-show by someone else.")
 			return
 
-		try:
-			trigger_recovery(session, booking_id=booking_id, submitted_by=f"slack:{user_id}")
-		except IntegrityError:
-			# Lost the race to a concurrent submit (this surface or the setter-
-			# channel outcome modal) between already_recorded() and the insert —
-			# the unique meeting-outcome index caught the duplicate. Not an error.
-			await respond(response_type="ephemeral", text=":information_source: Already marked no-show by someone else.")
-			return
+		trigger_recovery(session, booking_id=booking_id, submitted_by=f"slack:{user_id}")
 
 	await respond(response_type="in_channel", text=f":x: Marked no-show for booking `{booking_id}` by <@{user_id}> — recovery email enqueued.")
+# ── Post-meeting outcome modal (blueprint §3.1.7) — NO trigger wired here
+# by design. The Outbound Sequencer & Booking Engine's post-meeting Slack
+# card (not yet shipped) is the only entry point: its button handler calls
+# open_meeting_outcome_modal() directly. See this task's brief for the
+# rejected-alternative note on why there is deliberately no interim slash
+# command. ─────────────────────────────────────────────────────────────
+
+_MEETING_OUTCOME_CALLBACK_ID = "meeting_outcome_modal"
+
+_PM_SOFTWARE_OPTIONS = ["AppFolio", "Buildium", "Propertyware", "Rent Manager", "Other", "Unknown"]
+_OBJECTION_OPTIONS = ["Pricing", "Software Integration", "Capacity", "Existing Agency"]
 
 
-# ── Log Outcome — Addendum to Subtask 3.2.1, opens 4.2.2's modal ────────
+def _meeting_outcome_modal_view(contact_id: str, meeting_occurred_at: str) -> dict:
+	return {
+		"type": "modal",
+		"callback_id": _MEETING_OUTCOME_CALLBACK_ID,
+		"private_metadata": json.dumps({"contact_id": contact_id, "meeting_occurred_at": meeting_occurred_at}),
+		"title": {"type": "plain_text", "text": "Log Meeting Outcome"},
+		"submit": {"type": "plain_text", "text": "Submit"},
+		"close": {"type": "plain_text", "text": "Cancel"},
+		"blocks": [
+			{
+				"type": "input", "block_id": "attendance_block",
+				"label": {"type": "plain_text", "text": "Meeting Attendance Status"},
+				"element": {
+					"type": "static_select", "action_id": "attendance",
+					"options": [{"text": {"type": "plain_text", "text": v}, "value": v} for v in ("Held", "No-Show", "Rescheduled")],
+				},
+			},
+			{
+				"type": "input", "block_id": "pm_software_block", "optional": True,
+				"label": {"type": "plain_text", "text": "Target PM Software"},
+				"element": {
+					"type": "static_select", "action_id": "pm_software",
+					"options": [{"text": {"type": "plain_text", "text": v}, "value": v} for v in _PM_SOFTWARE_OPTIONS],
+				},
+			},
+			{
+				"type": "input", "block_id": "door_count_block", "optional": True,
+				"label": {"type": "plain_text", "text": "Estimated Door Count"},
+				"element": {"type": "number_input", "action_id": "door_count", "is_decimal_allowed": False},
+			},
+			{
+				"type": "input", "block_id": "objections_block", "optional": True,
+				"label": {"type": "plain_text", "text": "Stated Objections"},
+				"element": {
+					"type": "multi_static_select", "action_id": "objections",
+					"options": [{"text": {"type": "plain_text", "text": v}, "value": v} for v in _OBJECTION_OPTIONS],
+				},
+			},
+			{
+				"type": "input", "block_id": "next_action_block",
+				"label": {"type": "plain_text", "text": "Next Action"},
+				"element": {"type": "plain_text_input", "action_id": "next_action", "max_length": 280},
+			},
+		],
+	}
 
-_MEETING_OUTCOME_CALLBACK_ID = "meeting_outcome_submit"
-# The card's own 24-hour life. NOT part of the payload hash (the preimage is
-# FIXED — see payload_hash.py); enforced as an explicit created_at + TTL
-# check here and in the submit handler, so a click on an expired card is
-# rejected exactly like a click on an altered one.
+
+async def open_meeting_outcome_modal(*, trigger_id: str, contact_id: str, meeting_occurred_at: str) -> bool:
+	"""THE entry point into the post-meeting form — exported for the
+	Outbound Sequencer & Booking Engine's booking-confirmation card handler
+	to call from its "Log Outcome" button. There is deliberately no slash
+	command and no other trigger (see this task's design note): that card
+	is the only way in.
+
+	trigger_id comes from the Slack interaction that is opening this modal
+	and expires ~3 seconds after it — call this immediately on the click,
+	never after an await that could cross that window.
+
+	meeting_occurred_at is an ISO 8601 string, validated here rather than
+	trusted: it becomes part of the modal's private_metadata and then the
+	upsert key, so a malformed value would surface as a confusing failure
+	at submit time, long after the mistake. contact_id is validated for the
+	identical reason — it is int()-cast unguarded at submit time in
+	handle_meeting_outcome_submit.
+	"""
+	try:
+		_datetime.fromisoformat(meeting_occurred_at)
+	except (ValueError, TypeError):
+		logger.error(
+			"[listeners] open_meeting_outcome_modal: meeting_occurred_at=%r is not ISO 8601 — modal not opened",
+			meeting_occurred_at,
+		)
+		return False
+	try:
+		int(contact_id)
+	except (ValueError, TypeError):
+		logger.error(
+			"[listeners] open_meeting_outcome_modal: contact_id=%r is not an int — modal not opened",
+			contact_id,
+		)
+		return False
+	return await post.open_modal(
+		trigger_id=trigger_id,
+		view=_meeting_outcome_modal_view(contact_id, meeting_occurred_at),
+	)
+
+
+@app.view(_MEETING_OUTCOME_CALLBACK_ID)
+async def handle_meeting_outcome_submit(ack, body, view):
+	user_id = body.get("user", {}).get("id", "")
+	meta = json.loads(view.get("private_metadata", "{}"))
+	values = view["state"]["values"]
+
+	attendance = values["attendance_block"]["attendance"]["selected_option"]["value"]
+	pm_software_option = values["pm_software_block"]["pm_software"].get("selected_option")
+	door_count_raw = values["door_count_block"]["door_count"].get("value")
+	objection_options = values["objections_block"]["objections"].get("selected_options") or []
+	next_action = values["next_action_block"]["next_action"]["value"]
+
+	await ack()
+
+	# contacts has no client_id column of its own (scoped through its parent
+	# companies.owning_client_id, per config/tenant_policies.py's "join"
+	# mode) — resolving the real owning client_id for an arbitrary
+	# contact_id requires a cross-tenant lookup. This is a batch/system-style
+	# read used only to find which tenant a Slack-submitted contact_id
+	# belongs to before writing through the tenant-scoped path, consistent
+	# with queued_depth(client_id=None)'s existing precedent.
+	with get_system_db_context() as session:
+		row = session.execute(
+			text("SELECT co.owning_client_id FROM contacts c JOIN companies co USING(company_id) WHERE c.contact_id = :cid"),
+			{"cid": int(meta["contact_id"])},
+		).mappings().first()
+	if row is None or row["owning_client_id"] is None:
+		await post.post_notice(channel_key="qa", text=f":warning: meeting_outcome submit for unresolvable contact_id={meta['contact_id']}")
+		return
+	client_id_for_contact = row["owning_client_id"]
+
+	try:
+		record_outcome(
+			client_id_for_contact,
+			contact_id=int(meta["contact_id"]),
+			meeting_occurred_at=_datetime.fromisoformat(meta["meeting_occurred_at"]),
+			attendance_status=attendance,
+			pm_software=pm_software_option["value"] if pm_software_option else None,
+			door_count_est=int(door_count_raw) if door_count_raw else None,
+			objections=[o["value"] for o in objection_options],
+			next_action=next_action,
+			recorded_by=f"slack:{user_id}",
+		)
+	except Exception as exc:
+		logger.error(
+			"[listeners] record_outcome failed for contact_id=%s — outcome lost",
+			meta["contact_id"], exc_info=True,
+		)
+		await post.post_notice(
+			channel_key="qa",
+			text=f":warning: meeting_outcome record_outcome failed for contact_id={meta['contact_id']}: {exc}",
+		)
+		return
+
+	if attendance == "No-Show":
+		# TODO(no-show-pause): the real outbound-sequence pause lives in the
+		# Outbound Sequencer & Booking Engine's Subtask 3.2.3 no-show
+		# handler, which does not exist on this branch yet — this notice is
+		# a visible flag of that gap, not a substitute for the real pause.
+		await post.post_notice(
+			channel_key="setter",
+			text=f":warning: No-show recorded for contact `{meta['contact_id']}` by <@{user_id}> — outbound sequence pause is the Booking Engine's no-show handler (Subtask 3.2.3), not yet wired here.",
+		)
+
+
+# ── Log Outcome trigger card (Addendum to Subtask 3.2.1) ────────────────
+# The card posted by src/tasks/meeting_outcome_prompt_sender.py carries a
+# "Log Outcome" button. This handler is the ONLY new piece the addendum
+# adds to the outcome flow: it validates the card, then opens the canonical
+# §3.1.7 modal above (open_meeting_outcome_modal). The modal, its submit
+# handler, and record_outcome are the base's — not re-implemented here.
+
 _MEETING_OUTCOME_CARD_TTL = timedelta(hours=24)
-_ATTENDANCE_OPTIONS = [
-	("ATTENDED", "Attended"),
-	("NO_SHOW", "No-show"),
-	("RESCHEDULED", "Rescheduled"),
-	("CANCELLED", "Cancelled"),
-]
-_ATTENDANCE_VALUES = frozenset(v for v, _ in _ATTENDANCE_OPTIONS)
+
+
+def _meeting_outcome_expired(order: "wo.WorkOrder", *, now: datetime) -> bool:
+	# The 24h expiry is deliberately NOT part of the payload hash (that
+	# preimage is FIXED); it's an explicit created_at + TTL check here.
+	return now > order.created_at + _MEETING_OUTCOME_CARD_TTL
 
 
 def _booking_is_cancelled(session, booking_id) -> bool:
-	"""Live booking-status read shared by the click and submit paths — a
-	booking cancelled after its card was posted must be rejected in both."""
+	"""Live booking-status read — a booking cancelled after its card was
+	posted must not still present the outcome form."""
 	if booking_id is None:
 		return False
 	row = session.execute(
@@ -657,100 +860,11 @@ def _booking_is_cancelled(session, booking_id) -> bool:
 	return row is None or row.event_status == "CANCELLED"
 
 
-def _meeting_outcome_expired(order: "wo.WorkOrder", *, now: datetime) -> bool:
-	return now > order.created_at + _MEETING_OUTCOME_CARD_TTL
-
-
-async def open_meeting_outcome_modal(
-	client,
-	*,
-	trigger_id: str,
-	contact_id,
-	meeting_occurred_at,
-	private_metadata: str,
-) -> bool:
-	"""Opens the post-meeting outcome modal (the receiving function the
-	addendum's trigger card exists to call). Validates the two values the
-	button carries — contact_id must be int-parseable, meeting_occurred_at
-	must parse as ISO 8601 — and, on malformed input, logs a warning and
-	returns WITHOUT opening, no crash and no modal (the DoD's own guard-
-	clause line). trigger_id is single-use and ~3s-lived, so the caller must
-	reach this with no awaited network I/O in between."""
-	try:
-		int(str(contact_id))
-	except (TypeError, ValueError):
-		logger.warning("[log_meeting_outcome] refusing to open modal — non-int contact_id=%r", contact_id)
-		return False
-	try:
-		datetime.fromisoformat(str(meeting_occurred_at))
-	except (TypeError, ValueError):
-		logger.warning("[log_meeting_outcome] refusing to open modal — non-ISO meeting_occurred_at=%r", meeting_occurred_at)
-		return False
-
-	await client.views_open(
-		trigger_id=trigger_id,
-		view={
-			"type": "modal",
-			"callback_id": _MEETING_OUTCOME_CALLBACK_ID,
-			"private_metadata": private_metadata,
-			"title": {"type": "plain_text", "text": "Log Outcome"},
-			"submit": {"type": "plain_text", "text": "Save"},
-			"close": {"type": "plain_text", "text": "Cancel"},
-			"blocks": [
-				{
-					"type": "input",
-					"block_id": "attendance_block",
-					"label": {"type": "plain_text", "text": "What happened?"},
-					"element": {
-						"type": "static_select",
-						"action_id": "attendance_status",
-						"placeholder": {"type": "plain_text", "text": "Select an outcome"},
-						"options": [
-							{"text": {"type": "plain_text", "text": label}, "value": value}
-							for value, label in _ATTENDANCE_OPTIONS
-						],
-					},
-				},
-				{
-					"type": "input",
-					"block_id": "pm_software_block",
-					"optional": True,
-					"label": {"type": "plain_text", "text": "PM software (if stated)"},
-					"element": {"type": "plain_text_input", "action_id": "pm_software_stated"},
-				},
-				{
-					"type": "input",
-					"block_id": "door_count_block",
-					"optional": True,
-					"label": {"type": "plain_text", "text": "Door count (if stated)"},
-					"element": {"type": "plain_text_input", "action_id": "door_count_stated"},
-				},
-				{
-					"type": "input",
-					"block_id": "objections_block",
-					"optional": True,
-					"label": {"type": "plain_text", "text": "Objections"},
-					"element": {"type": "plain_text_input", "action_id": "objections_stated", "multiline": True},
-				},
-				{
-					"type": "input",
-					"block_id": "next_action_block",
-					"optional": True,
-					"label": {"type": "plain_text", "text": "Next action"},
-					"element": {"type": "plain_text_input", "action_id": "next_action", "multiline": True},
-				},
-			],
-		},
-	)
-	return True
-
-
 @app.action("log_meeting_outcome")
 async def handle_log_meeting_outcome(ack, body, respond, action, client):
-	"""Deliberately NOT _load_and_verify: that prelude re-posts a generic
-	work-order card via post_work_order_card() on a stale hash, which is
-	wrong for this card type. Everything here is in-memory / one DB read so
-	views_open lands inside Slack's ~3s trigger_id window."""
+	"""Opens the canonical meeting-outcome modal for the assigned closer.
+	Everything here is in-memory / one DB read so open_meeting_outcome_modal
+	lands inside Slack's ~3s trigger_id window."""
 	await ack()
 	user_id = body.get("user", {}).get("id", "")
 	try:
@@ -779,193 +893,20 @@ async def handle_log_meeting_outcome(ack, body, respond, action, client):
 		await respond(response_type="ephemeral", text=":warning: This action has expired or was altered.")
 		return
 
-	# The card is bound to the assigned closer via the work order's recipient,
-	# which is inside the hash preimage — so a verified-fresh card already
-	# proves recipient is unchanged; this compares the CLICKER against it.
 	if order.recipient != user_id:
 		await respond(response_type="ephemeral", text=":no_entry: This meeting is assigned to a different closer.")
 		return
 
-	payload = order.payload or {}
-
-	# Live cancellation re-check before opening the modal — a booking cancelled
-	# after this card was posted must not even present a form to fill in.
+	# Live cancellation re-check before opening the modal.
 	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
-		if _booking_is_cancelled(session, payload.get("booking_id")):
+		if _booking_is_cancelled(session, (order.payload or {}).get("booking_id")):
 			await respond(response_type="ephemeral", text=":information_source: This meeting was cancelled — no outcome can be logged.")
 			return
 
-	private_metadata = json.dumps(
-		{
-			"client_id": order.client_id,
-			"action_id": order.action_id,
-			"payload_hash": payload_hash.compute(order),
-			"booking_id": payload.get("booking_id"),
-			"contact_id": value.get("contact_id"),
-			"company_id": payload.get("company_id"),
-			"meeting_occurred_at": value.get("meeting_occurred_at"),
-			"channel_id": order.slack_channel_id,
-			"message_ts": order.slack_message_ts,
-		}
-	)
+	# Hand off to the base's canonical §3.1.7 modal (it validates contact_id /
+	# meeting_occurred_at itself and derives everything else at submit time).
 	await open_meeting_outcome_modal(
-		client,
 		trigger_id=body["trigger_id"],
 		contact_id=value.get("contact_id"),
 		meeting_occurred_at=value.get("meeting_occurred_at"),
-		private_metadata=private_metadata,
 	)
-
-
-def _modal_value(view: dict, block_id: str, action_id: str):
-	block = view["state"]["values"].get(block_id, {}).get(action_id, {})
-	if block.get("type") == "static_select":
-		selected = block.get("selected_option")
-		return selected.get("value") if selected else None
-	return block.get("value")
-
-
-@app.view(_MEETING_OUTCOME_CALLBACK_ID)
-async def handle_meeting_outcome_submit(ack, body, view):
-	"""Global — receives the submission regardless of what opened the modal
-	(this handler and 4.2.2's are one and the same). Re-verifies auth, hash
-	and the 24h window because a view_submission is a separate inbound
-	request and the modal can sit open; then one transaction writes the
-	outcome and closes out the card."""
-	user_id = body.get("user", {}).get("id", "")
-	try:
-		meta = json.loads(view.get("private_metadata", "{}"))
-	except (json.JSONDecodeError, TypeError):
-		await ack(response_action="errors", errors={"attendance_block": "Internal error — could not read card context. Close this and try again."})
-		return
-
-	client_id = meta.get("client_id")
-	action_id = meta.get("action_id")
-
-	if not approver_authorized(user_id, client_id=client_id):
-		await ack(response_action="errors", errors={"attendance_block": "Not authorized to act on this card."})
-		return
-
-	order = wo.get(client_id, action_id) if client_id and action_id else None
-	if order is None:
-		await ack(response_action="errors", errors={"attendance_block": "This card is no longer available."})
-		return
-
-	verdict = payload_hash.verify(order, meta.get("payload_hash"))
-	if not verdict.fresh or _meeting_outcome_expired(order, now=datetime.now(timezone.utc)):
-		await ack(response_action="errors", errors={"attendance_block": "This action has expired or was altered. Nothing was saved."})
-		return
-
-	if order.status != "QUEUED":
-		await ack(response_action="errors", errors={"attendance_block": f"Already logged (status={order.status})."})
-		return
-
-	if order.recipient != user_id:
-		await ack(response_action="errors", errors={"attendance_block": "This meeting is assigned to a different closer."})
-		return
-
-	# Parse the door count before ack — a non-numeric entry is a field-level
-	# error the modal shows in place, not a silent drop.
-	door_count_raw = _modal_value(view, "door_count_block", "door_count_stated")
-	door_count = None
-	if door_count_raw not in (None, ""):
-		try:
-			door_count = int(str(door_count_raw).strip())
-		except ValueError:
-			await ack(response_action="errors", errors={"door_count_block": "Enter a whole number, or leave blank."})
-			return
-
-	booking_id = meta.get("booking_id")
-	contact_id = int(str(meta.get("contact_id")))
-	company_id = meta.get("company_id")
-	try:
-		meeting_occurred_at = datetime.fromisoformat(str(meta.get("meeting_occurred_at")))
-	except (TypeError, ValueError):
-		await ack(response_action="errors", errors={"attendance_block": "Internal error — bad meeting time on this card."})
-		return
-
-	attendance_status = _modal_value(view, "attendance_block", "attendance_status")
-	if attendance_status not in _ATTENDANCE_VALUES:
-		# Validated before any write so a bad value can never leave a claimed
-		# work order behind (record_meeting_outcome would otherwise raise after
-		# the claim). Normally unreachable — the modal is a constrained select.
-		await ack(response_action="errors", errors={"attendance_block": "Invalid outcome — pick one of the listed options."})
-		return
-	pm_software = _modal_value(view, "pm_software_block", "pm_software_stated") or None
-	objections = _modal_value(view, "objections_block", "objections_stated") or None
-	next_action = _modal_value(view, "next_action_block", "next_action") or None
-
-	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
-		# Live cancellation re-check: a booking cancelled AFTER its card was
-		# posted must not still be recordable. The card's hash/expiry/status all
-		# still look valid, so this is the only guard that catches it.
-		if _booking_is_cancelled(session, booking_id):
-			await ack(response_action="errors", errors={"attendance_block": "This meeting was cancelled — no outcome can be logged."})
-			return
-
-		# A NO_SHOW may already have been logged from the #blackink-command
-		# "Mark No-Show" card — the two surfaces log the same meeting.
-		if booking_id is not None and outcome_recorded_for_booking(session, booking_id):
-			await ack(response_action="errors", errors={"attendance_block": "An outcome was already logged for this meeting."})
-			return
-
-		# Atomically CLAIM the work order before inserting the outcome — this is
-		# the concurrency gate for two simultaneous submissions of the SAME
-		# card: only one UPDATE ... WHERE status='QUEUED' can win (row lock
-		# serializes them), and the loser records nothing.
-		claimed = session.execute(
-			text(
-				"UPDATE agent_work_orders SET status = 'DONE', decided_by = :decided_by, "
-				"decided_at = NOW(), updated_at = NOW() "
-				"WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED' "
-				"RETURNING action_id"
-			),
-			{"decided_by": f"slack:{user_id}", "action_id": action_id, "client_id": client_id},
-		).first()
-		if claimed is None:
-			await ack(response_action="errors", errors={"attendance_block": "An outcome was already logged for this meeting."})
-			return
-
-		try:
-			# Savepoint so the unique-index backstop (a cross-surface race with
-			# the no-show click, which has no work order to gate it) rolls back
-			# only the failed insert — the work-order claim above still commits,
-			# leaving the card correctly resolved.
-			with session.begin_nested():
-				record_meeting_outcome(
-					session,
-					MeetingOutcomeRecord(
-						client_id=_INTERNAL_SALES_CLIENT_ID,
-						contact_id=contact_id,
-						company_id=company_id,
-						meeting_occurred_at=meeting_occurred_at,
-						attendance_status=attendance_status,
-						pm_software_stated=pm_software,
-						door_count_stated=door_count,
-						objections_stated=objections,
-						next_action=next_action,
-						submitted_by=f"slack:{user_id}",
-					),
-				)
-		except IntegrityError:
-			await ack(response_action="errors", errors={"attendance_block": "An outcome was already logged for this meeting."})
-			return
-
-	await ack()
-
-	_log_event(
-		client_id, "meeting_outcome_recorded", entity_id=action_id, actor=f"slack:{user_id}",
-		payload={"contact_id": contact_id, "booking_id": booking_id, "attendance_status": attendance_status},
-	)
-
-	if order.slack_channel_id and order.slack_message_ts:
-		await post.update_card(
-			channel_id=order.slack_channel_id,
-			message_ts=order.slack_message_ts,
-			text=f"{_card_text(order)}\n\n*Outcome logged* ({attendance_status}) by <@{user_id}>",
-		)
-
-
-@app.view_closed(_MEETING_OUTCOME_CALLBACK_ID)
-async def handle_meeting_outcome_closed(ack):
-	await ack()

@@ -86,20 +86,11 @@ DDL = [
 	"ALTER TABLE meeting_outcome_prompt_jobs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0",
 	"ALTER TABLE meeting_outcome_prompt_jobs ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ",
 
-	# Database-level idempotency backstop for meeting_outcomes: exactly one
-	# outcome per meeting. A meeting is identified by (contact_id,
-	# meeting_occurred_at) — a contact cannot be in two meetings at the same
-	# instant — which is also the pair booking-linked lookups already key on
-	# (bookings.target_contact_id + bookings.scheduled_at). Without this, two
-	# concurrent modal submissions (or a modal submit racing a "Mark No-Show"
-	# click on the same meeting) can both pass the app-level "already recorded?"
-	# check and insert duplicate, possibly-conflicting outcome rows. The app
-	# layer now also claims the work order atomically before inserting, but this
-	# constraint is the last line that holds regardless of how the write was
-	# issued. CREATE UNIQUE INDEX IF NOT EXISTS is the idempotent form (Postgres
-	# has no ADD CONSTRAINT IF NOT EXISTS).
-	"CREATE UNIQUE INDEX IF NOT EXISTS uq_meeting_outcomes_contact_meeting "
-	"ON meeting_outcomes (contact_id, meeting_occurred_at)",
+	# NOTE: the meeting_outcomes duplicate-outcome backstop is NOT added here.
+	# The canonical meeting_outcomes table (apply_meeting_outcomes.py) already
+	# carries UNIQUE (client_id, contact_id, meeting_occurred_at), and
+	# record_outcome() upserts through it — a contact belongs to exactly one
+	# client, so that constraint already enforces one outcome per meeting.
 
 	"CREATE INDEX IF NOT EXISTS ix_meeting_outcome_prompt_jobs_booking ON meeting_outcome_prompt_jobs (booking_id)",
 	"CREATE INDEX IF NOT EXISTS ix_meeting_outcome_prompt_jobs_status ON meeting_outcome_prompt_jobs (status)",
@@ -114,87 +105,15 @@ DDL = [
 	"GRANT SELECT, INSERT, UPDATE ON meeting_outcome_prompt_jobs TO blackink_system",
 	"GRANT USAGE ON SEQUENCE meeting_outcome_prompt_jobs_prompt_job_id_seq TO blackink_system",
 
-	# ── Intelligence-mirror write path for the outcome modal ─────────────────
-	# src/services/meeting_outcomes.py mirrors prospect intelligence onto
-	# contacts.prospect_objections and companies.current_pm_software /
-	# door_count_est. Those two tables are RLS-scoped through
-	# companies.owning_client_id, which is NULL for every unallocated
-	# prospect — so the plain UPDATEs silently affected ZERO rows whenever
-	# the caller was a session scoped to client_id='BLACKINK_INTERNAL_SALES'
-	# (which is every Slack interactive path, including 3.2.3's existing
-	# "Mark No-Show" flow: a pre-existing silent no-op this migration also
-	# fixes, not only a new requirement of the "Log Outcome" modal, whose
-	# DoD explicitly asserts contacts.prospect_objections is updated).
-	#
-	# Same write-side SECURITY DEFINER escape hatch as
-	# pause_contact_after_no_show()/resume_contact_if_rebooked()
-	# (apply_bookings.py), hardened identically: caller scope read from the
-	# session's own RLS context and never accepted as a parameter,
-	# search_path = pg_catalog, EXECUTE revoked from PUBLIC and granted only
-	# to blackink_app, owned by CURRENT_USER so SECURITY DEFINER actually
-	# bypasses RLS. The freshness guard itself stays in Python — it reads
-	# meeting_outcomes, which IS directly visible to that scoped session —
-	# so these functions do exactly one UPDATE each and make no decisions.
-	"""
-	CREATE OR REPLACE FUNCTION mirror_contact_objections(
-		p_contact_id BIGINT,
-		p_objections TEXT
-	)
-	RETURNS VOID
-	SECURITY DEFINER
-	SET search_path = pg_catalog
-	LANGUAGE plpgsql
-	AS $$
-	DECLARE
-		v_requesting_client_id VARCHAR(40);
-	BEGIN
-		v_requesting_client_id := current_setting('app.current_client_id', true);
-		IF v_requesting_client_id IS DISTINCT FROM 'BLACKINK_INTERNAL_SALES' THEN
-			RETURN;
-		END IF;
-		UPDATE public.contacts
-		SET prospect_objections = p_objections, updated_at = NOW()
-		WHERE contact_id = p_contact_id;
-	END;
-	$$
-	""",
-	"REVOKE EXECUTE ON FUNCTION mirror_contact_objections(BIGINT, TEXT) FROM PUBLIC",
-	"GRANT EXECUTE ON FUNCTION mirror_contact_objections(BIGINT, TEXT) TO blackink_app",
-	"ALTER FUNCTION mirror_contact_objections(BIGINT, TEXT) OWNER TO CURRENT_USER",
-
-	"""
-	CREATE OR REPLACE FUNCTION mirror_company_intelligence(
-		p_company_id  VARCHAR,
-		p_pm_software VARCHAR,
-		p_door_count  INTEGER
-	)
-	RETURNS VOID
-	SECURITY DEFINER
-	SET search_path = pg_catalog
-	LANGUAGE plpgsql
-	AS $$
-	DECLARE
-		v_requesting_client_id VARCHAR(40);
-	BEGIN
-		v_requesting_client_id := current_setting('app.current_client_id', true);
-		IF v_requesting_client_id IS DISTINCT FROM 'BLACKINK_INTERNAL_SALES' THEN
-			RETURN;
-		END IF;
-		-- COALESCE for the same reason the Python UPDATE uses it: a meeting
-		-- where the rep didn't ask about PM software must not erase a value
-		-- captured in an earlier one.
-		UPDATE public.companies
-		SET current_pm_software = COALESCE(p_pm_software, current_pm_software),
-		    door_count_est      = COALESCE(p_door_count, door_count_est),
-		    updated_at          = NOW()
-		WHERE company_id = p_company_id;
-	END;
-	$$
-	""",
-	"REVOKE EXECUTE ON FUNCTION mirror_company_intelligence(VARCHAR, VARCHAR, INTEGER) FROM PUBLIC",
-	"GRANT EXECUTE ON FUNCTION mirror_company_intelligence(VARCHAR, VARCHAR, INTEGER) TO blackink_app",
-	"ALTER FUNCTION mirror_company_intelligence(VARCHAR, VARCHAR, INTEGER) OWNER TO CURRENT_USER",
+	# The prompt sweep (src/tasks/meeting_outcome_prompt_sender.py, runs as
+	# blackink_system) reads meeting_outcomes via outcome_recorded_for_booking()
+	# to decide whether a card still needs posting / pinging. The canonical
+	# meeting_outcomes migration grants SELECT only to blackink_app, so this
+	# addendum — the first blackink_system reader of that table — adds the
+	# read grant it needs. Read-only: the sweep never writes meeting_outcomes.
+	"GRANT SELECT ON meeting_outcomes TO blackink_system",
 ]
+
 
 
 def main() -> int:
