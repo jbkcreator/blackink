@@ -28,6 +28,16 @@ Provision the Three-Touch Win-Back Sequence's own tables/columns (Subtask
     is fully deterministic — it re-reads winback_rows' own durable
     suppression columns, it never ABSTAINs pending an external vendor
     lookup the way the cold-sequence gate's DNC check can).
+  - Widens ck_winback_rows_suppression_reason (3.1.1) to also allow
+    'DNC_UNVERIFIED' — a confirmed review finding: a row whose DNC status
+    couldn't be affirmatively verified (missing vendor key, a batch call
+    failure, a batch response omitting this phone, or a phone that never
+    normalizes to any digits) previously only got requires_human_review =
+    TRUE, and nothing downstream (the /arm endpoint's SQL,
+    evaluate_winback_touch_gate) inspects that column — only
+    suppression_state. src/services/winback_ingest.py's _flag_unscrubbed
+    now sets suppression_state = TRUE with this reason, fail-closed, so
+    such a row can never be armed until a human clears it.
 
 winback_touch_dispatches and winback_gate_checks are both tenant-bearing
 and registered in config/tenant_policies.py in the same change that adds
@@ -65,6 +75,22 @@ DDL = [
 		ALTER TABLE winback_rows ADD CONSTRAINT ck_winback_rows_stop_reason
 			CHECK (stop_reason IS NULL OR stop_reason IN ('REPLY', 'OPT_OUT', 'MEETING_BOOKED'));
 	EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+	""",
+	# Widen apply_winback_imports.py's ck_winback_rows_suppression_reason
+	# (3.1.1) to also allow 'DNC_UNVERIFIED' — src/services/winback_ingest.py's
+	# _flag_unscrubbed now sets this reason whenever a row's DNC status
+	# couldn't be affirmatively verified (missing vendor key, a batch call
+	# failure, a batch response omitting this phone, or a phone that never
+	# normalizes at all), so it's never armable until a human clears it
+	# (confirmed review finding — requires_human_review alone was not
+	# enough, since nothing downstream inspects that column). DROP+ADD, not
+	# an in-place ALTER — Postgres has no ALTER CONSTRAINT for CHECK value
+	# lists; DROP CONSTRAINT IF EXISTS makes this idempotent on a re-run.
+	"ALTER TABLE winback_rows DROP CONSTRAINT IF EXISTS ck_winback_rows_suppression_reason",
+	"""
+	ALTER TABLE winback_rows ADD CONSTRAINT ck_winback_rows_suppression_reason CHECK (
+		suppression_reason IS NULL OR suppression_reason IN ('DNC_LISTED', 'NON_POACH_MATCH', 'SOLD', 'DNC_UNVERIFIED')
+	)
 	""",
 	"""
 	CREATE TABLE IF NOT EXISTS winback_touch_dispatches (

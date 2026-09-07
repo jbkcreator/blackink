@@ -452,16 +452,25 @@ def _process_row(
 	counts[_DISPOSITION_BUCKET_KEYS.get(disposition, "unknown_count")] += 1
 	if suppression_state:
 		counts["suppressed_count"] += 1
-	elif row.phone and disposition in _OUTREACH_ELIGIBLE_DISPOSITIONS:
+	elif disposition in _OUTREACH_ELIGIBLE_DISPOSITIONS:
 		# DNC scrub runs AFTER disposition and non-poach, before any
 		# sequence could arm — per the spec's explicit ordering requirement.
-		# Gated on outreach-eligible dispositions (not just "has a phone and
-		# isn't already suppressed") — a SOLD/UNKNOWN row can never be
-		# sequenced regardless of DNC status, so scrubbing its phone would
-		# only spend a Tracerfy credit for nothing.
-		normalized_phone = _normalize_phone(row.phone)
+		# Gated on outreach-eligible dispositions (not just "isn't already
+		# suppressed") — a SOLD/UNKNOWN row can never be sequenced regardless
+		# of DNC status, so scrubbing its phone would only spend a Tracerfy
+		# credit for nothing.
+		normalized_phone = _normalize_phone(row.phone) if row.phone else ""
 		if normalized_phone:
 			dnc_check_targets.append((winback_row_id, normalized_phone))
+		else:
+			# A phone that's present in the CSV (required column, so it
+			# passed the not-empty check) but doesn't normalize to any
+			# digits at all (e.g. "n/a", "unknown") previously fell through
+			# here silently — never scrubbed, never flagged, never
+			# suppressed (confirmed review finding). It can never be
+			# scrubbed at all, so it gets the same fail-closed treatment as
+			# a Tracerfy outage, not a silent skip.
+			_flag_unscrubbed(session, [winback_row_id], counts)
 
 
 def _insert_row(
@@ -538,16 +547,18 @@ def _run_dnc_scrub(
 	Tracerfy for the full rationale.
 
 	A total scrub failure (bad key, network error, vendor timeout) does NOT
-	default rows to clean — they keep suppression_state at its pre-scrub
-	value and get requires_human_review=TRUE, same "never guess on missing
-	data" posture as everywhere else in this pipeline.
+	default rows to clean — _flag_unscrubbed sets suppression_state = TRUE
+	(reason DNC_UNVERIFIED) and requires_human_review = TRUE, fail-closed,
+	same "never guess on missing data" posture as everywhere else in this
+	pipeline. See _flag_unscrubbed's own docstring for why
+	requires_human_review alone was not enough (confirmed review finding).
 	"""
 	from src.services.tracerfy_client import BATCH_SIZE, scrub_phones
 
 	if not settings.dnc_vendor_api_key:
 		logger.warning("winback_ingest: DNC_VENDOR_API_KEY not set — %d rows left unscrubbed, flagged for review",
 					   len(targets))
-		_flag_unscrubbed(session, [wid for wid, _ in targets])
+		_flag_unscrubbed(session, [wid for wid, _ in targets], counts)
 		return
 
 	api_key = settings.dnc_vendor_api_key.get_secret_value()
@@ -589,17 +600,36 @@ def _run_dnc_scrub(
 				counts["suppressed_count"] += len(row_ids)
 
 	if unscrubbed_row_ids:
-		_flag_unscrubbed(session, unscrubbed_row_ids)
+		_flag_unscrubbed(session, unscrubbed_row_ids, counts)
 
 
-def _flag_unscrubbed(session: Session, winback_row_ids: list[int]) -> None:
+def _flag_unscrubbed(session: Session, winback_row_ids: list[int], counts: Optional[dict] = None) -> None:
+	"""A row whose DNC status could not be affirmatively verified — missing
+	API key, a batch call failure, a batch response omitting this phone, or
+	(from _process_row) a phone that couldn't be normalized at all.
+
+	Fail-closed (review finding, confirmed): `requires_human_review = TRUE`
+	alone is NOT enough — nothing downstream (the /arm endpoint's SQL,
+	evaluate_winback_touch_gate) inspects that column, only
+	`suppression_state`. Setting `suppression_state = TRUE` with a distinct
+	`DNC_UNVERIFIED` reason reuses every existing consumer of that flag
+	(same posture as `StubDncProvider`/ABSTAIN in compliance_gate.py — never
+	guess clean on missing data). A human clearing this — confirming
+	DNC-clean out of band, or a later successful re-scrub — must flip
+	`suppression_state` back to `FALSE` explicitly; nothing here does that
+	automatically."""
+	if not winback_row_ids:
+		return
 	session.execute(
 		text(
-			"UPDATE winback_rows SET requires_human_review = TRUE, updated_at = NOW() "
+			"UPDATE winback_rows SET requires_human_review = TRUE, "
+			"suppression_state = TRUE, suppression_reason = 'DNC_UNVERIFIED', updated_at = NOW() "
 			"WHERE winback_row_id = ANY(:ids)"
 		),
 		{"ids": winback_row_ids},
 	)
+	if counts is not None:
+		counts["suppressed_count"] += len(winback_row_ids)
 
 
 _FORMULA_LEADING_CHARS = ("=", "+", "-", "@")

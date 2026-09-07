@@ -11,7 +11,7 @@ which is where a real bug would live.
 """
 
 from datetime import datetime, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from src.services.winback_ingest import (
 	SOLD,
@@ -24,8 +24,10 @@ from src.services.winback_ingest import (
 	_check_non_poach,
 	_csv_safe,
 	_email_domain,
+	_flag_unscrubbed,
 	_process_row,
 	_resolve_county_slug,
+	_run_dnc_scrub,
 	compute_disposition,
 	export_csv,
 	normalize_address,
@@ -375,3 +377,138 @@ def test_export_csv_neutralizes_formula_in_owner_name():
 
 	csv_text = export_csv(_ExportSession(), "import-1")
 	assert "'=cmd" in csv_text
+
+
+# ---------------------------------------------------------------------------
+# _flag_unscrubbed / _run_dnc_scrub — fail-closed DNC verification
+# (confirmed review finding: requires_human_review alone did NOT block
+# arming — winback_sequencer.evaluate_winback_touch_gate and
+# winback_router.py's /arm SQL both only ever check suppression_state.
+# A row whose DNC status couldn't be affirmatively verified must set that
+# flag too, not just a review marker nothing downstream reads.)
+# ---------------------------------------------------------------------------
+
+class _DncFakeSession:
+	"""Records every UPDATE winback_rows statement — enough to verify
+	suppression_state/suppression_reason/requires_human_review without a
+	live DB."""
+
+	def __init__(self):
+		self.updates: list[dict] = []
+
+	def execute(self, stmt, params=None):
+		sql = str(stmt)
+		if "UPDATE winback_rows" in sql:
+			self.updates.append({"sql": sql, "params": dict(params or {})})
+		return MagicMock()
+
+
+def test_flag_unscrubbed_sets_suppression_state_not_just_review_flag():
+	session = _DncFakeSession()
+	_flag_unscrubbed(session, [1, 2, 3])
+	assert len(session.updates) == 1
+	params = session.updates[0]["params"]
+	assert params["ids"] == [1, 2, 3]
+	sql = session.updates[0]["sql"]
+	assert "requires_human_review = TRUE" in sql
+	assert "suppression_state = TRUE" in sql
+	assert "DNC_UNVERIFIED" in sql
+
+
+def test_flag_unscrubbed_increments_suppressed_count_when_given():
+	session = _DncFakeSession()
+	counts = {"suppressed_count": 0}
+	_flag_unscrubbed(session, [1, 2], counts)
+	assert counts["suppressed_count"] == 2
+
+
+def test_flag_unscrubbed_is_a_noop_for_empty_list():
+	session = _DncFakeSession()
+	_flag_unscrubbed(session, [])
+	assert session.updates == []
+
+
+def test_run_dnc_scrub_missing_api_key_suppresses_every_target_fail_closed():
+	session = _DncFakeSession()
+	settings = MagicMock(dnc_vendor_api_key=None)
+	counts = {"suppressed_count": 0}
+	_run_dnc_scrub(session, [(1, "8135550100"), (2, "8135550101")], settings, counts)
+	assert len(session.updates) == 1
+	assert session.updates[0]["params"]["ids"] == [1, 2]
+	assert counts["suppressed_count"] == 2
+
+
+def test_run_dnc_scrub_vendor_call_failure_suppresses_targets_fail_closed():
+	session = _DncFakeSession()
+	settings = MagicMock()
+	settings.dnc_vendor_api_key.get_secret_value.return_value = "test-key"
+	counts = {"suppressed_count": 0}
+	with patch("src.services.tracerfy_client.scrub_phones", side_effect=RuntimeError("Tracerfy is down")):
+		_run_dnc_scrub(session, [(1, "8135550100")], settings, counts)
+	assert len(session.updates) == 1
+	assert session.updates[0]["params"]["ids"] == [1]
+	assert counts["suppressed_count"] == 1
+
+
+def test_run_dnc_scrub_partial_vendor_response_suppresses_only_the_missing_phone():
+	"""One phone gets a real (clean) result; the other is silently omitted
+	from Tracerfy's response — that omitted row must still be fail-closed,
+	not left at suppression_state=FALSE by default."""
+	session = _DncFakeSession()
+	settings = MagicMock()
+	settings.dnc_vendor_api_key.get_secret_value.return_value = "test-key"
+	counts = {"suppressed_count": 0}
+	with patch("src.services.tracerfy_client.scrub_phones", return_value={"8135550100": True}):
+		_run_dnc_scrub(session, [(1, "8135550100"), (2, "8135550199")], settings, counts)
+
+	clean_update = next(u for u in session.updates if "dnc_clean" in u["sql"])
+	assert clean_update["params"]["ids"] == [1]
+	assert clean_update["params"]["clean"] is True
+
+	unscrubbed_update = next(u for u in session.updates if "DNC_UNVERIFIED" in u["sql"])
+	assert unscrubbed_update["params"]["ids"] == [2]
+	assert counts["suppressed_count"] == 1  # only the unverified row — the clean one wasn't a hit
+
+
+def test_run_dnc_scrub_dnc_hit_suppresses_with_dnc_listed_not_unverified():
+	"""A genuine DNC hit (Tracerfy says NOT clean) must keep its own
+	DNC_LISTED reason, distinct from an unverified/failed-lookup row."""
+	session = _DncFakeSession()
+	settings = MagicMock()
+	settings.dnc_vendor_api_key.get_secret_value.return_value = "test-key"
+	counts = {"suppressed_count": 0}
+	with patch("src.services.tracerfy_client.scrub_phones", return_value={"8135550100": False}):
+		_run_dnc_scrub(session, [(1, "8135550100")], settings, counts)
+	update = session.updates[0]
+	assert update["params"]["clean"] is False
+	assert update["params"]["hit"] is True
+	assert "DNC_LISTED" in update["sql"]
+	assert counts["suppressed_count"] == 1
+
+
+def test_process_row_malformed_phone_is_fail_closed_not_silently_skipped():
+	"""A phone that passes the CSV's not-empty required-column check but
+	normalizes to zero digits (e.g. 'n/a') previously vanished silently —
+	never scrubbed, never flagged, never suppressed. Confirmed review
+	finding: it must now be treated the same as a Tracerfy outage."""
+	session = _ScriptedSession(
+		[
+			_ScriptedResult(fetchone_value=("hillsborough_fl",)),
+			_ScriptedResult(fetchone_value=("Jane Doe",)),  # assessor match -> still_owns=True
+			_ScriptedResult(fetchone_value=None),  # non-poach: no match
+			_ScriptedResult(scalar_one_value=55),  # insert
+			None,  # the _flag_unscrubbed UPDATE — return value unused
+		]
+	)
+	counts = {"total_rows": 1, "still_owns_still_renting_count": 0, "still_owns_not_renting_count": 0,
+			  "sold_count": 0, "unknown_count": 0, "suppressed_count": 0}
+	dnc_targets: list = []
+	frbo = StubFrboProvider()
+	frbo.check_active_listing = lambda address: True
+	_process_row(
+		session, "import-1", "acme_pm", _row(phone="n/a"), StagingTableAssessorProvider(session), frbo,
+		datetime.now(timezone.utc), counts, dnc_targets,
+	)
+	assert dnc_targets == []  # never queued for a paid Tracerfy lookup it can't pass
+	assert counts["still_owns_still_renting_count"] == 1
+	assert counts["suppressed_count"] == 1  # fail-closed, not silently left outreach-eligible

@@ -215,6 +215,25 @@ def arm_winback_run(
 	if not row.email:
 		logger.warning("arm_winback_run: winback_row_id=%s has no email — skipped", row.winback_row_id)
 		return []
+	# Defense in depth (review finding): the /arm endpoint's own SQL already
+	# filters out suppression_state/stopped_at, but arm_winback_run must not
+	# rely on that alone — a future caller (or a re-arm of an import whose
+	# rows were suppressed AFTER the initial /arm query ran) must never
+	# enqueue touches for a row that's already blocked. Same posture as
+	# evaluate_winback_touch_gate re-checking fresh rather than trusting
+	# upstream state.
+	if row.suppression_state:
+		logger.warning(
+			"arm_winback_run: winback_row_id=%s suppression_reason=%s — skipped",
+			row.winback_row_id, row.suppression_reason,
+		)
+		return []
+	if row.stopped_at is not None:
+		logger.warning(
+			"arm_winback_run: winback_row_id=%s already stopped (reason=%s) — skipped",
+			row.winback_row_id, row.stop_reason,
+		)
+		return []
 
 	base_offset = timedelta(days=0) if row.disposition == STILL_OWNS_STILL_RENTING else timedelta(days=1)
 	county_name = _resolve_county_name(session, row.county_slug)

@@ -68,6 +68,19 @@ def test_gate_blocks_stopped_row():
 	assert any("REPLY" in r for r in gate.blocked_reasons)
 
 
+def test_gate_blocks_dnc_unverified_row():
+	"""Confirmed review finding: a row whose DNC status couldn't be
+	affirmatively verified must be blocked the same way a genuine DNC hit
+	is — evaluate_winback_touch_gate's suppression check is reason-agnostic,
+	so this closes the loop end to end (no work order can ever send for
+	such a row, however it got created)."""
+	gate = evaluate_winback_touch_gate(
+		MagicMock(), _row(suppression_state=True, suppression_reason="DNC_UNVERIFIED"), "client_a",
+	)
+	assert not gate.ready
+	assert any("DNC_UNVERIFIED" in r for r in gate.blocked_reasons)
+
+
 def test_gate_blocks_missing_email():
 	gate = evaluate_winback_touch_gate(MagicMock(), _row(email=None), "client_a")
 	assert not gate.ready
@@ -192,6 +205,30 @@ def test_still_owns_not_renting_gets_one_day_base_offset():
 def test_arm_skips_non_armable_disposition():
 	with patch("src.services.winback_sequencer.wo.enqueue") as mock_enqueue:
 		action_ids = arm_winback_run(_ArmFakeSession(), "client_a", _row(disposition="SOLD"), datetime.now(timezone.utc))
+	assert action_ids == []
+	mock_enqueue.assert_not_called()
+
+
+def test_arm_skips_suppressed_row_even_if_caller_did_not_pre_filter():
+	"""Defense in depth (review finding): arm_winback_run must not rely
+	solely on the /arm endpoint's own SQL filter."""
+	with patch("src.services.winback_sequencer.wo.enqueue") as mock_enqueue:
+		action_ids = arm_winback_run(
+			_ArmFakeSession(), "client_a",
+			_row(suppression_state=True, suppression_reason="DNC_UNVERIFIED"),
+			datetime.now(timezone.utc),
+		)
+	assert action_ids == []
+	mock_enqueue.assert_not_called()
+
+
+def test_arm_skips_already_stopped_row_even_if_caller_did_not_pre_filter():
+	with patch("src.services.winback_sequencer.wo.enqueue") as mock_enqueue:
+		action_ids = arm_winback_run(
+			_ArmFakeSession(), "client_a",
+			_row(stopped_at=datetime.now(timezone.utc), stop_reason="REPLY"),
+			datetime.now(timezone.utc),
+		)
 	assert action_ids == []
 	mock_enqueue.assert_not_called()
 
