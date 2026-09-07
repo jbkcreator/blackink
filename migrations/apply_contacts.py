@@ -93,6 +93,13 @@ DDL = [
 	# booked_appointment_id IS NULL blocks SMS eligibility).
 	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS booked_appointment_id VARCHAR(64)",
 	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS inbound_sms_count INTEGER NOT NULL DEFAULT 0",
+	# Week 1 Subtask 3.2.3 — No-Show Handler. outbound_pause_source_booking_id
+	# (the FK to bookings.booking_id) is NOT added here — bookings does not
+	# exist yet at this point in the migration run order. It is added by
+	# apply_bookings.py instead, which runs after both contacts and bookings
+	# exist. These two columns carry no FK and are safe to add now.
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS outbound_paused_at TIMESTAMPTZ",
+	"ALTER TABLE contacts ADD COLUMN IF NOT EXISTS outbound_pause_reason VARCHAR(50)",
 	"GRANT SELECT, INSERT, UPDATE ON contacts TO blackink_app",
 	"GRANT USAGE ON SEQUENCE contacts_contact_id_seq TO blackink_app",
 	# promotion_sweep.py runs as blackink_system and promotes contacts

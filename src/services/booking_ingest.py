@@ -30,13 +30,26 @@ rounds of engineering review (see the plan file for the full history):
   src/tasks/calendar_sync_worker.py, which (along with a FastAPI
   BackgroundTask for the common-case fast path) is what actually calls
   this module.
+
+Extended for Subtask 3.2.2 (Show-Rate Reminder Cascade):
+`calendar_connections.connection_scope` distinguishes the original
+owner-books-client's-calendar flow above (CLIENT_OWNER_BOOKING) from a
+prospective PM firm booking a sales-demo call with Blackink's own sales
+team (INTERNAL_SALES_DEMO) — the DoD's "prospect's Owner Visibility
+Score PDF" only makes sense for the latter (the OVS scores `companies`,
+i.e. PM firms, not residential owners). An INTERNAL_SALES_DEMO booking
+matches its target against `contacts`/`companies` by work email instead
+of `owner_contacts`, and `schedule_show_rate_reminders()` is called on
+every insert/reschedule/cancellation of such a booking — never for
+CLIENT_OWNER_BOOKING bookings, since the DoD's OVS-PDF/benchmark
+content is specific to the sales-demo flow.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Protocol
 
 from sqlalchemy import text
@@ -129,6 +142,29 @@ def _find_owner_contact(session: Session, client_id: str, email: Optional[str]) 
 	return row.owner_contact_id if row else None
 
 
+def _find_sales_demo_target(session: Session, email: Optional[str]) -> Optional[dict]:
+	"""INTERNAL_SALES_DEMO counterpart to _find_owner_contact(): the
+	work-email captured on the booking form is matched against
+	contacts/companies (global, deduplicated — not client-scoped, since
+	the target is a prospective PM firm, not this reserved internal
+	client's own tenant data), never owner_contacts.
+
+	Goes through the resolve_sales_demo_target() SECURITY DEFINER function
+	(apply_bookings.py), not a direct SELECT — contacts/companies are
+	RLS-scoped via companies.owning_client_id, which is NULL for every
+	PROSPECTING/ENGAGED company (not yet allocated to a client), so a
+	session scoped to client_id='BLACKINK_INTERNAL_SALES' can never see
+	them directly (NULL never matches an RLS equality filter). Same
+	pattern already used for resolve_calendar_connection()."""
+	if not email:
+		return None
+	row = session.execute(
+		text("SELECT * FROM resolve_sales_demo_target(:email)"),
+		{"email": email},
+	).first()
+	return {"contact_id": row.contact_id, "company_id": row.company_id} if row else None
+
+
 def _upsert_booking(
 	session: Session,
 	*,
@@ -219,6 +255,293 @@ def _cancel_by_identity(
 	return row.booking_id if row else None
 
 
+_REMINDER_STEPS = {
+	"24h_email": timedelta(hours=24),
+	"30min_email": timedelta(minutes=30),
+}
+
+
+def schedule_show_rate_reminders(
+	session: Session,
+	*,
+	client_id: str,
+	booking_id: int,
+	old_event_status: Optional[str],
+	old_scheduled_at: Optional[datetime],
+	new_event_status: str,
+	new_scheduled_at: Optional[datetime],
+	as_of: Optional[datetime] = None,
+) -> None:
+	"""Called on every upsert of an INTERNAL_SALES_DEMO-scope booking —
+	new inserts, reschedules, AND cancellations alike (not gated on
+	was_inserted, which would silently miss reschedules/cancellations
+	entirely). Fire time is an absolute TIMESTAMPTZ offset from
+	new_scheduled_at, so no timezone math is needed here — see
+	src/services/show_rate_reminders.py for where timezone resolution
+	matters (email content only)."""
+	as_of = as_of or datetime.now(timezone.utc)
+
+	if new_event_status == "CANCELLED":
+		session.execute(
+			text(
+				"UPDATE booking_reminder_jobs SET status = 'CANCELLED', updated_at = NOW() "
+				"WHERE booking_id = :bid AND status IN ('PENDING', 'FAILED', 'BLOCKED', 'SENDING')"
+			),
+			{"bid": booking_id},
+		)
+		return
+
+	if new_event_status != "CONFIRMED" or new_scheduled_at is None:
+		return
+
+	is_new = old_event_status is None
+	is_reschedule = not is_new and old_scheduled_at != new_scheduled_at
+
+	if not is_new and not is_reschedule:
+		return  # unchanged CONFIRMED booking (e.g. a routine incremental re-sync) — no-op
+
+	for step, offset in _REMINDER_STEPS.items():
+		scheduled_for = new_scheduled_at - offset
+		status = "SKIPPED" if scheduled_for <= as_of else "PENDING"
+		last_error = f"scheduled_for ({scheduled_for.isoformat()}) already past at {'creation' if is_new else 'reschedule'} time" if status == "SKIPPED" else None
+		if is_new:
+			session.execute(
+				text(
+					"INSERT INTO booking_reminder_jobs (client_id, booking_id, reminder_step, scheduled_for, status, last_error) "
+					"VALUES (:client_id, :booking_id, :step, :scheduled_for, :status, :last_error) "
+					"ON CONFLICT (booking_id, reminder_step) DO NOTHING"
+				),
+				{
+					"client_id": client_id, "booking_id": booking_id, "step": step,
+					"scheduled_for": scheduled_for, "status": status, "last_error": last_error,
+				},
+			)
+		else:
+			# Reschedule: only touch rows still PENDING/FAILED/BLOCKED — a
+			# SENT reminder is never re-sent or un-sent.
+			session.execute(
+				text(
+					"UPDATE booking_reminder_jobs SET scheduled_for = :scheduled_for, status = :status, "
+					"last_error = :last_error, updated_at = NOW() "
+					"WHERE booking_id = :booking_id AND reminder_step = :step "
+					"AND status IN ('PENDING', 'FAILED', 'BLOCKED')"
+				),
+				{
+					"scheduled_for": scheduled_for, "status": status, "last_error": last_error,
+					"booking_id": booking_id, "step": step,
+				},
+			)
+
+
+def schedule_no_show_prompt(
+	session: Session,
+	*,
+	client_id: str,
+	booking_id: int,
+	old_event_status: Optional[str],
+	old_scheduled_at: Optional[datetime],
+	new_event_status: str,
+	new_scheduled_at: Optional[datetime],
+	as_of: Optional[datetime] = None,
+) -> None:
+	"""Subtask 3.2.3 — No-Show Handler. Sibling to
+	schedule_show_rate_reminders() — same insert/reschedule/cancel call
+	sites and lifecycle rules, but for the single 'Mark No-Show' Slack
+	prompt job rather than an email reminder. Reads bookings.target_contact_id
+	itself (rather than taking it as a parameter) so every call site is
+	uniform whether the target was just resolved (new insert) or was
+	resolved earlier (reschedule/cancel of an already-matched booking).
+
+	Never schedules an actionable PENDING prompt for a booking whose
+	target_contact_id is unresolved (still PENDING_RECONCILIATION) — a
+	rep clicking "Mark No-Show" on an inferred/unknown contact would pause
+	the wrong person. Such a booking's job stays BLOCKED until
+	reconciliation resolves target_contact_id (no automatic re-check exists
+	yet for this specific case — a future reconciliation-completion hook
+	would need to re-run this function)."""
+	as_of = as_of or datetime.now(timezone.utc)
+
+	if new_event_status == "CANCELLED":
+		session.execute(
+			text(
+				"UPDATE no_show_prompt_jobs SET status = 'CANCELLED', updated_at = NOW() "
+				"WHERE booking_id = :bid AND status IN ('PENDING', 'BLOCKED', 'SENDING')"
+			),
+			{"bid": booking_id},
+		)
+		return
+
+	if new_event_status != "CONFIRMED" or new_scheduled_at is None:
+		return
+
+	is_new = old_event_status is None
+	is_reschedule = not is_new and old_scheduled_at != new_scheduled_at
+	if not is_new and not is_reschedule:
+		return  # unchanged CONFIRMED booking — no-op
+
+	target_contact_id = session.execute(
+		text("SELECT target_contact_id FROM bookings WHERE booking_id = :bid"),
+		{"bid": booking_id},
+	).scalar()
+
+	if target_contact_id is None:
+		status, last_error = "BLOCKED", "target_contact_id unresolved (booking is PENDING_RECONCILIATION)"
+	elif new_scheduled_at <= as_of:
+		status = "SKIPPED"
+		last_error = f"scheduled_for ({new_scheduled_at.isoformat()}) already past at {'creation' if is_new else 'reschedule'} time"
+	else:
+		status, last_error = "PENDING", None
+
+	if is_new:
+		session.execute(
+			text(
+				"INSERT INTO no_show_prompt_jobs (client_id, booking_id, scheduled_for, status, last_error) "
+				"VALUES (:client_id, :booking_id, :scheduled_for, :status, :last_error) "
+				"ON CONFLICT (booking_id) DO NOTHING"
+			),
+			{
+				"client_id": client_id, "booking_id": booking_id, "scheduled_for": new_scheduled_at,
+				"status": status, "last_error": last_error,
+			},
+		)
+	else:
+		# Reschedule: only touch rows still PENDING/BLOCKED — a SENT/CANCELLED
+		# job is never re-posted.
+		session.execute(
+			text(
+				"UPDATE no_show_prompt_jobs SET scheduled_for = :scheduled_for, status = :status, "
+				"last_error = :last_error, updated_at = NOW() "
+				"WHERE booking_id = :booking_id AND status IN ('PENDING', 'BLOCKED')"
+			),
+			{
+				"scheduled_for": new_scheduled_at, "status": status, "last_error": last_error,
+				"booking_id": booking_id,
+			},
+		)
+
+
+def schedule_meeting_outcome_prompt(
+	session: Session,
+	*,
+	client_id: str,
+	booking_id: int,
+	old_event_status: Optional[str],
+	old_scheduled_at: Optional[datetime],
+	new_event_status: str,
+	new_scheduled_at: Optional[datetime],
+	as_of: Optional[datetime] = None,
+) -> None:
+	"""Addendum to Subtask 3.2.1 — the "Log Outcome" trigger card. Third
+	sibling to schedule_show_rate_reminders()/schedule_no_show_prompt():
+	identical signature, identical call sites (insert, reschedule AND
+	cancellation), identical lifecycle rules.
+
+	scheduled_for is the meeting's own start time, never a guessed end time
+	— the card exists to give the closer a button to press whenever their
+	meeting actually wraps; the click, not any timer, is what signals "the
+	meeting is done."
+
+	Unlike the no-show prompt, an unresolved target_contact_id here is not
+	the only blocking input: the card must @mention (and later authorize) the
+	assigned closer, which needs calendar_connections.rep_slack_user_id.
+	Both blocking conditions are re-checked at post time by
+	src/services/meeting_outcome_prompts.py, which is also where the
+	self-heal that lifts them lives — this function only needs to get the
+	row scheduled, so it does the cheap target check it already has a query
+	for and leaves the connection lookup to the poster."""
+	as_of = as_of or datetime.now(timezone.utc)
+
+	if new_event_status == "CANCELLED":
+		# No outcome prompt for a meeting that never happened — and a card
+		# ALREADY posted (SENT) must be invalidated too, not left live for its
+		# 24h TTL: otherwise a booking cancelled after its card was posted
+		# could still be clicked and submitted as attended/no-show. The job
+		# goes CANCELLED here; the click and submit handlers additionally
+		# re-check the booking's live status, so the already-posted Slack card
+		# becomes inert the moment it's used.
+		session.execute(
+			text(
+				"UPDATE meeting_outcome_prompt_jobs SET status = 'CANCELLED', updated_at = NOW() "
+				"WHERE booking_id = :bid AND status IN ('PENDING', 'BLOCKED', 'SENDING', 'SENT')"
+			),
+			{"bid": booking_id},
+		)
+		return
+
+	if new_event_status != "CONFIRMED" or new_scheduled_at is None:
+		return
+
+	is_new = old_event_status is None
+	is_reschedule = not is_new and old_scheduled_at != new_scheduled_at
+	if not is_new and not is_reschedule:
+		return  # unchanged CONFIRMED booking — no-op
+
+	target_contact_id = session.execute(
+		text("SELECT target_contact_id FROM bookings WHERE booking_id = :bid"),
+		{"bid": booking_id},
+	).scalar()
+
+	if target_contact_id is None:
+		status, last_error = "BLOCKED", "UNRESOLVED_TARGET"
+	elif new_scheduled_at <= as_of:
+		status = "SKIPPED"
+		last_error = f"scheduled_for ({new_scheduled_at.isoformat()}) already past at {'creation' if is_new else 'reschedule'} time"
+	else:
+		status, last_error = "PENDING", None
+
+	if is_new:
+		session.execute(
+			text(
+				"INSERT INTO meeting_outcome_prompt_jobs (client_id, booking_id, scheduled_for, status, last_error) "
+				"VALUES (:client_id, :booking_id, :scheduled_for, :status, :last_error) "
+				"ON CONFLICT (booking_id) DO NOTHING"
+			),
+			{
+				"client_id": client_id, "booking_id": booking_id, "scheduled_for": new_scheduled_at,
+				"status": status, "last_error": last_error,
+			},
+		)
+	else:
+		# Reschedule: only touch rows still PENDING/BLOCKED — a SENT card is
+		# never re-posted, and a CANCELLED/EXPIRED one is never revived.
+		session.execute(
+			text(
+				"UPDATE meeting_outcome_prompt_jobs SET scheduled_for = :scheduled_for, status = :status, "
+				"last_error = :last_error, updated_at = NOW() "
+				"WHERE booking_id = :booking_id AND status IN ('PENDING', 'BLOCKED')"
+			),
+			{
+				"scheduled_for": new_scheduled_at, "status": status, "last_error": last_error,
+				"booking_id": booking_id,
+			},
+		)
+
+
+def _resume_if_rebooked(session: Session, *, contact_id: int, new_booking_id: int) -> None:
+	"""Subtask 3.2.3. Clears a contact's outbound pause ONLY when the
+	contact has actually rebooked under a genuinely new, distinct
+	booking_id — never on a routine re-sync/re-delivery of the SAME
+	booking whose no-show caused the pause (that would silently defeat
+	the pause the moment the provider redelivers an unchanged webhook
+	event). Only ever called from the was_inserted branch below, so
+	new_booking_id is always a booking_id that did not exist before this
+	call — still compared explicitly against
+	outbound_pause_source_booking_id rather than assumed, since that's the
+	actual invariant that matters here, not merely "this code path only
+	runs on insert."
+
+	Goes through resume_contact_if_rebooked() (apply_bookings.py), not a
+	direct UPDATE — contacts is RLS-scoped via companies.owning_client_id,
+	which is NULL for every unallocated prospect, so a session scoped to
+	client_id='BLACKINK_INTERNAL_SALES' can never write these rows
+	directly (same reason _find_sales_demo_target() above goes through
+	resolve_sales_demo_target() rather than a direct SELECT)."""
+	session.execute(
+		text("SELECT resume_contact_if_rebooked(:cid, :new_booking_id)"),
+		{"cid": contact_id, "new_booking_id": new_booking_id},
+	)
+
+
 def _process_event(
 	session: Session,
 	connection,
@@ -246,6 +569,22 @@ def _process_event(
 			_record_event(session, connection.client_id, "booking_cancelled", booking_id, {
 				"external_event_id": event.external_event_id,
 			})
+			if connection.connection_scope == "INTERNAL_SALES_DEMO":
+				schedule_show_rate_reminders(
+					session, client_id=connection.client_id, booking_id=booking_id,
+					old_event_status="CONFIRMED", old_scheduled_at=None,
+					new_event_status="CANCELLED", new_scheduled_at=None,
+				)
+				schedule_no_show_prompt(
+					session, client_id=connection.client_id, booking_id=booking_id,
+					old_event_status="CONFIRMED", old_scheduled_at=None,
+					new_event_status="CANCELLED", new_scheduled_at=None,
+				)
+				schedule_meeting_outcome_prompt(
+					session, client_id=connection.client_id, booking_id=booking_id,
+					old_event_status="CONFIRMED", old_scheduled_at=None,
+					new_event_status="CANCELLED", new_scheduled_at=None,
+				)
 		return
 
 	if not event.tagged:
@@ -270,17 +609,39 @@ def _process_event(
 		initial_confirmation_status="NOT_REQUIRED",
 	)
 
+	is_sales_demo = connection.connection_scope == "INTERNAL_SALES_DEMO"
+
 	if result["was_inserted"]:
-		owner_contact_id = _find_owner_contact(session, connection.client_id, event.owner_email)
-		match_status = "MATCHED" if owner_contact_id else "PENDING_RECONCILIATION"
-		if owner_contact_id:
-			session.execute(
-				text(
-					"UPDATE bookings SET owner_contact_id = :ocid, status = 'MATCHED', updated_at = NOW() "
-					"WHERE booking_id = :bid"
-				),
-				{"ocid": owner_contact_id, "bid": result["booking_id"]},
-			)
+		if is_sales_demo:
+			target = _find_sales_demo_target(session, event.owner_email)
+			match_status = "MATCHED" if target else "PENDING_RECONCILIATION"
+			if target:
+				session.execute(
+					text(
+						"UPDATE bookings SET target_company_id = :cid, target_contact_id = :ctid, "
+						"status = 'MATCHED', updated_at = NOW() WHERE booking_id = :bid"
+					),
+					{"cid": target["company_id"], "ctid": target["contact_id"], "bid": result["booking_id"]},
+				)
+				# A genuinely new booking_id (this is the was_inserted branch)
+				# for a matched contact means the contact has rebooked — clear
+				# any standing no-show pause, but only if it wasn't already
+				# sourced from this exact booking (can't be, since this
+				# booking_id did not exist until this INSERT).
+				_resume_if_rebooked(
+					session, contact_id=target["contact_id"], new_booking_id=result["booking_id"]
+				)
+		else:
+			owner_contact_id = _find_owner_contact(session, connection.client_id, event.owner_email)
+			match_status = "MATCHED" if owner_contact_id else "PENDING_RECONCILIATION"
+			if owner_contact_id:
+				session.execute(
+					text(
+						"UPDATE bookings SET owner_contact_id = :ocid, status = 'MATCHED', updated_at = NOW() "
+						"WHERE booking_id = :bid"
+					),
+					{"ocid": owner_contact_id, "bid": result["booking_id"]},
+				)
 
 		eligible_for_confirmation = not is_baseline_suppressed
 		if eligible_for_confirmation:
@@ -296,6 +657,23 @@ def _process_event(
 			"baseline": is_baseline_suppressed,
 		})
 		outcome.new_bookings += 1
+
+		if is_sales_demo and eligible_for_confirmation:
+			schedule_show_rate_reminders(
+				session, client_id=connection.client_id, booking_id=result["booking_id"],
+				old_event_status=None, old_scheduled_at=None,
+				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+			)
+			schedule_no_show_prompt(
+				session, client_id=connection.client_id, booking_id=result["booking_id"],
+				old_event_status=None, old_scheduled_at=None,
+				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+			)
+			schedule_meeting_outcome_prompt(
+				session, client_id=connection.client_id, booking_id=result["booking_id"],
+				old_event_status=None, old_scheduled_at=None,
+				new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+			)
 	else:
 		if result["old_scheduled_at"] is not None and result["scheduled_at"] != result["old_scheduled_at"]:
 			_record_event(session, connection.client_id, "booking_rescheduled", result["booking_id"], {
@@ -304,6 +682,22 @@ def _process_event(
 				"new_scheduled_at": result["scheduled_at"].isoformat() if result["scheduled_at"] else None,
 			})
 			outcome.rescheduled += 1
+			if is_sales_demo:
+				schedule_show_rate_reminders(
+					session, client_id=connection.client_id, booking_id=result["booking_id"],
+					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
+					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+				)
+				schedule_no_show_prompt(
+					session, client_id=connection.client_id, booking_id=result["booking_id"],
+					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
+					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+				)
+				schedule_meeting_outcome_prompt(
+					session, client_id=connection.client_id, booking_id=result["booking_id"],
+					old_event_status="CONFIRMED", old_scheduled_at=result["old_scheduled_at"],
+					new_event_status="CONFIRMED", new_scheduled_at=result["scheduled_at"],
+				)
 		else:
 			outcome.unchanged += 1
 

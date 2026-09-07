@@ -70,7 +70,7 @@ def mint_ghl_webhook_credentials(session: Session, client_id: str) -> dict:
 			INSERT INTO calendar_connections
 				(client_id, provider, external_calendar_id, subscription_id, verification_secret, status)
 			VALUES (:client_id, 'GOHIGHLEVEL', :placeholder, :token, :secret, 'ACTIVE')
-			ON CONFLICT (client_id, provider) DO UPDATE SET
+			ON CONFLICT (client_id, provider) WHERE connection_scope = 'CLIENT_OWNER_BOOKING' DO UPDATE SET
 				subscription_id = EXCLUDED.subscription_id,
 				verification_secret = EXCLUDED.verification_secret,
 				status = 'ACTIVE',

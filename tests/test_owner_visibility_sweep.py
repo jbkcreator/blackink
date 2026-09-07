@@ -95,6 +95,44 @@ class TestRunSweep:
         assert count == 0
 
 
+# ── score_one_company (Subtask 3.2.3 extraction) ──────────────────────────────
+
+class TestScoreOneCompany:
+    """Extracted from run_sweep()'s loop body so the monthly sweep and
+    self_serve_audit_worker.py's single-company trigger share one scoring
+    implementation. Confirms it upserts exactly one row and returns the
+    breakdown, independent of run_sweep()'s own loop."""
+
+    def _stub_signals(self):
+        return [
+            SignalResult("website_owner_page", 14, 14, SCORED, "test"),
+            SignalResult("dbpr_active_licence", 4, 4, SCORED, "test"),
+            SignalResult("google_rating", 0, 20, MISSING_DATA, "stub"),
+        ]
+
+    def test_upserts_one_row_and_returns_breakdown(self):
+        company = {
+            "company_id": "abc123", "company_name": "Test PM LLC", "domain": "testpm.com",
+            "website": "https://testpm.com", "county_slug": "hillsborough_fl", "google_place_id": None,
+        }
+        fake_db = MagicMock()
+
+        with patch("src.tasks.owner_visibility_sweep.WebsiteSignalProvider") as MockWebsite, \
+             patch("src.tasks.owner_visibility_sweep.DbprLicenceSignalProvider") as MockDbpr, \
+             patch("src.tasks.owner_visibility_sweep.build_google_places_provider") as MockGoogle:
+
+            stub = self._stub_signals()
+            MockWebsite.return_value.collect.return_value = [stub[0]]
+            MockDbpr.return_value.collect.return_value = [stub[1]]
+            MockGoogle.return_value.collect.return_value = [stub[2]]
+
+            from src.tasks.owner_visibility_sweep import score_one_company
+            breakdown = score_one_company(fake_db, company, "2026-09")
+
+        assert breakdown.score_total == 18  # 14 (website) + 4 (dbpr)
+        assert fake_db.execute.call_count == 1  # one INSERT ... ON CONFLICT, no place_id update needed
+
+
 # ── main() exit codes ─────────────────────────────────────────────────────────
 
 class TestMain:

@@ -59,6 +59,16 @@ DDL = [
     # County-rank queries: list top N firms in a county for a month.
     "CREATE INDEX IF NOT EXISTS ix_ovs_county_month_rank ON owner_visibility_scores (county_slug, month_key, score_total DESC)",
     "CREATE INDEX IF NOT EXISTS ix_ovs_company_month ON owner_visibility_scores (company_id, month_key)",
+    # No DELETE for either role — least privilege, on purpose. Neither
+    # owner_visibility_sweep.py (INSERT/UPDATE only, an upsert) nor
+    # Subtask 3.2.2's show_rate_reminders.py (SELECT only) ever deletes a
+    # score row; test-fixture teardown for this table goes through
+    # get_owner_db_context() instead (tests/test_show_rate_reminders.py),
+    # not a widened production grant. Explicit REVOKE so this migration is
+    # self-correcting even against a database an earlier draft's broader
+    # GRANT already ran against.
+    "REVOKE DELETE ON owner_visibility_scores FROM blackink_app",
+    "REVOKE DELETE ON owner_visibility_scores FROM blackink_system",
     "GRANT SELECT, INSERT, UPDATE ON owner_visibility_scores TO blackink_app",
     # owner_visibility_sweep.py runs as blackink_system (BYPASSRLS).
     "GRANT SELECT, INSERT, UPDATE ON owner_visibility_scores TO blackink_system",

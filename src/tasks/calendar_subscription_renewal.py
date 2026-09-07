@@ -53,6 +53,14 @@ def run_renewal_sweep() -> int:
 
 	renewed = 0
 	with get_system_db_context() as session:
+		# GoHighLevel connections have no OAuth tokens and no provider-side
+		# push subscription to renew -- their bookings arrive directly in the
+		# webhook POST (src/services/ghl_webhook.py -> process_ghl_event).
+		# They must be excluded here: their expires_at is permanently NULL,
+		# so they would otherwise be selected as due every sweep, routed to
+		# the Microsoft Graph branch below, fail for lack of credentials, and
+		# be flipped to NEEDS_RECONNECT -- which the webhook resolver then
+		# rejects, silently dropping real GHL bookings.
 		due = session.execute(
 			text(
 				"SELECT connection_id, provider FROM calendar_connections "

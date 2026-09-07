@@ -44,9 +44,6 @@ def expires_at_ms_to_datetime(expires_at_ms: Optional[str]) -> Optional[datetime
         return None
     return datetime.fromtimestamp(int(expires_at_ms) / 1000, tz=timezone.utc)
 
-from datetime import datetime, timezone
-from typing import Optional
-
 import requests
 
 from src.services.booking_ingest import (
@@ -164,6 +161,10 @@ class GoogleCalendarClient:
 		)
 		resp.raise_for_status()
 		body = resp.json()
+		# Google returns `expiration` as a Unix timestamp in MILLISECONDS, as a
+		# string. It is handed back raw; every caller converts it through
+		# expires_at_ms_to_datetime() before persisting expires_at — one
+		# conversion path, so a caller can't accidentally store the raw ms.
 		return {"resource_id": body["resourceId"], "expires_at_ms": body.get("expiration")}
 
 

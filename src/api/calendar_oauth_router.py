@@ -156,24 +156,35 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 					claims.client_id,
 				)
 			else:
+				sub_result = client.register_subscription(existing_row, _webhook_url(provider), verification_secret)
 				# Graph issues its own subscription id (body["id"]) — distinct
 				# from the locally generated channel_id, and it's what Graph's
 				# webhook payload carries back, so it must be what's persisted
 				# as subscription_id or resolve_calendar_connection() can never
 				# find this row (previously stored channel_id here — a bug).
-				sub_result = client.register_subscription(existing_row, _webhook_url(provider), verification_secret)
 				subscription_id_value = sub_result["subscription_id"]
 				subscription_expires_at = sub_result.get("expires_at")
 
+		# Two distinct partial unique indexes back these two conflict
+		# targets (see apply_calendar_connections.py's DDL comment) —
+		# CLIENT_OWNER_BOOKING keeps 3.2.1's original "one connection per
+		# client per provider" behavior exactly; INTERNAL_SALES_DEMO allows
+		# multiple Blackink sales reps under the shared reserved client_id,
+		# each identified by their own external_calendar_id.
+		if claims.connection_scope == "INTERNAL_SALES_DEMO":
+			conflict_clause = "ON CONFLICT (client_id, provider, external_calendar_id) WHERE connection_scope = 'INTERNAL_SALES_DEMO'"
+		else:
+			conflict_clause = "ON CONFLICT (client_id, provider) WHERE connection_scope = 'CLIENT_OWNER_BOOKING'"
+
 		row = session.execute(
 			text(
-				"""
+				f"""
 				INSERT INTO calendar_connections
-					(client_id, provider, external_calendar_id, subscription_id, verification_secret,
+					(client_id, provider, connection_scope, external_calendar_id, subscription_id, verification_secret,
 					 access_token_encrypted, refresh_token_encrypted, token_expires_at, expires_at, status)
-				VALUES (:client_id, :provider, :external_calendar_id, :subscription_id, :verification_secret,
+				VALUES (:client_id, :provider, :connection_scope, :external_calendar_id, :subscription_id, :verification_secret,
 						:access_token_encrypted, :refresh_token_encrypted, :token_expires_at, :expires_at, 'ACTIVE')
-				ON CONFLICT (client_id, provider) DO UPDATE SET
+				{conflict_clause} DO UPDATE SET
 					external_calendar_id = EXCLUDED.external_calendar_id,
 					subscription_id = EXCLUDED.subscription_id,
 					verification_secret = EXCLUDED.verification_secret,
@@ -191,6 +202,7 @@ def oauth_callback(provider: str, code: str = Query(...), state: str = Query(...
 			{
 				"client_id": claims.client_id,
 				"provider": provider,
+				"connection_scope": claims.connection_scope,
 				"external_calendar_id": external_calendar_id,
 				"subscription_id": subscription_id_value,
 				"verification_secret": verification_secret,

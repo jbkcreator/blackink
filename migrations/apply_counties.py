@@ -31,6 +31,12 @@ DDL = [
 	)
 	""",
 	"GRANT SELECT ON counties TO blackink_app",
+	# show_rate_reminder_sender.py (Subtask 3.2.2) runs as blackink_system
+	# and joins counties for county_name in its reminder-content query
+	# (src/services/show_rate_reminders.py's _load_job) — without this
+	# grant, that join fails with InsufficientPrivilege the first time a
+	# reminder job is actually claimed and sent.
+	"GRANT SELECT ON counties TO blackink_system",
 ]
 
 SEED_COUNTIES = [

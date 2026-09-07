@@ -45,6 +45,8 @@ from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
 from src.core.database import get_db_context, get_system_db_context
 from src.services import work_orders as wo
+from src.services.no_show_prompts import verify_no_show_token
+from src.services.no_show_recovery import already_recorded, trigger_recovery
 from src.services.events import log_event as _shared_log_event, MalformedEventError
 from src.services.meeting_outcomes import record_outcome
 from src.services.slack import payload_hash, post
@@ -606,6 +608,65 @@ async def handle_halt_resume_click(ack, body, respond, action):
 	await respond(response_type="in_channel", text=f":white_check_mark: Halt #{halt_id} resumed by <@{user_id}>.")
 
 
+# ── Mark No-Show — Subtask 3.2.3, control action, no work order ─────────
+
+_INTERNAL_SALES_CLIENT_ID = "BLACKINK_INTERNAL_SALES"
+_NO_SHOW_WINDOW = timedelta(minutes=10)
+
+
+@app.action("mark_no_show")
+async def handle_mark_no_show(ack, body, respond, action):
+	"""Steps 1-8 of Subtask 3.2.3's mark-no-show flow. ack() first (no
+	network I/O before it — Slack's 3-second budget), then verify the
+	token, the 10-minute timing window (both boundaries), and the
+	double-click guard, THEN run trigger_recovery() as one transaction
+	with no external calls inside it — the recovery email itself is sent
+	later, out-of-band, by src/tasks/no_show_recovery_sender.py."""
+	await ack()
+	user_id = body.get("user", {}).get("id", "")
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	if not approver_authorized(user_id):
+		await respond(response_type="ephemeral", text=":no_entry: Not authorized to mark no-shows.")
+		return
+
+	booking_id = value.get("booking_id")
+	token = value.get("token", "")
+	if not booking_id or not verify_no_show_token(booking_id, token):
+		await respond(response_type="ephemeral", text=":warning: Stale or invalid button — this card may have been superseded.")
+		return
+
+	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
+		booking = session.execute(
+			text("SELECT booking_id, scheduled_at, event_status FROM bookings WHERE booking_id = :bid"),
+			{"bid": booking_id},
+		).first()
+		if booking is None:
+			await respond(response_type="ephemeral", text=":warning: Booking not found.")
+			return
+		if booking.event_status == "CANCELLED":
+			await respond(response_type="ephemeral", text=":information_source: This booking was cancelled — nothing to mark.")
+			return
+
+		now = datetime.now(timezone.utc)
+		if now < booking.scheduled_at:
+			await respond(response_type="ephemeral", text=":warning: This meeting hasn't started yet.")
+			return
+		if now > booking.scheduled_at + _NO_SHOW_WINDOW:
+			await respond(response_type="ephemeral", text=":warning: The 10-minute no-show window for this meeting has passed.")
+			return
+
+		if already_recorded(session, booking_id):
+			await respond(response_type="ephemeral", text=":information_source: Already marked no-show by someone else.")
+			return
+
+		trigger_recovery(session, booking_id=booking_id, submitted_by=f"slack:{user_id}")
+
+	await respond(response_type="in_channel", text=f":x: Marked no-show for booking `{booking_id}` by <@{user_id}> — recovery email enqueued.")
 # ── Post-meeting outcome modal (blueprint §3.1.7) — NO trigger wired here
 # by design. The Outbound Sequencer & Booking Engine's post-meeting Slack
 # card (not yet shipped) is the only entry point: its button handler calls
@@ -769,3 +830,83 @@ async def handle_meeting_outcome_submit(ack, body, view):
 			channel_key="setter",
 			text=f":warning: No-show recorded for contact `{meta['contact_id']}` by <@{user_id}> — outbound sequence pause is the Booking Engine's no-show handler (Subtask 3.2.3), not yet wired here.",
 		)
+
+
+# ── Log Outcome trigger card (Addendum to Subtask 3.2.1) ────────────────
+# The card posted by src/tasks/meeting_outcome_prompt_sender.py carries a
+# "Log Outcome" button. This handler is the ONLY new piece the addendum
+# adds to the outcome flow: it validates the card, then opens the canonical
+# §3.1.7 modal above (open_meeting_outcome_modal). The modal, its submit
+# handler, and record_outcome are the base's — not re-implemented here.
+
+_MEETING_OUTCOME_CARD_TTL = timedelta(hours=24)
+
+
+def _meeting_outcome_expired(order: "wo.WorkOrder", *, now: datetime) -> bool:
+	# The 24h expiry is deliberately NOT part of the payload hash (that
+	# preimage is FIXED); it's an explicit created_at + TTL check here.
+	return now > order.created_at + _MEETING_OUTCOME_CARD_TTL
+
+
+def _booking_is_cancelled(session, booking_id) -> bool:
+	"""Live booking-status read — a booking cancelled after its card was
+	posted must not still present the outcome form."""
+	if booking_id is None:
+		return False
+	row = session.execute(
+		text("SELECT event_status FROM bookings WHERE booking_id = :bid"),
+		{"bid": booking_id},
+	).first()
+	return row is None or row.event_status == "CANCELLED"
+
+
+@app.action("log_meeting_outcome")
+async def handle_log_meeting_outcome(ack, body, respond, action, client):
+	"""Opens the canonical meeting-outcome modal for the assigned closer.
+	Everything here is in-memory / one DB read so open_meeting_outcome_modal
+	lands inside Slack's ~3s trigger_id window."""
+	await ack()
+	user_id = body.get("user", {}).get("id", "")
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	client_id = value.get("client_id")
+	action_id = value.get("action_id")
+	provided_hash = value.get("payload_hash")
+
+	if not approver_authorized(user_id, client_id=client_id):
+		await respond(response_type="ephemeral", text=":no_entry: Not authorized to act on this card.")
+		return
+
+	order = wo.get(client_id, action_id) if client_id and action_id else None
+	if order is None:
+		await respond(response_type="ephemeral", text=":warning: This card could not be found (it may be stale or belong to a different tenant).")
+		return
+
+	verdict = payload_hash.verify(order, provided_hash)
+	now = datetime.now(timezone.utc)
+	if not verdict.fresh or _meeting_outcome_expired(order, now=now):
+		_log_event(client_id, "meeting_outcome_prompt_rejected", entity_id=action_id, actor=f"slack:{user_id}", payload={"reason": "expired_or_altered"})
+		await respond(response_type="ephemeral", text=":warning: This action has expired or was altered.")
+		return
+
+	if order.recipient != user_id:
+		await respond(response_type="ephemeral", text=":no_entry: This meeting is assigned to a different closer.")
+		return
+
+	# Live cancellation re-check before opening the modal.
+	with get_db_context(client_id=_INTERNAL_SALES_CLIENT_ID) as session:
+		if _booking_is_cancelled(session, (order.payload or {}).get("booking_id")):
+			await respond(response_type="ephemeral", text=":information_source: This meeting was cancelled — no outcome can be logged.")
+			return
+
+	# Hand off to the base's canonical §3.1.7 modal (it validates contact_id /
+	# meeting_occurred_at itself and derives everything else at submit time).
+	await open_meeting_outcome_modal(
+		trigger_id=body["trigger_id"],
+		contact_id=value.get("contact_id"),
+		meeting_occurred_at=value.get("meeting_occurred_at"),
+	)

@@ -55,12 +55,22 @@ def _jwt_secret() -> str:
 	return secret.get_secret_value()
 
 
-def mint_calendar_connect_link(session: Session, client_id: str, provider: str) -> str:
+def mint_calendar_connect_link(
+	session: Session, client_id: str, provider: str, connection_scope: str = "CLIENT_OWNER_BOOKING"
+) -> str:
 	"""Called automatically by the onboarding flow's calendar-connect step
 	(production path) or a dev-only CLI script (local testing only — never
 	the production trigger). Encodes client_id + a single-use nonce,
 	recorded in oauth_connect_nonces so the link cannot be replayed once
-	consumed."""
+	consumed.
+
+	connection_scope (Subtask 3.2.2) defaults to 'CLIENT_OWNER_BOOKING' —
+	the original 3.2.1 case, a PM firm client connecting its own owner-
+	booking calendar. Pass 'INTERNAL_SALES_DEMO' only for a Blackink sales
+	rep's own connect link (client_id = the reserved 'BLACKINK_INTERNAL_SALES'
+	row); the callback route uses this to pick the right partial unique
+	index (see apply_calendar_connections.py) and owner-matching branch
+	(see booking_ingest.py)."""
 	nonce = secrets.token_urlsafe(32)
 	expires_at = datetime.now(timezone.utc) + timedelta(minutes=CONNECT_LINK_TTL_MINUTES)
 	session.execute(
@@ -73,6 +83,7 @@ def mint_calendar_connect_link(session: Session, client_id: str, provider: str) 
 	payload = {
 		"client_id": client_id,
 		"provider": provider,
+		"connection_scope": connection_scope,
 		"nonce": nonce,
 		"exp": expires_at,
 		"iat": datetime.now(timezone.utc),
@@ -85,6 +96,7 @@ class ConnectLinkClaims:
 	client_id: str
 	provider: str
 	nonce: str
+	connection_scope: str = "CLIENT_OWNER_BOOKING"
 
 
 def decode_connect_link(token: str) -> ConnectLinkClaims:
@@ -100,7 +112,12 @@ def decode_connect_link(token: str) -> ConnectLinkClaims:
 		payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
 	except jwt.PyJWTError as exc:
 		raise OAuthStateError("Invalid or expired connect-link token") from exc
-	return ConnectLinkClaims(client_id=payload["client_id"], provider=payload["provider"], nonce=payload["nonce"])
+	return ConnectLinkClaims(
+		client_id=payload["client_id"],
+		provider=payload["provider"],
+		nonce=payload["nonce"],
+		connection_scope=payload.get("connection_scope", "CLIENT_OWNER_BOOKING"),
+	)
 
 
 def consume_connect_link_nonce(session: Session, claims: ConnectLinkClaims) -> None:
@@ -126,6 +143,7 @@ def build_authorization_url(claims: ConnectLinkClaims, redirect_uri: str) -> str
 	state_payload = {
 		"client_id": claims.client_id,
 		"provider": claims.provider,
+		"connection_scope": claims.connection_scope,
 		"nonce": claims.nonce,
 		"exp": datetime.now(timezone.utc) + timedelta(minutes=STATE_TTL_MINUTES),
 	}
@@ -164,7 +182,12 @@ def verify_state(token: str) -> ConnectLinkClaims:
 		payload = jwt.decode(token, _jwt_secret(), algorithms=["HS256"])
 	except jwt.PyJWTError as exc:
 		raise OAuthStateError("Invalid or expired OAuth state") from exc
-	return ConnectLinkClaims(client_id=payload["client_id"], provider=payload["provider"], nonce=payload["nonce"])
+	return ConnectLinkClaims(
+		client_id=payload["client_id"],
+		provider=payload["provider"],
+		nonce=payload["nonce"],
+		connection_scope=payload.get("connection_scope", "CLIENT_OWNER_BOOKING"),
+	)
 
 
 @dataclass
