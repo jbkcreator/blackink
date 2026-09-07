@@ -84,6 +84,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py
           PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py
           PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py
+          PYTHONPATH=. python migrations/apply_appointment_ops.py
           PYTHONPATH=. python migrations/apply_inbound_messages.py
           PYTHONPATH=. python migrations/apply_inbound_messages_sla.py
           PYTHONPATH=. python migrations/apply_respond_routing_gaps.py
