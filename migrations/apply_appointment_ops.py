@@ -43,10 +43,36 @@ appointment rows across reschedules / no-show recovery / rebooking. Billing
 idempotency at the opportunity level is enforced by the settlement layer, not a
 unique index here.
 
+── Same-tenant referential integrity (PR #25 review fix) ──
+A bare `appointment_id UUID REFERENCES appointments(appointment_id)` on a
+child table only proves the referenced appointment exists — not that it
+belongs to the SAME client_id as the child row. Under RLS, a tenant-scoped
+writer for client B can construct a confirmation_logs/appointment_dispositions/
+appointment_disputes row carrying client_id='B' that references an
+appointment_id it looked up (or is handed) belonging to client A, since the FK
+constraint alone never inspects the appointment's client_id. RLS on the child
+table only ever checks the child row's OWN client_id, not the parent's.
+Fixed here by adding `UNIQUE (client_id, appointment_id)` on appointments and
+replacing every child FK with a COMPOSITE `FOREIGN KEY (client_id,
+appointment_id) REFERENCES appointments(client_id, appointment_id)` — a
+mismatched (client_id, appointment_id) pair is now rejected by Postgres itself,
+before RLS is even evaluated. See tests/test_tenant_isolation.py for the live
+proof that a Tenant-B session cannot insert a child row against a Tenant-A
+appointment_id.
+
 State-machine rules ("reschedule capped at 2 → LOST", "opportunity_id retained
 across reschedules and no-show recovery") are enforced in the application layer
 — see src/services/appointment_state.py — since a computed generated column
-cannot express a transition guard.
+cannot express a transition guard. A BEFORE UPDATE trigger
+(`trg_appointments_guard_transition` / `appointments_guard_transition()`) is
+the enforcement backstop (PR #25 review fix): it rejects
+`reschedule_count > 2`, rejects `reschedule_count` decreasing, and rejects any
+change to `opportunity_id` — the two invariants the module docstring calls
+"hard" but that, before this trigger, only held if every caller remembered to
+route through appointment_state.py. Direct UPDATE access on the table stays
+(needed for state/timestamp columns the trigger does not touch), but the two
+billing-critical invariants can no longer be bypassed by a stray hand-written
+UPDATE.
 
 Idempotent: CREATE TYPE guarded by a catalog check, everything else
 CREATE ... IF NOT EXISTS. Run BEFORE apply_rls_policies.py, AFTER apply_clients
@@ -98,7 +124,11 @@ DDL = [
 		) STORED,
 		owner_brief_url          TEXT          NOT NULL,
 		created_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-		updated_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+		updated_at               TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+		-- Lets every child table FK on (client_id, appointment_id) instead of
+		-- appointment_id alone, so a mismatched tenant/appointment pair is
+		-- rejected by the FK constraint itself (PR #25 review fix).
+		UNIQUE (client_id, appointment_id)
 	)
 	""",
 	# 3. CONFIRMATION AUDIT LOG
@@ -106,14 +136,18 @@ DDL = [
 	CREATE TABLE IF NOT EXISTS confirmation_logs (
 		log_id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
 		client_id          VARCHAR(40)  NOT NULL REFERENCES clients(client_id),
-		appointment_id     UUID         NOT NULL REFERENCES appointments(appointment_id) ON DELETE CASCADE,
+		appointment_id     UUID         NOT NULL,
 		channel            VARCHAR(10)  NOT NULL CHECK (channel IN ('SMS', 'EMAIL')),
 		confirmation_tier  VARCHAR(10)  NOT NULL CHECK (confirmation_tier IN ('24H', '3H')),
 		sent_at            TIMESTAMPTZ  NOT NULL,
 		delivery_status    VARCHAR(50)  NOT NULL,
 		reply_received_at  TIMESTAMPTZ,
 		raw_response       TEXT,
-		created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+		created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+		CONSTRAINT fk_confirmation_logs_appointment_same_tenant
+			FOREIGN KEY (client_id, appointment_id)
+			REFERENCES appointments (client_id, appointment_id)
+			ON DELETE CASCADE
 	)
 	""",
 	# 4. DISPOSITION CAPTURE TABLE
@@ -126,14 +160,18 @@ DDL = [
 	CREATE TABLE IF NOT EXISTS appointment_dispositions (
 		disposition_id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
 		client_id               VARCHAR(40)  NOT NULL REFERENCES clients(client_id),
-		appointment_id          UUID  UNIQUE NOT NULL REFERENCES appointments(appointment_id) ON DELETE CASCADE,
+		appointment_id          UUID  UNIQUE NOT NULL,
 		outcome                 VARCHAR(20)  NOT NULL CHECK (outcome IN ('SIGNED', 'DECIDING', 'NO', 'NOT_A_FIT')),
 		doors_signed            INTEGER      NOT NULL DEFAULT 0,
 		close_reason            VARCHAR(50)  CHECK (close_reason IN (
 			'PRICE', 'TIMING', 'STAYING_SELF_MANAGED', 'WENT_ELSEWHERE', 'NOT_QUALIFIED'
 		)),
 		brief_accurate          VARCHAR(10)  NOT NULL CHECK (brief_accurate IN ('YES', 'PARTLY', 'NO')),
-		disposition_captured_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+		disposition_captured_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+		CONSTRAINT fk_appointment_dispositions_appointment_same_tenant
+			FOREIGN KEY (client_id, appointment_id)
+			REFERENCES appointments (client_id, appointment_id)
+			ON DELETE CASCADE
 	)
 	""",
 	# 5. DISPUTE AUDIT LOG
@@ -150,13 +188,135 @@ DDL = [
 	CREATE TABLE IF NOT EXISTS appointment_disputes (
 		dispute_id      UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
 		client_id       VARCHAR(40)  NOT NULL REFERENCES clients(client_id),
-		appointment_id  UUID  UNIQUE NOT NULL REFERENCES appointments(appointment_id) ON DELETE CASCADE,
+		appointment_id  UUID  UNIQUE NOT NULL,
 		flagged_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
 		reason          TEXT         NOT NULL,
 		evidence_ref    TEXT,
 		outcome         VARCHAR(50)  NOT NULL DEFAULT 'CREDITED_AUTOMATIC',
-		resolved_at     TIMESTAMPTZ
+		resolved_at     TIMESTAMPTZ,
+		CONSTRAINT fk_appointment_disputes_appointment_same_tenant
+			FOREIGN KEY (client_id, appointment_id)
+			REFERENCES appointments (client_id, appointment_id)
+			ON DELETE CASCADE
 	)
+	""",
+	# 2a. SELF-CORRECTING UPGRADE for an already-applied instance of this
+	#     migration (pre-PR-#25-fix): add the composite UNIQUE on appointments
+	#     and swap every child FK from single-column appointment_id to the
+	#     composite (client_id, appointment_id) pair. Re-run on every apply, same
+	#     self-correcting pattern as apply_contacts.py's company_id FK fixup —
+	#     harmless once already applied.
+	# Postgres has no `ADD CONSTRAINT IF NOT EXISTS` (only DROP CONSTRAINT
+	# supports IF EXISTS), so each addition is guarded via pg_constraint.
+	"""
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'appointments_client_id_appointment_id_key'
+		) THEN
+			ALTER TABLE appointments ADD CONSTRAINT appointments_client_id_appointment_id_key UNIQUE (client_id, appointment_id);
+		END IF;
+	END$$;
+	""",
+	"ALTER TABLE confirmation_logs DROP CONSTRAINT IF EXISTS confirmation_logs_appointment_id_fkey",
+	"""
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'fk_confirmation_logs_appointment_same_tenant'
+		) THEN
+			ALTER TABLE confirmation_logs
+				ADD CONSTRAINT fk_confirmation_logs_appointment_same_tenant
+				FOREIGN KEY (client_id, appointment_id)
+				REFERENCES appointments (client_id, appointment_id)
+				ON DELETE CASCADE;
+		END IF;
+	END$$;
+	""",
+	"ALTER TABLE appointment_dispositions DROP CONSTRAINT IF EXISTS appointment_dispositions_appointment_id_fkey",
+	"""
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'fk_appointment_dispositions_appointment_same_tenant'
+		) THEN
+			ALTER TABLE appointment_dispositions
+				ADD CONSTRAINT fk_appointment_dispositions_appointment_same_tenant
+				FOREIGN KEY (client_id, appointment_id)
+				REFERENCES appointments (client_id, appointment_id)
+				ON DELETE CASCADE;
+		END IF;
+	END$$;
+	""",
+	"ALTER TABLE appointment_disputes DROP CONSTRAINT IF EXISTS appointment_disputes_appointment_id_fkey",
+	"""
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM pg_constraint WHERE conname = 'fk_appointment_disputes_appointment_same_tenant'
+		) THEN
+			ALTER TABLE appointment_disputes
+				ADD CONSTRAINT fk_appointment_disputes_appointment_same_tenant
+				FOREIGN KEY (client_id, appointment_id)
+				REFERENCES appointments (client_id, appointment_id)
+				ON DELETE CASCADE;
+		END IF;
+	END$$;
+	""",
+	# 6a. TRANSITION-GUARD + SAME-TENANT-OWNERSHIP TRIGGER (PR #25 review fix).
+	#     A single BEFORE INSERT OR UPDATE trigger, since Postgres has no
+	#     composite-FK equivalent for company_id/contact_id — companies is a
+	#     shared prospect pool (owning_client_id reassigned by
+	#     county_allocation_reassessment.py), so a static composite FK would
+	#     break the moment ownership legitimately moves. Checked at write time
+	#     instead, against the live owning_client_id.
+	"""
+	CREATE OR REPLACE FUNCTION appointments_guard_transition() RETURNS TRIGGER AS $$
+	DECLARE
+		v_owning_client_id VARCHAR(40);
+	BEGIN
+		IF TG_OP = 'UPDATE' THEN
+			IF NEW.opportunity_id IS DISTINCT FROM OLD.opportunity_id THEN
+				RAISE EXCEPTION 'opportunity_id is immutable once set (billing anchor, appointment %)', OLD.appointment_id;
+			END IF;
+			IF NEW.reschedule_count < OLD.reschedule_count THEN
+				RAISE EXCEPTION 'reschedule_count cannot decrease (appointment %)', OLD.appointment_id;
+			END IF;
+		END IF;
+		IF NEW.reschedule_count > 2 THEN
+			RAISE EXCEPTION 'reschedule_count cannot exceed 2 — a third reschedule must set state to LOST instead (appointment %)', NEW.appointment_id;
+		END IF;
+
+		IF NEW.company_id IS NOT NULL THEN
+			SELECT owning_client_id INTO v_owning_client_id
+			FROM companies WHERE company_id = NEW.company_id;
+			IF v_owning_client_id IS DISTINCT FROM NEW.client_id THEN
+				RAISE EXCEPTION 'company % is not owned by client % (owning_client_id=%)',
+					NEW.company_id, NEW.client_id, v_owning_client_id;
+			END IF;
+		END IF;
+
+		IF NEW.contact_id IS NOT NULL THEN
+			SELECT c.owning_client_id INTO v_owning_client_id
+			FROM contacts ct JOIN companies c ON c.company_id = ct.company_id
+			WHERE ct.contact_id = NEW.contact_id;
+			IF v_owning_client_id IS DISTINCT FROM NEW.client_id THEN
+				RAISE EXCEPTION 'contact % is not owned by client % (owning_client_id=%)',
+					NEW.contact_id, NEW.client_id, v_owning_client_id;
+			END IF;
+		END IF;
+
+		RETURN NEW;
+	END;
+	$$ LANGUAGE plpgsql;
+	""",
+	"""
+	DROP TRIGGER IF EXISTS trg_appointments_guard_transition ON appointments;
+	""",
+	"""
+	CREATE TRIGGER trg_appointments_guard_transition
+		BEFORE INSERT OR UPDATE ON appointments
+		FOR EACH ROW EXECUTE FUNCTION appointments_guard_transition();
 	""",
 	# 6. INDICES — the billing-gate composite (index scan on the settlement
 	#    query) and the opportunity-dedupe lookup (non-unique, see module docstring).
