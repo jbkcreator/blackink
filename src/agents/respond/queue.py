@@ -57,14 +57,19 @@ def publish(
     client_id: str,
     idempotency_key: str,
 ) -> Optional[str]:
-    """XADD one inbound-message event. Returns the Redis message id or None."""
-    ensure_group()
+    """XADD one inbound-message event. Returns the Redis message id or None.
+
+    Returns None (never raises) on any Redis failure — the DB row stays
+    PENDING and _sweep_unpublished_pending() will re-enqueue it once Redis
+    recovers.
+    """
     fields = {
         "db_id": str(db_id),
         "client_id": client_id,
         "idempotency_key": idempotency_key,
     }
     try:
+        ensure_group()
         return get_redis_client().xadd(STREAM_KEY, fields)
     except Exception as exc:
         logger.error(
@@ -90,8 +95,8 @@ def read_batch(
     block_ms: int = 1000,
 ) -> List[InboundQueueMessage]:
     """XREADGROUP — claim new messages from the stream."""
-    ensure_group()
     try:
+        ensure_group()
         result = get_redis_client().xreadgroup(
             GROUP_NAME, consumer_name, {STREAM_KEY: ">"}, count=count, block=block_ms
         )

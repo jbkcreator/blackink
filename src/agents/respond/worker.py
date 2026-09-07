@@ -392,6 +392,7 @@ class Worker:
         self.consumer_name = consumer_name or _consumer_name()
         self._stop = False
         self._loop_count = 0
+        self._group_confirmed = False
 
     def request_stop(self, *_args: Any) -> None:
         logger.info(
@@ -419,12 +420,19 @@ class Worker:
                 )
 
     def run_forever(self, block_ms: int = 1000) -> None:
-        queue.ensure_group()
         logger.info("respond.worker: starting (consumer=%s)", self.consumer_name)
 
         while not self._stop:
             self._loop_count += 1
             try:
+                # Lazy group creation: retry on every iteration until Redis is
+                # reachable. Prevents a startup-time outage from killing the
+                # thread permanently. _group_confirmed is reset to False if any
+                # loop exception fires, so a mid-run Redis bounce is also handled.
+                if not self._group_confirmed:
+                    queue.ensure_group()
+                    self._group_confirmed = True
+
                 if self._loop_count % CLAIM_SWEEP_EVERY_N_LOOPS == 0:
                     self._sweep_stale()
 
@@ -447,6 +455,7 @@ class Worker:
                         )
             except Exception:
                 logger.exception("respond.worker: main loop iteration failed — continuing")
+                self._group_confirmed = False
                 time.sleep(IDLE_SLEEP_SECONDS)
 
         logger.info("respond.worker: stopped (consumer=%s)", self.consumer_name)
