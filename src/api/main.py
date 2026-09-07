@@ -61,6 +61,7 @@ _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS = 60
 _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS = 30
 _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS = 60
+_RESPOND_SLA_SWEEP_INTERVAL_SECONDS = 60
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -81,6 +82,8 @@ def _start_background_workers() -> None:
 	from src.tasks.no_show_recovery_sender import run_sweep as no_show_recovery_sweep
 	from src.tasks.self_serve_audit_worker import run_sweep as self_serve_audit_sweep
 	from src.tasks.meeting_outcome_prompt_sender import run_sweep as meeting_outcome_prompt_sweep
+	from src.tasks.respond_sla_sweep import run_sweep as respond_sla_sweep
+	from src.agents.respond.worker import Worker as RespondWorker
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -94,11 +97,25 @@ def _start_background_workers() -> None:
 		("no_show_recovery_sender.run_sweep", _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS, no_show_recovery_sweep),
 		("self_serve_audit_worker.run_sweep", _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS, self_serve_audit_sweep),
 		("meeting_outcome_prompt_sender.run_sweep", _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS, meeting_outcome_prompt_sweep),
+		("respond_sla_sweep.run_sweep", _RESPOND_SLA_SWEEP_INTERVAL_SECONDS, respond_sla_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
 		thread.start()
 		logger.info("Started background worker %s (interval=%ds)", name, interval)
+
+	# The respond worker has its own internal loop and error handling — run it
+	# directly rather than wrapping in _loop(). Signal handlers are not
+	# installed: only the main thread can handle signals in Python, and Cloud
+	# Run SIGTERM terminates the container regardless.
+	respond_worker = RespondWorker()
+	respond_thread = threading.Thread(
+		target=respond_worker.run_forever,
+		name="respond_worker",
+		daemon=True,
+	)
+	respond_thread.start()
+	logger.info("Started background worker respond_worker")
 
 
 # PR review finding: src.services.events._pending_buffer is process-local,

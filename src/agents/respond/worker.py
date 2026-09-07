@@ -148,13 +148,20 @@ def _route(
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
     sla_due_at = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
     _write_result(db, db_id, result, final_status, sla_due_at=sla_due_at)
+
+    if result.intent == Intent.UNSUBSCRIBE:
+        # Suppress the contact atomically with the status write so a crash
+        # between the two can't leave the contact reachable.
+        from src.services.email_suppression import suppress_by_email
+        suppress_by_email(db, sender_email, reason="inbound_opt_out")
+
     db.commit()
 
     if result.intent == Intent.UNSUBSCRIBE:
         msg = (
             f":no_entry: *Opt-out received*\n"
             f"Client: `{client_id}` | Sender: `{sender_email}`\n"
-            f"Message ID: `{db_id}` — marked SUPPRESSED. Remove from all active sequences."
+            f"Message ID: `{db_id}` — marked SUPPRESSED, contact suppressed."
         )
         asyncio.run(_post_slack_alert("command", msg))
 
