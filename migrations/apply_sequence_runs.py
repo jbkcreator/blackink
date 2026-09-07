@@ -40,6 +40,15 @@ DDL = [
             CHECK (status IN ('ACTIVE', 'COMPLETED', 'CANCELLED'))
     )
     """,
+    # Add HALTED terminal state — used by halt_sequence_for_contact() when a
+    # contact clicks opt-out. HALTED has no cooling_until (permanence comes
+    # from contacts.is_opted_out, not from the run state). Idempotent: drop
+    # old constraint (IF EXISTS) then add new one with HALTED included.
+    "ALTER TABLE sequence_runs DROP CONSTRAINT IF EXISTS chk_sequence_runs_status",
+    """
+    ALTER TABLE sequence_runs ADD CONSTRAINT chk_sequence_runs_status
+        CHECK (status IN ('ACTIVE', 'COMPLETED', 'CANCELLED', 'HALTED'))
+    """,
     # cooling_until: 30-day post-sequence cooling window, written when the final
     # touch dispatches (wayfinder ticket 07 — cooling lives on the run). ADD
     # COLUMN IF NOT EXISTS so this is idempotent on an already-created table.

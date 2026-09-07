@@ -153,3 +153,57 @@ def test_may_enroll_true_when_no_active_run(monkeypatch):
 
     monkeypatch.setattr(se, "get_system_db_context", _fake_system_db)
     assert se.may_enroll(contact_id=42) is True
+
+
+def test_may_enroll_false_when_opted_out(monkeypatch):
+    """Enroll-time 'belt': a globally opted-out contact is never re-enrollable,
+    even with no active run. The is_opted_out lookup is the first query."""
+    import src.services.sequence_enrollment as se
+
+    calls = {"n": 0}
+
+    def _execute(*a, **kw):
+        calls["n"] += 1
+        # First execute = is_opted_out lookup → True (short-circuits).
+        return SimpleNamespace(scalar=lambda: True if calls["n"] == 1 else 0)
+
+    @contextmanager
+    def _fake_system_db():
+        yield SimpleNamespace(execute=_execute)
+
+    monkeypatch.setattr(se, "get_system_db_context", _fake_system_db)
+    assert se.may_enroll(contact_id=42) is False
+    assert calls["n"] == 1  # never reached the active-run count
+
+
+# ── enroll_contact: touch-2 dial is NOT enqueued (event-driven) ──────────────
+
+
+def test_enroll_contact_skips_touch2_dial(monkeypatch):
+    """enroll_contact enqueues touches 1/3/4/5 upfront but NOT the touch-2 dial
+    — that is posted event-driven on Touch 1 approval (ADR 0001). Enqueuing it
+    here would orphan it, since the sweep never posts DIAL_TASK."""
+    import src.services.sequence_enrollment as se
+    import src.services.work_orders as wo
+
+    monkeypatch.setattr(se, "may_enroll", lambda contact_id: True)
+
+    enqueued: list[dict] = []
+    monkeypatch.setattr(wo, "enqueue", lambda **kw: enqueued.append(kw) or SimpleNamespace(action_id="a"))
+
+    @contextmanager
+    def _nested():
+        yield SimpleNamespace()
+
+    session = SimpleNamespace(
+        begin_nested=_nested,
+        execute=lambda *a, **kw: SimpleNamespace(),
+    )
+
+    se.enroll_contact(session, client_id="acme", contact_id=7, contact_email="p@x.com")
+
+    steps = sorted(kw["payload"]["touch_step"] for kw in enqueued)
+    classes = {kw["action_class"] for kw in enqueued}
+    assert steps == [1, 3, 4, 5]
+    assert "DIAL_TASK" not in classes
+    assert "LINKEDIN_TASK" in classes

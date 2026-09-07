@@ -71,6 +71,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
           PYTHONPATH=. python migrations/apply_sequence_runs.py
           PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py
+          PYTHONPATH=. python migrations/apply_inbound_messages.py
           PYTHONPATH=. python migrations/apply_companies_google_place_id.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py
           PYTHONPATH=. python migrations/apply_owner_visibility_scores.py

@@ -16,8 +16,10 @@ the normal production mode. Providing it is useful for per-client debugging.
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, ".")
 
@@ -26,6 +28,16 @@ from src.services import work_orders as wo
 logger = logging.getLogger(__name__)
 
 _EMAIL_TOUCH_ACTION = "DISPATCH_EMAIL_TOUCH"
+_LINKEDIN_TASK_ACTION = "LINKEDIN_TASK"
+
+# Compliance-block handling for LinkedIn touches (PR #26 finding 3). A block is
+# either PERMANENT (opt-out / suppression — never self-resolves) or RETRYABLE
+# (e.g. a DNC ABSTAIN that may clear once a vendor is wired). A permanent block
+# is terminally SKIPPED so due_batch never re-selects it; a retryable block is
+# deferred by a bounded backoff so it is re-checked at most once per interval
+# (not every sweep tick), and terminally SKIPPED once the retry window is spent.
+_LINKEDIN_RETRY_BACKOFF = timedelta(hours=6)
+_LINKEDIN_MAX_RETRY_AGE = timedelta(days=3)
 
 # Every touch action class the sweep surfaces, mapped to its Slack channel key
 # (config/slack_channels.py). Without DIAL_TASK/LINKEDIN_TASK here they would
@@ -38,11 +50,123 @@ _ACTION_CHANNEL = {
     "LINKEDIN_TASK": "setter",
 }
 
+# Action classes the sweep actually surfaces. DIAL_TASK is excluded on purpose
+# (event-driven on Touch 1 approval, ADR 0001) — it is in _ACTION_CHANNEL only
+# for channel resolution, never swept.
+_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION)
+
 
 async def _post_due_card(order, channel_key: str) -> bool:
     from src.services.slack.listeners import post_work_order_card
 
     posted = await post_work_order_card(order, channel_key=channel_key)
+    return posted is not None
+
+
+async def _post_due_linkedin_card(order) -> bool:
+    """Post a due LINKEDIN_TASK card, but only after the per-touch compliance
+    gate passes. On a block (including a global opt-out), skip the post and
+    record a touch_skipped_compliance event instead. See
+    docs/adr/0001-non-email-touch-posting-model.md.
+
+    DB access is synchronous (get_db_context) inside this async function — same
+    pattern as listeners._post_dial_task_after_touch1_approval."""
+    from sqlalchemy import text
+
+    from src.core.database import get_db_context
+    from src.services.compliance_gate import evaluate_touch_gate
+    from src.services.slack.listeners import post_work_order_card
+
+    contact_id = int(order.entity_id)
+    touch_step = int(order.payload.get("touch_step", 4)) if isinstance(order.payload, dict) else 4
+
+    with get_db_context(client_id=order.client_id) as session:
+        contact = session.execute(
+            text("SELECT * FROM contacts WHERE contact_id = :cid"),
+            {"cid": contact_id},
+        ).fetchone()
+        if contact is None:
+            logger.error("sequence_sweep: LINKEDIN_TASK contact_id=%s not found — skipping", contact_id)
+            return False
+
+        gate = evaluate_touch_gate(session, contact, order.client_id)
+        if not gate.ready:
+            # Permanent = opt-out / suppression (never self-resolves). Everything
+            # else is treated as retryable, but bounded: once the order has been
+            # around longer than _LINKEDIN_MAX_RETRY_AGE it is terminally skipped
+            # too, so nothing loops forever.
+            now = datetime.now(timezone.utc)
+            permanent = bool(getattr(contact, "is_opted_out", False) or getattr(contact, "suppression_state", False))
+            order_created = getattr(order, "created_at", None)
+            exhausted = order_created is not None and (now - order_created) > _LINKEDIN_MAX_RETRY_AGE
+            terminal = permanent or exhausted
+            disposition = "SKIPPED_PERMANENT" if permanent else ("SKIPPED_RETRY_EXHAUSTED" if exhausted else "DEFERRED")
+
+            logger.info(
+                "sequence_sweep: LINKEDIN_TASK compliance block contact_id=%s reasons=%s disposition=%s",
+                contact_id, gate.blocked_reasons, disposition,
+            )
+            # Status change and the audit event share ONE transaction, so a
+            # terminally-skipped order can never re-emit the event on a later
+            # tick (the guarded WHERE status='QUEUED' makes the SKIP idempotent).
+            if terminal:
+                session.execute(
+                    text(
+                        "UPDATE agent_work_orders "
+                        "SET status = 'SKIPPED', decided_by = 'sequence_sweep:compliance', "
+                        "    decided_at = NOW(), updated_at = NOW() "
+                        "WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED'"
+                    ),
+                    {"action_id": str(order.action_id), "client_id": order.client_id},
+                )
+            else:
+                session.execute(
+                    text(
+                        "UPDATE agent_work_orders SET due_at = :next_due, updated_at = NOW() "
+                        "WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED'"
+                    ),
+                    {"next_due": now + _LINKEDIN_RETRY_BACKOFF, "action_id": str(order.action_id), "client_id": order.client_id},
+                )
+            session.execute(
+                text(
+                    "INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
+                    "VALUES (:client_id, 'touch_skipped_compliance', 'contact', :entity_id, 'sequence_sweep', :payload)"
+                ),
+                {
+                    "client_id": order.client_id,
+                    "entity_id": str(contact_id),
+                    "payload": json.dumps({
+                        "action_id": str(order.action_id),
+                        "touch_step": touch_step,
+                        "action_class": _LINKEDIN_TASK_ACTION,
+                        "blocked_reasons": gate.blocked_reasons,
+                        "disposition": disposition,
+                    }),
+                },
+            )
+            session.commit()
+            return False
+
+    posted = await post_work_order_card(order, channel_key="setter")
+    if posted is not None:
+        # Manual-task log (v2 §3.1.2 line 381): no browser/LinkedIn API involved.
+        with get_db_context(client_id=order.client_id) as session:
+            session.execute(
+                text(
+                    "INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
+                    "VALUES (:client_id, 'linkedin_task_created', 'contact', :entity_id, 'sequence_sweep', :payload)"
+                ),
+                {
+                    "client_id": order.client_id,
+                    "entity_id": str(contact_id),
+                    "payload": json.dumps({
+                        "action_id": str(order.action_id),
+                        "touch_step": touch_step,
+                        "run_id": order.payload.get("run_id") if isinstance(order.payload, dict) else None,
+                    }),
+                },
+            )
+            session.commit()
     return posted is not None
 
 
@@ -76,9 +200,16 @@ def alert_stuck_dispatches(older_than_minutes: int = 30) -> int:
 
 
 def run_sweep(client_id=None, limit: int = 100) -> int:
-    """Fetch due QUEUED orders and post their approval cards. Returns cards posted."""
+    """Fetch due QUEUED orders and post their approval cards. Returns cards posted.
+
+    Handles email touches (1/3/5) and the day-7 LinkedIn touch (4). The dial
+    touch (2) is NOT swept — it is posted event-driven on Touch 1 approval
+    (docs/adr/0001-non-email-touch-posting-model.md)."""
     batch = wo.due_batch(client_id=client_id, limit=limit)
-    touch_orders = [o for o in batch if o.action_class in _ACTION_CHANNEL]
+    # DIAL_TASK is deliberately NOT swept — it is posted event-driven on Touch 1
+    # approval (docs/adr/0001-non-email-touch-posting-model.md); only email and
+    # LinkedIn touches surface here.
+    touch_orders = [o for o in batch if o.action_class in _SWEPT_ACTIONS]
 
     if not touch_orders:
         logger.info("sequence_sweep: no due touch orders")
@@ -89,6 +220,18 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         if order.slack_message_ts:
             # Card already posted — skip to avoid duplicate cards.
             logger.debug("sequence_sweep: action_id=%s already has a card, skipping", order.action_id)
+            continue
+        # LINKEDIN_TASK is posted through its own poster, which re-checks the
+        # per-touch compliance gate before showing the card and logs a
+        # touch_skipped_compliance / linkedin_task_created event (v2 §3.1.2).
+        # Everything else goes through the generic card poster.
+        if order.action_class == _LINKEDIN_TASK_ACTION:
+            ok = asyncio.run(_post_due_linkedin_card(order))
+            if ok:
+                posted += 1
+                logger.info("sequence_sweep: LinkedIn card posted action_id=%s contact=%s", order.action_id, order.entity_id)
+            else:
+                logger.info("sequence_sweep: LinkedIn card NOT posted action_id=%s (compliance skip or Slack error)", order.action_id)
             continue
         channel_key = _ACTION_CHANNEL[order.action_class]
         ok = asyncio.run(_post_due_card(order, channel_key))

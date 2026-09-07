@@ -74,12 +74,19 @@ DDL = [
 		updated_at           TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
 		CONSTRAINT uq_agent_work_orders_idem UNIQUE (client_id, idempotency_key),
 		CONSTRAINT ck_agent_work_orders_status CHECK (status IN
-			('QUEUED','APPROVED','REJECTED','SNOOZED','SKIPPED','DONE','EXECUTING','FAILED')),
+			('QUEUED','APPROVED','REJECTED','SNOOZED','SKIPPED','DONE','EXECUTING','FAILED','CANCELLED')),
 		CONSTRAINT ck_agent_work_orders_band CHECK (autonomy_band IN
 			('BAND_1_OBSERVE','BAND_2_ONE_TAP','BAND_3_AUTO')),
 		CONSTRAINT ck_agent_work_orders_risk CHECK (risk_class IN
 			('LOW','MEDIUM','HIGH','CRITICAL'))
 	)
+	""",
+	# Idempotent status-constraint refresh for DBs created before CANCELLED was
+	# added (the Mark Opt-Out halt sets status='CANCELLED' — sequence_halt.py).
+	"ALTER TABLE agent_work_orders DROP CONSTRAINT IF EXISTS ck_agent_work_orders_status",
+	"""
+	ALTER TABLE agent_work_orders ADD CONSTRAINT ck_agent_work_orders_status
+		CHECK (status IN ('QUEUED','APPROVED','REJECTED','SNOOZED','SKIPPED','DONE','EXECUTING','FAILED','CANCELLED'))
 	""",
 	"CREATE INDEX IF NOT EXISTS ix_awo_client_status ON agent_work_orders (client_id, status)",
 	"CREATE INDEX IF NOT EXISTS ix_awo_entity        ON agent_work_orders (entity_type, entity_id)",
