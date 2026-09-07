@@ -42,10 +42,20 @@ _EMAIL_TOUCH_STEPS = {1, 3, 5}
 
 def may_enroll(contact_id: int) -> bool:
     """Return False if the contact is currently ineligible for a new sequence:
-    either an ACTIVE run exists, or a COMPLETED run's 30-day cooling window has
-    not yet elapsed (cooling_until in the future). True otherwise. Cross-client
-    by design — see module docstring."""
+    the contact is globally opted out, an ACTIVE run exists, or a COMPLETED
+    run's 30-day cooling window has not yet elapsed (cooling_until in the
+    future). True otherwise. Cross-client by design — see module docstring.
+
+    The opt-out check is the enroll-time "belt": a globally opted-out contact
+    must never be re-enrolled by any client. The per-send compliance gate is
+    the "suspenders" backstop (contacts.is_opted_out, evaluate_touch_gate)."""
     with get_system_db_context() as session:
+        opted_out = session.execute(
+            text("SELECT is_opted_out FROM contacts WHERE contact_id = :contact_id"),
+            {"contact_id": contact_id},
+        ).scalar()
+        if opted_out:
+            return False
         count = session.execute(
             text(
                 "SELECT COUNT(*) FROM sequence_runs "
@@ -113,11 +123,19 @@ def enroll_contact(
         return None
 
     for touch_step, day_offset in _TOUCH_DAY_OFFSETS.items():
+        # Touch 2 (dial) is NOT enqueued here — it is posted event-driven the
+        # instant Touch 1 is approved (60s call-while-hot SLA), keyed
+        # seq:{run_id}:touch:2 by _post_dial_task_after_touch1_approval. See
+        # docs/adr/0001-non-email-touch-posting-model.md. Enqueuing it upfront
+        # would create an orphan the sweep never posts.
+        if touch_step == 2:
+            continue
         due_at = now + timedelta(days=day_offset)
         is_email = touch_step in _EMAIL_TOUCH_STEPS
+        # Touch 2 is `continue`d above (event-driven dial post, ADR 0001), so
+        # only email vs LinkedIn is decided here.
         action_class = (
             "DISPATCH_EMAIL_TOUCH" if is_email
-            else "DIAL_TASK" if touch_step == 2
             else "LINKEDIN_TASK"
         )
         # config_fingerprint["channel"] selects the EXECUTION dispatcher (see

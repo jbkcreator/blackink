@@ -1025,3 +1025,182 @@ def test_evaluate_campaign_readiness_not_subverted_by_temp_table_shadowing(canar
 				{"cid": str(contact_id)},
 			)
 			session.commit()
+
+
+# ── Subtask 1.1.1 — appointment ops: PR #25 review fixes ──
+#
+# Finding 1 (cross-tenant appointment records can be linked together): a bare
+# appointment_id FK on the child tables only proves the parent row exists, not
+# that it belongs to the same tenant. Proves the composite (client_id,
+# appointment_id) FK — and the trigger's company_id/contact_id ownership
+# check — actually reject a cross-tenant link, not just that the DDL parses.
+#
+# Finding 2 (state-machine rules unenforced): proves
+# appointments_guard_transition() rejects reschedule_count > 2, a decrease in
+# reschedule_count, and any change to opportunity_id — regardless of whether
+# any caller goes through src/services/appointment_state.py.
+
+
+def _insert_appointment(session, *, client_id, company_id, contact_id, opportunity_id=None):
+	import uuid
+
+	row = session.execute(
+		text(
+			"INSERT INTO appointments "
+			"(client_id, company_id, contact_id, opportunity_id, scheduled_for, owner_brief_url) "
+			"VALUES (:client_id, :company_id, :contact_id, :opportunity_id, NOW() + interval '1 day', "
+			"'https://example.test/brief') "
+			"RETURNING appointment_id"
+		),
+		{
+			"client_id": client_id,
+			"company_id": company_id,
+			"contact_id": contact_id,
+			"opportunity_id": opportunity_id or str(uuid.uuid4()),
+		},
+	).first()
+	return row.appointment_id
+
+
+def _delete_appointment(appointment_id):
+	# DELETE is REVOKEd from both runtime roles on appointments (status-
+	# transitioned, never removed at runtime — see apply_appointment_ops.py),
+	# so cleanup must go through the owner role, not a tenant-scoped session.
+	with get_owner_db_context() as session:
+		session.execute(text("DELETE FROM confirmation_logs WHERE appointment_id = :aid"), {"aid": appointment_id})
+		session.execute(text("DELETE FROM appointment_disputes WHERE appointment_id = :aid"), {"aid": appointment_id})
+		session.execute(text("DELETE FROM appointment_dispositions WHERE appointment_id = :aid"), {"aid": appointment_id})
+		session.execute(text("DELETE FROM appointments WHERE appointment_id = :aid"), {"aid": appointment_id})
+		session.commit()
+
+
+def test_confirmation_log_cannot_reference_another_tenants_appointment(canary_tenants):
+	"""Composite FK proof: a Tenant-A session may write a confirmation_logs
+	row with its own client_id, but must not be able to point it at an
+	appointment that actually belongs to Tenant B."""
+	with get_db_context(client_id=CANARY_B) as session:
+		other_appointment_id = _insert_appointment(
+			session,
+			client_id=CANARY_B,
+			company_id=canary_tenants[CANARY_B]["company_id"],
+			contact_id=canary_tenants[CANARY_B]["contact_id"],
+		)
+	try:
+		raised = False
+		try:
+			with get_db_context(client_id=CANARY_A) as session:
+				session.execute(
+					text(
+						"INSERT INTO confirmation_logs "
+						"(client_id, appointment_id, channel, confirmation_tier, sent_at, delivery_status) "
+						"VALUES (:client_id, :appointment_id, 'EMAIL', '24H', NOW(), 'SENT')"
+					),
+					{"client_id": CANARY_A, "appointment_id": other_appointment_id},
+				)
+		except IntegrityError:
+			raised = True
+		assert raised, (
+			"Tenant A inserted a confirmation_logs row referencing Tenant B's "
+			"appointment_id — composite (client_id, appointment_id) FK did not reject it"
+		)
+	finally:
+		_delete_appointment(other_appointment_id)
+
+
+def test_appointment_dispute_cannot_reference_another_tenants_appointment(canary_tenants):
+	with get_db_context(client_id=CANARY_A) as session:
+		other_appointment_id = _insert_appointment(
+			session,
+			client_id=CANARY_A,
+			company_id=canary_tenants[CANARY_A]["company_id"],
+			contact_id=canary_tenants[CANARY_A]["contact_id"],
+		)
+	try:
+		raised = False
+		try:
+			with get_db_context(client_id=CANARY_B) as session:
+				session.execute(
+					text(
+						"INSERT INTO appointment_disputes (client_id, appointment_id, reason) "
+						"VALUES (:client_id, :appointment_id, 'test')"
+					),
+					{"client_id": CANARY_B, "appointment_id": other_appointment_id},
+				)
+		except IntegrityError:
+			raised = True
+		assert raised, (
+			"Tenant B inserted an appointment_disputes row referencing Tenant A's "
+			"appointment_id — composite (client_id, appointment_id) FK did not reject it"
+		)
+	finally:
+		_delete_appointment(other_appointment_id)
+
+
+def test_appointment_cannot_be_booked_against_another_tenants_company(canary_tenants):
+	"""Trigger proof: company_id has no static composite FK (companies is a
+	shared, reassignable pool), so appointments_guard_transition() must reject
+	an appointment whose client_id doesn't match the company's own
+	owning_client_id."""
+	raised = False
+	try:
+		with get_db_context(client_id=CANARY_A) as session:
+			_insert_appointment(
+				session,
+				client_id=CANARY_A,
+				company_id=canary_tenants[CANARY_B]["company_id"],
+				contact_id=None,
+			)
+	except Exception:
+		raised = True
+	assert raised, (
+		"Tenant A booked an appointment against Tenant B's company_id — "
+		"appointments_guard_transition() did not reject the ownership mismatch"
+	)
+
+
+def test_appointment_reschedule_count_cannot_exceed_two(canary_tenants):
+	with get_db_context(client_id=CANARY_A) as session:
+		appointment_id = _insert_appointment(
+			session,
+			client_id=CANARY_A,
+			company_id=canary_tenants[CANARY_A]["company_id"],
+			contact_id=canary_tenants[CANARY_A]["contact_id"],
+		)
+	try:
+		raised = False
+		try:
+			with get_db_context(client_id=CANARY_A) as session:
+				session.execute(
+					text("UPDATE appointments SET reschedule_count = 3 WHERE appointment_id = :aid"),
+					{"aid": appointment_id},
+				)
+		except Exception:
+			raised = True
+		assert raised, "reschedule_count=3 was accepted — the trigger did not enforce the cap of 2"
+	finally:
+		_delete_appointment(appointment_id)
+
+
+def test_appointment_opportunity_id_is_immutable(canary_tenants):
+	import uuid
+
+	with get_db_context(client_id=CANARY_A) as session:
+		appointment_id = _insert_appointment(
+			session,
+			client_id=CANARY_A,
+			company_id=canary_tenants[CANARY_A]["company_id"],
+			contact_id=canary_tenants[CANARY_A]["contact_id"],
+		)
+	try:
+		raised = False
+		try:
+			with get_db_context(client_id=CANARY_A) as session:
+				session.execute(
+					text("UPDATE appointments SET opportunity_id = :new_id WHERE appointment_id = :aid"),
+					{"new_id": str(uuid.uuid4()), "aid": appointment_id},
+				)
+		except Exception:
+			raised = True
+		assert raised, "opportunity_id was changed — the trigger did not enforce immutability"
+	finally:
+		_delete_appointment(appointment_id)

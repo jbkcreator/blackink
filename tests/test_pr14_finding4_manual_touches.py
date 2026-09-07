@@ -2,8 +2,9 @@
 surfaced and executable, not left QUEUED forever.
 
 Two halves:
-  - sequence_sweep now posts cards for all three touch classes, each to its
-    own Slack channel (not just DISPATCH_EMAIL_TOUCH).
+  - the sweep surfaces the LinkedIn touch (through its compliance-gated
+    poster); the dial touch is posted event-driven on Touch 1 approval and is
+    deliberately NOT swept (docs/adr/0001-non-email-touch-posting-model.md).
   - the manual dispatcher records completion for an APPROVED manual touch so
     the state machine closes — and never routes a phone/LinkedIn touch into
     the email sender.
@@ -23,10 +24,14 @@ from src.services.work_orders.dispatchers import (
 def _order(action_class, action_id="a1"):
     return SimpleNamespace(
         action_id=action_id, entity_id="1", action_class=action_class, slack_message_ts=None,
+        payload={"touch_step": 4, "run_id": "r1"},
     )
 
 
-def test_sweep_surfaces_all_three_touch_classes_to_their_channels(monkeypatch):
+def test_sweep_surfaces_email_and_linkedin_but_not_dial(monkeypatch):
+    """Per ADR 0001: the sweep posts the email touch (via _post_due_card) and
+    the LinkedIn touch (via its compliance-gated _post_due_linkedin_card).
+    DIAL_TASK is event-driven on Touch 1 approval and is NEVER swept."""
     orders = [
         _order("DISPATCH_EMAIL_TOUCH", "email1"),
         _order("DIAL_TASK", "dial1"),
@@ -40,15 +45,21 @@ def test_sweep_surfaces_all_three_touch_classes_to_their_channels(monkeypatch):
         routed.append((order.action_class, channel_key))
         return True
 
+    async def _fake_linkedin_post(order):
+        routed.append((order.action_class, "linkedin"))
+        return True
+
     monkeypatch.setattr(sequence_sweep, "_post_due_card", _fake_post)
+    monkeypatch.setattr(sequence_sweep, "_post_due_linkedin_card", _fake_linkedin_post)
 
     posted = sequence_sweep.run_sweep()
-    assert posted == 3
+    # Email + LinkedIn posted; dial excluded entirely.
+    assert posted == 2
     assert dict(routed) == {
         "DISPATCH_EMAIL_TOUCH": "setter",
-        "DIAL_TASK": "dial",
-        "LINKEDIN_TASK": "setter",
+        "LINKEDIN_TASK": "linkedin",
     }
+    assert "DIAL_TASK" not in dict(routed)
 
 
 def test_manual_touch_registered_and_closes_without_send():
