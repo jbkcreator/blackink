@@ -31,7 +31,9 @@ from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
 from src.api.booking_webhook_router import router as booking_webhook_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
+from src.api.payment_auth_router import router as payment_auth_router
 from src.api.public_landing_router import router as public_landing_router
+from src.api.stripe_webhook_router import router as stripe_webhook_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -150,6 +152,8 @@ app.include_router(akrash_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
 app.include_router(public_landing_router)
+app.include_router(payment_auth_router)
+app.include_router(stripe_webhook_router)
 
 
 @app.get("/healthz")

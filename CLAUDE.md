@@ -53,6 +53,7 @@ PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2
 PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
 PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — appointments/confirmation_logs/dispositions/disputes + state enum (needs clients+companies+contacts; before RLS)
+PYTHONPATH=. python migrations/apply_payment_auth_capture.py   # Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture columns + config/webhook-idempotency tables (needs companies; before RLS)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -653,6 +654,82 @@ permanently block the original tenant from updating its own pre-existing
 appointment rows after a routine reassignment. `client_id`/`company_id`/
 `contact_id` are immutable once set instead, closing the same tenant-hop
 without that live re-check.
+
+### Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1)
+
+Greenfield Stripe integration — no Stripe usage existed anywhere in this
+repo before this subtask. Captures a client's card (backup) and ACH
+Direct Debit mandate (primary billing rail) via a Stripe Elements modal
+during onboarding, with a temporary $1 uncaptured authorization proving
+card validity before it's explicitly cancelled.
+
+**Offer-scoped, never a universal rule.** The Source of Truth is explicit
+that zero-upfront billing is not blanket policy — self-serve Respond/
+bundle signups charge at signup via Stripe Checkout with an order bump, a
+separate flow entirely. `payment_auth_offer_config` (one row per
+`offer_code`, `zero_deposit_enabled` defaulting `FALSE`) is the gate every
+endpoint checks (`src/services/payment_auth.py::is_zero_deposit_enabled`)
+before any Stripe call — an operator flips it only for a client-confirmed
+offer, never a hardcoded offer-name branch.
+
+**Two SetupIntents, not one.** A single Stripe SetupIntent cannot capture
+both a card and a bank account, so `POST /api/v1/onboarding/payment-auth/setup-intents`
+creates one of each (`create_card_setup_intent`/`create_ach_setup_intent`),
+presented together in one onboarding step. Full request/response contract:
+`docs/api/payment_auth_contract.md`. **The actual embedded Stripe Elements
+modal is a separate frontend task, not complete under this backend work**
+— `GET /api/v1/onboarding/payment-auth/test-harness` is a standalone,
+clearly-labeled test page available only in local/dev/test environments
+and returning 404 whenever `ENVIRONMENT=production` (see `is_production`),
+for manual Stripe test-mode verification only, not the production
+frontend.
+
+**No client-portal login system exists yet, so every endpoint
+authenticates via a signed, expiring onboarding token**
+(`src/services/payment_auth_token.py`) rather than trusting a bare
+`client_id`/`company_id`/`offer_code` in the request — those three values
+come exclusively from the token's own signed claims, never a request
+field, so a request can never operate on a company (or claim a different
+offer for one) it wasn't issued a token for. This token is deliberately
+temporary integration-testing scaffolding (`scripts/dev_mint_payment_auth_token.py`
+mints one for dev/test use) — the future authenticated onboarding portal
+is expected to supply its own tenant context once it exists, same
+resolved gap as the calendar-connect link in the booking-engine section
+above.
+
+**Server-side verification only — never trusts a client-submitted
+PaymentMethod id.** `POST .../confirm` takes SetupIntent *ids* only;
+`verify_setup_intent_server_side()` always re-fetches each SetupIntent
+from Stripe and asserts its `.customer`/`.payment_method.type`/`.status`
+before anything is persisted. ACH verification is genuinely asynchronous
+(a SetupIntent can sit `processing` for minutes) — `SetupIntentNotReady`
+is not an error, just "not done yet"; `payment_auth_completed_at` on
+`companies` is only ever set once **both** rails independently reach
+`succeeded`, most often via `src/api/stripe_webhook_router.py`'s
+`setup_intent.succeeded` handler rather than the synchronous confirm call.
+`stripe_webhook_events` is the idempotency ledger for Stripe's own webhook
+redeliveries; every outbound Stripe call additionally carries its own
+`idempotency_key` (keyed by `company_id` + purpose) so a retried request
+can't create a duplicate Customer/SetupIntent/hold.
+
+**The $1 hold is a real, uncaptured `capture_method='manual'` PaymentIntent**
+— a temporary pending authorization that may briefly appear on the
+customer's statement (never promised to be invisible, since Stripe doesn't
+guarantee that). It is explicitly cancelled (`cancel_auth_hold()`) the
+moment both rails verify, rather than relying on Stripe's ~7-day automatic
+expiry as the primary release mechanism.
+
+`stripe_customer_id`/`card_payment_method_id_encrypted`/
+`ach_payment_method_id_encrypted`/`ach_mandate_id_encrypted` live on
+`companies`, encrypted via the existing `src/core/token_crypto.py`
+(`encrypt_token`/`decrypt_token`, Fernet) — the same primitive already
+used for calendar OAuth tokens and SMTP passwords, not a second encryption
+helper. `record_payment_auth_completed()` deliberately touches only
+`companies` + `events` — payment-method capture must never itself flip
+any billing/entitlement row; that belongs to a separate, later
+settlement-pipeline ticket (the 50/50 split, 60-day clawback monitor, and
+Evidence Packet PDF compiler described in the blueprint's Settlement
+Engine section are not built here).
 
 ## Tooling Rules
 

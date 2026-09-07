@@ -215,6 +215,27 @@ class Company(Base):
 	owner_entity_id: Mapped[Optional[int]] = mapped_column(
 		BigInteger, ForeignKey("owner_entities.id"), nullable=True, index=True
 	)
+	# ── Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1) ─────────
+	# Additive-only, all nullable, starts NULL — same pattern as owner_entity_id
+	# above. The two *_encrypted columns store Fernet ciphertext produced by
+	# src/core/token_crypto.py's encrypt_token(), never plaintext Stripe IDs.
+	# See migrations/apply_payment_auth_capture.py and src/services/payment_auth.py.
+	stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+	card_payment_method_id_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	ach_payment_method_id_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	ach_mandate_id_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	# Which payment_auth_offer_config.offer_code this capture was performed
+	# under — NULL means payment auth has never run for this company. This
+	# flow is offer-scoped, never a universal rule (see that table's docstring).
+	payment_auth_offer_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+	# The $1 verification PaymentIntent id, so it can be explicitly cancelled
+	# rather than relying solely on Stripe's ~7-day automatic hold expiry.
+	payment_auth_hold_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+	# Set ONLY once both the card and ACH SetupIntents are verified succeeded
+	# server-side (src/services/payment_auth.py::record_payment_auth_completed).
+	# Never flips billing/entitlement itself — that is a separate, later
+	# settlement-pipeline ticket's responsibility.
+	payment_auth_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

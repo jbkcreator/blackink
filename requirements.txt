@@ -42,3 +42,6 @@ lxml>=5.0
 googlemaps>=4.10
 fpdf2>=2.7
 
+# Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1)
+stripe>=10.0
+

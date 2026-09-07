@@ -327,6 +327,27 @@ class AppSettings(BaseSettings):
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
+	# ── Stripe — Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1) ─
+	# Greenfield integration — no Stripe usage existed anywhere in this repo
+	# before this subtask. Test-mode keys only until the applicable offers are
+	# confirmed with the client (see payment_auth_offer_config — this flow is
+	# explicitly NOT a universal zero-upfront rule; self-serve Respond/bundle
+	# signups charge at signup via Stripe Checkout, unrelated to this flow).
+	stripe_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_SECRET_KEY")
+	stripe_publishable_key: Optional[str] = Field(default=None, env="STRIPE_PUBLISHABLE_KEY")
+	# Signs inbound Stripe webhook payloads (stripe.Webhook.construct_event) —
+	# same fail-closed posture as every other secret here: unset means the
+	# webhook route rejects everything rather than trusting an unsigned body.
+	stripe_webhook_secret: Optional[SecretStr] = Field(default=None, env="STRIPE_WEBHOOK_SECRET")
+	# Signs the short-lived onboarding token that stands in for the not-yet-
+	# built authenticated onboarding portal (see src/services/payment_auth_token.py).
+	# Deliberately its own secret, not a reuse of calendar_oauth_state_secret
+	# or no_show_token_secret — same rationale as those: unrelated token
+	# families must be able to rotate independently.
+	payment_auth_onboarding_token_secret: Optional[SecretStr] = Field(
+		default=None, env="PAYMENT_AUTH_ONBOARDING_TOKEN_SECRET"
+	)
+
 
 @lru_cache
 def get_settings() -> AppSettings:
