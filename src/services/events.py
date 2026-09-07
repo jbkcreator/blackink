@@ -47,6 +47,20 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Per-disposition-bucket counts,
+	# not just a total, so the proof-ledger-style visibility the spec asks
+	# for ("winback_import_completed event written with row counts for each
+	# disposition bucket") is enforced at write time, not left to convention.
+	"winback_import_completed": frozenset(
+		{
+			"total_rows",
+			"still_owns_still_renting_count",
+			"still_owns_not_renting_count",
+			"sold_count",
+			"unknown_count",
+			"suppressed_count",
+		}
+	),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is

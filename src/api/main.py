@@ -38,6 +38,7 @@ from src.api.ovs_router import router as ovs_router
 from src.api.booking_webhook_router import router as booking_webhook_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
 from src.api.public_landing_router import router as public_landing_router
+from src.api.winback_router import router as winback_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -162,6 +163,7 @@ app.include_router(ovs_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
 app.include_router(public_landing_router)
+app.include_router(winback_router)
 
 
 @app.get("/healthz")

@@ -89,6 +89,12 @@ TENANT_POLICIES = {
 	"confirmation_logs": {"mode": "direct", "column": "client_id"},
 	"appointment_dispositions": {"mode": "direct", "column": "client_id"},
 	"appointment_disputes": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Both carry their own client_id
+	# column (winback_rows.client_id is denormalized from winback_imports at
+	# insert time, same "direct mode needs its own column per table"
+	# reasoning as meeting_outcome_prompt_jobs above).
+	"winback_imports": {"mode": "direct", "column": "client_id"},
+	"winback_rows": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
