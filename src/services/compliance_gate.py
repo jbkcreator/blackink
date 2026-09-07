@@ -20,7 +20,6 @@ Does not commit — caller's session_scope() owns the transaction, same
 convention as Forced Action's email_suppression.suppress_contact().
 """
 
-import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -30,8 +29,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
-
-logger = logging.getLogger(__name__)
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -84,52 +81,27 @@ class StubDncProvider(DncProvider):
 		return None
 
 
-class TracerfyDncProvider(DncProvider):
-	"""Real vendor implementation (Subtask 3.1.1) — Tracerfy, the same vendor
-	src/tasks/dnc_refresh.py already uses for the monthly re-scrub. Uses
-	src/services/tracerfy_client.py's shared HTTP primitives so there is
-	exactly one implementation of Tracerfy's submit-batch/poll-queue flow.
-
-	check() submits a single-phone batch — acceptable here since this
-	provider is reached rarely (per-contact, at sequence-enrollment time),
-	unlike winback_ingest.py's own batch scrub step (Subtask 3.1.1's CSV
-	pipeline), which calls tracerfy_client.scrub_phones() directly on the
-	whole row set in one call rather than going through this per-phone
-	interface — see that module for why.
-
-	Any submit/poll failure (network error, bad key, vendor timeout) returns
-	None (unknown), never a guessed True/False — the gate's ABSTAIN-always-
-	blocks rule already does the right thing with that.
-	"""
-
-	def __init__(self, api_key: str):
-		self._api_key = api_key
-
-	def check(self, phone: str) -> Optional[bool]:
-		from src.services.tracerfy_client import scrub_phones
-
-		try:
-			result = scrub_phones([phone], self._api_key)
-		except Exception as e:
-			logger.warning("TracerfyDncProvider: scrub failed for phone, ABSTAIN — %s", e)
-			return None
-		return result.get(phone)
-
-
 class StubEmailVerificationProvider(EmailVerificationProvider):
 	def verify(self, email: str) -> str:
 		return "unknown"
 
 
-def _default_dnc_provider() -> DncProvider:
-	"""TracerfyDncProvider once a live API key is configured (Subtask 3.1.1);
-	StubDncProvider otherwise — same fail-closed default posture as
-	EMAIL_SENDING_ENABLED defaulting False. Callers that already pass an
-	explicit dnc_provider (e.g. tests) are unaffected."""
-	settings = get_settings()
-	if settings.dnc_vendor_api_key:
-		return TracerfyDncProvider(settings.dnc_vendor_api_key.get_secret_value())
-	return StubDncProvider()
+# Deliberately no TracerfyDncProvider wired in here, even though Tracerfy is
+# the confirmed DNC vendor (see src/services/tracerfy_client.py) — a real
+# submit-batch/poll-queue round trip can take up to 10 minutes
+# (_POLL_MAX_ATTEMPTS x _POLL_INTERVAL_SEC in that module) and was designed
+# for src/tasks/dnc_refresh.py's async monthly batch, not a synchronous
+# per-contact check. evaluate_touch_gate/evaluate_enrollment_gate are called
+# from live/synchronous paths (sequence_orchestrator.py's touch gate,
+# sequence_enrollment.enroll_contact) — wiring a live single-phone Tracerfy
+# call in as their default would block those paths for minutes per
+# unchecked contact. Every actual live-Tracerfy call in this codebase is a
+# genuine batch (dnc_refresh.py's monthly sweep, winback_ingest.py's
+# post-disposition scrub) that calls tracerfy_client directly, bypassing
+# this per-contact interface entirely — see winback_ingest.py's own
+# docstring for why. This gate stays on StubDncProvider (ABSTAIN on an
+# unchecked contact) until the async monthly refresh has populated a real
+# dnc_clean/dnc_checked_at value for it to read.
 
 
 def _record(session: Session, contact_id: int, client_id: str, result: GateCheckResult) -> None:
@@ -260,7 +232,7 @@ def evaluate_enrollment_gate(
 	fatigue guard that prevents re-enrolling a recently-touched contact across
 	campaigns. Does NOT run mid-sequence (use evaluate_touch_gate for that).
 	"""
-	dnc_provider = dnc_provider or _default_dnc_provider()
+	dnc_provider = dnc_provider or StubDncProvider()
 
 	checks = (
 		_check_deterministic_columns(contact),
@@ -289,7 +261,7 @@ def evaluate_touch_gate(
 	blocked by the cross-enrollment fatigue guard mid-flight. All other checks
 	(eligibility, DNC, non-poach) still run on every touch.
 	"""
-	dnc_provider = dnc_provider or _default_dnc_provider()
+	dnc_provider = dnc_provider or StubDncProvider()
 
 	checks = (
 		_check_deterministic_columns(contact),

@@ -527,12 +527,15 @@ def _run_dnc_scrub(
 	(or as many BATCH_SIZE-sized calls as needed), per the spec's explicit
 	"DNC scrub runs after disposition, before any sequence arm" ordering.
 
-	Calls tracerfy_client.scrub_phones() directly rather than going through
-	compliance_gate.py's per-contact TracerfyDncProvider — winback_rows
-	isn't a `contacts` row, so the existing evaluate_enrollment_gate doesn't
-	apply, and a 500-row import calling a per-phone provider interface 500
-	times would mean 500 separate Tracerfy submissions instead of one
-	batch. See the plan doc's §Wiring Tracerfy for the full rationale.
+	Calls tracerfy_client.scrub_phones() directly rather than through
+	compliance_gate.py's per-contact DncProvider interface — winback_rows
+	isn't a `contacts` row, so evaluate_enrollment_gate doesn't apply, and
+	(separately) compliance_gate.py deliberately has no live per-contact
+	Tracerfy provider at all: a real submit/poll round trip can take up to
+	10 minutes, fine for this function's own batch call but wrong for a
+	synchronous per-contact gate. See compliance_gate.py's own comment on
+	why that gate stays on StubDncProvider, and the plan doc's §Wiring
+	Tracerfy for the full rationale.
 
 	A total scrub failure (bad key, network error, vendor timeout) does NOT
 	default rows to clean — they keep suppression_state at its pre-scrub
