@@ -91,6 +91,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py
           PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py
           PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py
+          PYTHONPATH=. python migrations/apply_appointment_ops.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       # Full suite — this is what actually gates a PR on every change, not
       # just the tenant-leakage path-filtered nightly. Runs

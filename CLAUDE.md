@@ -52,6 +52,7 @@ PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py        # Subtask 3.2
 PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2.3 — No-Show Handler
 PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
+PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — appointments/confirmation_logs/dispositions/disputes + state enum (needs clients+companies+contacts; before RLS)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -598,6 +599,48 @@ Slack workspace over Socket Mode. Note that **Interactivity must be toggled
 on** in the Slack app config even under Socket Mode — Socket Mode only
 replaces the Request URL; it does not enable interactivity, and a card's
 button renders with a warning until it is on.
+
+### Appointment operations & the billing gate (Subtask 1.1.1)
+
+`migrations/apply_appointment_ops.py` deploys the settlement-billing
+substrate: the `appointment_state_enum` (nine states) and four tables —
+`appointments`, `confirmation_logs`, `appointment_dispositions`,
+`appointment_disputes`. This is schema + state machine only; the full
+4-rule ownership/intent/ICP/duration qualification bar lands Week 4.
+
+**Deliberate adaptation of the blueprint DDL** (Source D p5's
+`009_appointment_ops.sql`): the printed DDL types `company_id`/`contact_id`
+as UUIDs and declares `client_id UUID REFERENCES companies(company_id)` —
+none of which is true in this repo (`companies.company_id` is a VARCHAR(64)
+sha256, `contacts.contact_id` is BIGSERIAL, and `client_id` is the
+VARCHAR(40) paying-tenant key that is the RLS boundary). Source D's own
+caveats flag exactly this ("Printed DDL is not a complete application
+schema"). The conflated `client_id → companies` is split into two real
+columns: **`client_id VARCHAR(40) → clients`** (the tenant / RLS boundary)
+and **`company_id VARCHAR(64) → companies`** (the company the appointment is
+with), plus **`contact_id BIGINT → contacts`**. `opportunity_id UUID` is
+preserved across reschedules exactly as the blueprint intends.
+
+All four tables carry their own `client_id` and are registered in
+`config/tenant_policies.py` as `{"mode": "direct", "column": "client_id"}`
+(child tables scoped directly, not via a parent join — a mis-scoped INSERT
+is rejected at the row it is written on). DELETE is REVOKEd from **both**
+runtime roles: an appointment / audit row is status-transitioned, never
+removed at runtime — so tests clean up via the table-owner role, not
+`blackink_system`.
+
+`appointments.is_billable` is a **STORED generated column** — `TRUE` only
+when `state = 'ATTENDED' AND confirmed_24h_timestamp IS NOT NULL AND
+confirmed_3h_timestamp IS NOT NULL`. It is the schema-level slice of the
+gate, **not** the sole billing truth (it recomputes to `false` the moment
+state leaves ATTENDED, e.g. → DISPOSITIONED). `idx_opportunity_dedupe` is a
+**non-unique** index on purpose: one `opportunity_id` legitimately spans
+many appointment rows across reschedule / no-show-recovery / rebook chains;
+exactly-once billing idempotency is enforced at settlement, not by this
+index. The nine-state transition rules — reschedule capped at 2 (the third
+forces `LOST`), `opportunity_id` retained across reschedule and no-show
+recovery — live in `src/services/appointment_state.py` (a generated column
+can express a value but not a transition guard).
 
 ## Tooling Rules
 
