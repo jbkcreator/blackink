@@ -348,6 +348,30 @@ class AppSettings(BaseSettings):
 		default=None, env="PAYMENT_AUTH_ONBOARDING_TOKEN_SECRET"
 	)
 
+	# ── Settlement engine — 50/50 split + 60-day clawback (Subtask 1.2.2) ────
+	# Which store publishes the Evidence Packet PDF and links it on the
+	# Stripe invoice. Unset -> src/services/settlement/store.py falls back to
+	# StubEvidencePacketStore, which always returns None — the same
+	# fail-closed posture as EMAIL_SENDING_ENABLED / OVS_PDF_ALLOWED_HOSTS: a
+	# charge cannot be recorded without a published packet (see
+	# ck_settlement_evidence_packet_required / trg_settlement_guard_transition
+	# in migrations/apply_settlement_ledger.py), so with no store configured
+	# the pipeline compiles packets and bills nothing.
+	settlement_evidence_packet_store: Optional[str] = Field(
+		default=None, env="SETTLEMENT_EVIDENCE_PACKET_STORE"
+	)
+	# Only "stripe_files" is implemented today (Stripe Files + FileLink —
+	# Invoices have no attachment field of their own, so this is the
+	# zero-new-infrastructure option). Any other value is treated as unset.
+
+	# Gates src/api/settlement_router.py's synthetic door_signed ingest —
+	# the DoD's own test path, since no nightly PMS sync exists. Unset means
+	# every request to that route is rejected (HTTP 503), same fail-closed
+	# posture as every other secret-gated route in this file.
+	settlement_operator_api_key: Optional[SecretStr] = Field(
+		default=None, env="SETTLEMENT_OPERATOR_API_KEY"
+	)
+
 
 @lru_cache
 def get_settings() -> AppSettings:

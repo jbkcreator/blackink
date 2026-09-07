@@ -54,6 +54,8 @@ PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
 PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — appointments/confirmation_logs/dispositions/disputes + state enum (needs clients+companies+contacts; before RLS)
 PYTHONPATH=. python migrations/apply_payment_auth_capture.py   # Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture columns + config/webhook-idempotency tables (needs companies; before RLS)
+PYTHONPATH=. python migrations/apply_pms_agreements.py      # Subtask 1.2.2 — door_signed data source (needs clients+companies+owner_contacts; before RLS)
+PYTHONPATH=. python migrations/apply_settlement_ledger.py   # Subtask 1.2.2 — 50/50 settlement split + 60-day clawback ledger (needs pms_agreements+companies; before RLS)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -72,6 +74,7 @@ python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
+python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
 
 # Tests
@@ -730,6 +733,119 @@ any billing/entitlement row; that belongs to a separate, later
 settlement-pipeline ticket (the 50/50 split, 60-day clawback monitor, and
 Evidence Packet PDF compiler described in the blueprint's Settlement
 Engine section are not built here).
+
+### 50/50 Settlement Split Engine & 60-Day Clawback Monitor (Subtask 1.2.2)
+
+Builds the settlement pipeline Subtask 1.2.1 deferred: 50% of a bounty
+charged when a signed management agreement is confirmed (`door_signed`),
+50% at day 60 — voided if the agreement was terminated inside that window
+— with a 4-section Evidence Packet PDF attached to every charge.
+
+**`pms_agreements`, not `client_pm_books`, is the data source for
+`door_signed` and the day-60 re-check.** `client_pm_books` is the
+*permanent, no-TTL* non-poach lock `is_claimed_by_other_client()` reads;
+giving it a `terminated_at` column would risk a future `AND terminated_at
+IS NULL` predicate silently turning that permanent lock into an expiring
+one. `record_door_signed()` (`src/services/settlement/ledger.py`) writes
+the new `pms_agreements` row and upserts the `client_pm_books` claim in one
+transaction; `record_agreement_terminated()` touches only `pms_agreements`
+— the claim row is never touched, so non-poach semantics don't change (see
+`tests/test_settlement_live.py::test_non_poach_claim_survives_agreement_termination`).
+No PMS integration is contracted: `src/services/pms_sync.py`'s
+`PmsProvider` ABC follows the `compliance_gate.py` tri-state stub
+convention, and its only implementation, `StubPmsProvider`, returns `None`
+("couldn't determine") for everything — so out of the box nothing opens
+from a real sync and nothing charges or claws back on a guess at day 60.
+
+**`settlement_transactions`** (`migrations/apply_settlement_ledger.py`) is
+the ledger. Both pricing bases from the blueprint are supported —
+`pricing_basis` is `PER_DOOR` or `FLAT_PER_AGREEMENT` on
+`settlement_offer_config`, since the blueprint's own printed settlement DDL
+bills per door while its pricing registry prices `appt_standard` as a flat
+fee "Any door count" — a contradiction this repo does not resolve by
+picking one; `settlement_enabled` ships `FALSE` with no amount set on
+either basis. Terminal status is **`CHARGED`, not `PAID`** (matching the
+subtask's own Definition of Done wording literally); a distinct
+`SETTLING` value carries ACH's asynchronous pending-settlement window so
+`CHARGED` always means Stripe confirmed money moved. `is_clawed_back` is a
+STORED generated column off `installment_2_status = 'VOIDED_CLAWBACK'`, so
+it can never independently disagree with the status explaining it.
+
+**Zero-dollars-upfront and every fail-closed rule are enforced at the
+schema/trigger layer, not by convention** (six independent layers — see
+the migration's own docstring for the full list): `door_signed_at` /
+`pms_agreement_id` are `NOT NULL` with a composite same-tenant FK (the
+`apply_appointment_ops.py` trick); `trg_settlement_guard_transition`
+rejects a charge unless the agreement is `ACTIVE` (installment 1) or not
+clawed-back-eligible (installment 2), rejects it while
+`evidence_packet_url IS NULL` (**no "compiled but unpublished, proceed
+anyway" path exists**), and rejects it for a non-`PMS_SYNC` agreement
+unless `allow_synthetic_charge = TRUE` — a flag `src/services/settlement/
+charge.py` only ever sets when the configured Stripe key is `sk_test_`, so
+the DoD's synthetic `door_signed` test path can exercise the full pipeline
+in Stripe test mode and is structurally unable to bill a real client in
+production. `charge_installment()` is the *only* function in the repo
+permitted to call a money-moving Stripe API — it re-reads the row/agreement
+and re-derives the amount and every precondition from the DB rather than
+trusting its caller, and `tests/test_no_upfront_charge_paths.py` walks
+`src/` asserting that structurally.
+
+**Exactly-once billing** — the promise `appointments`' own docstring
+deferred here — lives on the ledger via `UNIQUE (client_id,
+opportunity_id)` (many appointment rows legitimately share one
+`opportunity_id` across reschedules; `idx_opportunity_dedupe` on
+`appointments` is deliberately non-unique for that reason) plus `UNIQUE
+(client_id, pms_agreement_id)`. A partial unique index excluding `VOIDED`
+rows was considered and rejected — it would let a voided-then-reinserted
+row re-bill the same opportunity; the accepted failure direction is always
+under-billing, never double-billing.
+
+ACH settles asynchronously via Stripe Invoices (no attachment field of
+their own, so the Evidence Packet is published via **Stripe Files +
+FileLink** and linked in invoice metadata — the zero-new-infrastructure
+option, since no general-purpose object storage has ever been built in
+this repo). Card fallback is attempted **only on a definite decline** — a
+timeout or transport error is recorded `UNCERTAIN` with no card attempt,
+because retrying the other rail after an indeterminate ACH result is
+exactly how a double-charge happens. Idempotency keys are pinned to
+`settlement-<step>|{transaction_id}|{installment}` with no timestamp or
+attempt counter, so a retried sweep re-derives the same key rather than
+creating a second Stripe object.
+
+The **Evidence Packet** (`src/services/settlement/evidence.py` +
+`evidence_pdf.py`) assembles its 4 blueprint-required sections from
+whatever this repo's tables genuinely contain — a missing value renders
+`NOT RECORDED` with its source table printed underneath, never a blank or
+a plausible default. Real gaps are stated verbatim rather than papered
+over: no DNC vendor is contracted (§1 prints `ABSTAIN`), no open/click/
+reply tracking exists (§2), the 4-rule ownership/intent/ICP/duration
+qualification bar does not exist — only the two-tier confirmation +
+`ATTENDED` state is asserted (§3, the section most likely to be disputed
+by a client if it fabricated "qualified: yes"), and a non-`PMS_SYNC`
+agreement prints `SOURCE: SYNTHETIC — NOT PMS-VERIFIED` (§4).
+
+Three sweeps (`src/tasks/settlement_sweep.py`, registered in
+`src/api/main.py`) — door-signed poll, installment 1 claim/charge,
+installment 2 claim/clawback — all under `get_system_db_context()`
+(BYPASSRLS), each taking an explicit `claim_time`/`as_of` rather than SQL
+`NOW()`, which is what makes the 60-day clock fast-forwardable in tests
+without clock mocking. The DoD's synthetic `door_signed` event enters via
+a new operator-only, fail-closed-gated route,
+`POST /api/v1/settlement/door-signed` (`src/api/settlement_router.py`) —
+the honest way to exercise the DoD's "test outcome transaction" without
+pretending a nightly PMS sync exists.
+
+**Status, stated plainly:** completable against a synthetic `door_signed`
+in Stripe test mode: installment 1 charge (`CHARGED`), installment 2
+scheduled 60 days out on a real committed row, day-60 charge and
+day-60 clawback-void with `settlement_clawback_executed` logged, the
+4-section packet with its URL on the invoice, and zero-dollars-upfront.
+**Pending, blocked on the nightly PMS read-sync** — which does not exist
+in this repo and is not built here: verification against a *real*
+`door_signed` event and a real day-60 re-verification decision (today
+`StubPmsProvider` returns `None` and correctly refuses to charge or void).
+Landing a real PMS integration is an implementation of the `PmsProvider`
+ABC, not a schema or pipeline change.
 
 ## Tooling Rules
 

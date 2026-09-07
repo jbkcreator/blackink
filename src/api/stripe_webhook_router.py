@@ -72,6 +72,12 @@ async def stripe_webhook(request: Request):
 		raise HTTPException(status_code=401, detail="Invalid Stripe webhook signature") from exc
 
 	event_type = event["type"]
+
+	if event_type in (
+		"invoice.paid", "invoice.payment_failed", "invoice.voided", "charge.dispute.created",
+	):
+		return _handle_settlement_event(event)
+
 	if event_type not in ("setup_intent.succeeded", "setup_intent.setup_failed"):
 		return {"status": "ignored"}
 
@@ -240,3 +246,67 @@ async def stripe_webhook(request: Request):
 			{"id": event["id"]},
 		)
 		return {"status": "completed"}
+
+
+def _handle_settlement_event(event: dict) -> dict:
+	"""Subtask 1.2.2 — invoice.paid/payment_failed/voided and
+	charge.dispute.created for the settlement engine. Resolves
+	(transaction_id, installment) from invoice metadata (written by
+	src/services/settlement/charge.py) — NEVER by matching amount, since
+	two installments could coincidentally share one. Dedups through the
+	same stripe_webhook_events ledger before any state change."""
+	from datetime import datetime, timezone
+
+	from src.services.settlement.ledger import mark_installment, mark_installment_failed
+
+	obj = event["data"]["object"]
+	event_type = event["type"]
+
+	if event_type == "charge.dispute.created":
+		# Log only — appointment_disputes stays the dispute record of truth.
+		logger.warning("stripe_webhook: charge.dispute.created for charge=%s", obj.get("charge"))
+		return {"status": "logged_dispute"}
+
+	metadata = obj.get("metadata") or {}
+	client_id = metadata.get("client_id")
+	transaction_id = metadata.get("transaction_id")
+	installment = metadata.get("installment")
+	if not client_id or not transaction_id or not installment:
+		return {"status": "ignored_no_metadata"}
+
+	transaction_id = int(transaction_id)
+	installment = int(installment)
+
+	with get_db_context(client_id=client_id) as session:
+		if not _mark_event_seen(session, event["id"], event_type):
+			return {"status": "duplicate_ignored"}
+
+		if event_type == "invoice.paid":
+			paid_at_raw = (obj.get("status_transitions") or {}).get("paid_at")
+			charged_at = (
+				datetime.fromtimestamp(paid_at_raw, tz=timezone.utc) if paid_at_raw else datetime.now(timezone.utc)
+			)
+			mark_installment(session, transaction_id, installment, "CHARGED", charged_at=charged_at)
+		elif event_type == "invoice.payment_failed":
+			last_error = (obj.get("last_finalization_error") or {}).get("message", "invoice.payment_failed")
+			mark_installment_failed(session, transaction_id, installment, attempts=0, error=last_error)
+		elif event_type == "invoice.voided":
+			row = session.execute(
+				text(
+					f"SELECT installment_{installment}_status AS status FROM settlement_transactions "
+					f"WHERE transaction_id = :tid"
+				),
+				{"tid": transaction_id},
+			).first()
+			if row and row.status not in ("VOIDED", "VOIDED_CLAWBACK"):
+				logger.warning(
+					"stripe_webhook: invoice voided outside the clawback pipeline (transaction=%s installment=%s status=%s) — someone acted in the Stripe dashboard",
+					transaction_id, installment, row.status,
+				)
+				mark_installment(session, transaction_id, installment, "VOIDED")
+
+		session.execute(
+			text("UPDATE stripe_webhook_events SET processed_at = NOW() WHERE stripe_event_id = :id"),
+			{"id": event["id"]},
+		)
+	return {"status": "recorded"}
