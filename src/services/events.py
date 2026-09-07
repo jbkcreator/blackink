@@ -47,6 +47,11 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	# Task 4.2.1 — Speed-to-Lead ingest events
+	"inbound_lead_received": frozenset({"source_channel", "channel", "message_id"}),
+	"non_poach_suppressed": frozenset({"message_id", "source_channel"}),
+	"speed_to_lead_response_sent": frozenset({"message_id", "ack_latency_seconds"}),
+	"closer_alert_posted": frozenset({"message_id", "slack_channel"}),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is

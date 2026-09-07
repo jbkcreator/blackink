@@ -79,6 +79,9 @@ TENANT_POLICIES = {
 	# Addendum to Subtask 3.2.1 — "Log Outcome" trigger card. Carries its own
 	# client_id column (copied from bookings.client_id at schedule time).
 	"meeting_outcome_prompt_jobs": {"mode": "direct", "column": "client_id"},
+	# Task 4.2.1 — Speed-to-Lead ingest. Superset table shared with Dev 2
+	# triage; Dev 2 columns are nullable. Scoped directly via client_id.
+	"inbound_messages": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

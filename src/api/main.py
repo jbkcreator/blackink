@@ -37,6 +37,8 @@ from src.api.ovs_router import router as ovs_router
 from src.api.booking_webhook_router import router as booking_webhook_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
 from src.api.public_landing_router import router as public_landing_router
+from src.api.inbound_lead_router import router as inbound_lead_router
+from src.api.mailgun_inbound_router import router as mailgun_inbound_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -60,6 +62,8 @@ _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS = 60
 _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS = 30
 _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS = 60
+# Task 4.2.1 — 30-second tick keeps SLA response latency well under 30 min
+_SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS = 30
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -80,6 +84,7 @@ def _start_background_workers() -> None:
 	from src.tasks.no_show_recovery_sender import run_sweep as no_show_recovery_sweep
 	from src.tasks.self_serve_audit_worker import run_sweep as self_serve_audit_sweep
 	from src.tasks.meeting_outcome_prompt_sender import run_sweep as meeting_outcome_prompt_sweep
+	from src.tasks.speed_to_lead_sweep import run_sweep as speed_to_lead_sweep
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -160,6 +165,8 @@ app.include_router(ovs_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
 app.include_router(public_landing_router)
+app.include_router(inbound_lead_router)
+app.include_router(mailgun_inbound_router)
 
 
 @app.get("/healthz")
