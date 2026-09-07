@@ -132,6 +132,38 @@ def test_confirm_returns_already_completed_without_re_verifying_stripe(monkeypat
 	verify_mock.assert_not_called()
 
 
+def test_confirm_cancels_card_hold_when_ach_verification_is_invalid(monkeypatch, _db_session):
+	"""Regression test (PR #27 review): a definite ACH SetupIntentInvalid
+	must not leave the just-placed $1 card hold open."""
+	monkeypatch.setattr(payment_auth_router, "is_zero_deposit_enabled", lambda session, offer_code: True)
+	_db_session.execute.return_value.first.return_value = SimpleNamespace(
+		stripe_customer_id="cus_1", payment_auth_completed_at=None
+	)
+	card_intent = SimpleNamespace(payment_method=SimpleNamespace(id="pm_card"))
+
+	def _verify(customer_id, seti_id, expected_type):
+		if expected_type == "card":
+			return card_intent
+		from src.services.payment_auth import SetupIntentInvalid
+
+		raise SetupIntentInvalid("payment_method.type mismatch")
+
+	monkeypatch.setattr(payment_auth_router, "verify_setup_intent_server_side", _verify)
+	monkeypatch.setattr(
+		payment_auth_router, "create_dollar_auth_hold",
+		lambda *a, **k: SimpleNamespace(id="pi_hold_1"),
+	)
+	cancel_mock = MagicMock()
+	monkeypatch.setattr(payment_auth_router, "cancel_auth_hold", cancel_mock)
+
+	resp = client.post(
+		"/api/v1/onboarding/payment-auth/confirm",
+		json={"onboarding_token": _token(), "card_setup_intent_id": "seti_1", "ach_setup_intent_id": "seti_2"},
+	)
+	assert resp.status_code == 400
+	cancel_mock.assert_called_once_with("pi_hold_1")
+
+
 # ── status ────────────────────────────────────────────────────────────────
 
 

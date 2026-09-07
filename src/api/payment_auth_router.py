@@ -262,6 +262,16 @@ def confirm_payment_auth(body: ConfirmRequest) -> ConfirmResponse:
 			# stays open (not yet cancelled) until both rails verify.
 			return ConfirmResponse(status="ach_pending")
 		except SetupIntentInvalid as exc:
+			# ACH will never complete for this SetupIntent id — the card hold
+			# already placed above must not be left open waiting for a rail
+			# that just failed verification.
+			try:
+				cancel_auth_hold(hold.id)
+			except Exception:
+				logger.error(
+					"payment_auth: failed to cancel $1 auth hold %s for company %s after ACH "
+					"verification failure", hold.id, claims.company_id, exc_info=True,
+				)
 			raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 		# Both rails already succeeded synchronously (ACH can sometimes
