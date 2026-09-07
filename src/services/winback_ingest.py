@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.core.database import get_system_db_context
+from src.services.email_suppression import _normalize_phone
 from src.services.events import log_event
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,13 @@ STILL_OWNS_STILL_RENTING = "STILL_OWNS_STILL_RENTING"
 STILL_OWNS_NOT_RENTING = "STILL_OWNS_NOT_RENTING"
 SOLD = "SOLD"
 UNKNOWN = "UNKNOWN"
-PENDING = "PENDING"
+
+# Dispositions that can ever proceed to outreach (Subtask 3.1.2). Used to
+# skip the DNC scrub (a paid Tracerfy credit per phone) on rows that can
+# never be contacted regardless of DNC status — same cost-avoidance
+# reasoning already applied to the FRBO lookup being skipped when
+# still_owns isn't True.
+_OUTREACH_ELIGIBLE_DISPOSITIONS = {STILL_OWNS_STILL_RENTING, STILL_OWNS_NOT_RENTING}
 
 _DISPOSITION_BUCKET_KEYS = {
 	STILL_OWNS_STILL_RENTING: "still_owns_still_renting_count",
@@ -202,10 +209,17 @@ def _check_non_poach(session: Session, email: Optional[str]) -> bool:
 	if not email:
 		return False
 	domain = _email_domain(email)
+	# Case-insensitive on both sides — email addresses compare
+	# case-insensitively in practice, and client_pm_books.owner_email is
+	# PMS-synced data whose casing this pipeline doesn't control. An exact
+	# match would silently miss a real conflict (Jane@Example.com vs
+	# jane@example.com), same reasoning _resolve_county_slug already
+	# applies to its county-name comparison.
 	row = session.execute(
 		text(
 			"SELECT 1 FROM client_pm_books "
-			"WHERE owner_email = :email OR (owner_domain IS NOT NULL AND owner_domain = :domain) "
+			"WHERE LOWER(owner_email) = LOWER(:email) "
+			"   OR (owner_domain IS NOT NULL AND LOWER(owner_domain) = LOWER(:domain)) "
 			"LIMIT 1"
 		),
 		{"email": email, "domain": domain},
@@ -287,7 +301,18 @@ def run_import(
 	Runs entirely under the system role — see module docstring for why.
 	The winback_imports row itself is created by the caller (the router)
 	under the tenant-scoped app role before this function is invoked; this
-	function only transitions its status to COMPLETED/FAILED.
+	function transitions it to COMPLETED itself — the router's caller sets
+	FAILED only if this whole function raises (which, per row, it no longer
+	should — see the per-row SAVEPOINT below).
+
+	Each row is processed inside its own SAVEPOINT (session.begin_nested())
+	so one row's failure — a NUL byte or other value Postgres rejects, a
+	future live FRBO/assessor provider timing out — rolls back only that
+	row, never the rows already inserted before it. Same "one bad row must
+	not abort the whole batch" principle as BaseIngestLoader.safe_add's own
+	SAVEPOINT pattern; without this, a single mid-batch exception would
+	silently wipe every row processed so far (system_session_scope rolls
+	back the ENTIRE session on any uncaught exception).
 	"""
 	settings = get_settings()
 	rows = parse_csv(raw_csv)
@@ -308,57 +333,28 @@ def run_import(
 		dnc_check_targets: list[tuple[int, str]] = []  # (winback_row_id, normalized_phone)
 
 		for row in rows:
-			if row.validation_error:
-				_insert_row(
-					session, import_id, client_id, row, county_slug=None,
-					still_owns=None, still_renting=None, disposition=UNKNOWN,
-					requires_human_review=True, now=now,
+			try:
+				with session.begin_nested():
+					_process_row(session, import_id, client_id, row, provider, frbo, now, counts, dnc_check_targets)
+			except Exception:
+				logger.error(
+					"winback_ingest: row failed unexpectedly (owner_name=%r) — flagging for review",
+					row.owner_name, exc_info=True,
 				)
-				counts["unknown_count"] += 1
-				continue
-
-			county_slug = _resolve_county_slug(session, row.county_input)
-			if county_slug is None:
-				row.validation_error = f"unrecognized county: {row.county_input!r}"
-				_insert_row(
-					session, import_id, client_id, row, county_slug=None,
-					still_owns=None, still_renting=None, disposition=UNKNOWN,
-					requires_human_review=True, now=now,
-				)
-				counts["unknown_count"] += 1
-				continue
-
-			still_owns = provider.check_still_owns(county_slug, row.property_address, row.owner_name)
-			# Only spend an FRBO lookup when it can actually change the
-			# outcome — a confirmed-sold or unresolved-ownership row is
-			# SOLD/UNKNOWN regardless of rental status (see compute_disposition).
-			still_renting = frbo.check_active_listing(row.property_address) if still_owns else None
-			disposition = compute_disposition(still_owns, still_renting)
-			requires_review = disposition == UNKNOWN
-
-			non_poach_hit = _check_non_poach(session, row.email)
-			suppression_state = non_poach_hit
-			suppression_reason = "NON_POACH_MATCH" if non_poach_hit else None
-
-			winback_row_id = _insert_row(
-				session, import_id, client_id, row, county_slug=county_slug,
-				still_owns=still_owns, still_renting=still_renting, disposition=disposition,
-				requires_human_review=requires_review, now=now,
-				suppression_state=suppression_state, suppression_reason=suppression_reason,
-			)
-
-			counts[_DISPOSITION_BUCKET_KEYS.get(disposition, "unknown_count")] += 1
-			if suppression_state:
-				counts["suppressed_count"] += 1
-			elif row.phone and not non_poach_hit:
-				# DNC scrub runs AFTER disposition and non-poach, before any
-				# sequence could arm — per the spec's explicit ordering
-				# requirement. Skipped for rows already suppressed by
-				# non-poach — no reason to spend a Tracerfy credit on a row
-				# that can never be contacted regardless of DNC status.
-				normalized_phone = re.sub(r"\D", "", row.phone)
-				if normalized_phone:
-					dnc_check_targets.append((winback_row_id, normalized_phone))
+				try:
+					with session.begin_nested():
+						row.validation_error = (row.validation_error or "") + " | processing error, see server logs"
+						_insert_row(
+							session, import_id, client_id, row, county_slug=None,
+							still_owns=None, still_renting=None, disposition=UNKNOWN,
+							requires_human_review=True, now=now,
+						)
+					counts["unknown_count"] += 1
+				except Exception:
+					logger.error(
+						"winback_ingest: fallback insert also failed (owner_name=%r) — row dropped entirely",
+						row.owner_name, exc_info=True,
+					)
 
 		session.commit()
 
@@ -386,6 +382,86 @@ def run_import(
 		session.commit()
 
 	return counts
+
+
+def _process_row(
+	session: Session,
+	import_id: str,
+	client_id: str,
+	row: ParsedRow,
+	provider: AssessorProvider,
+	frbo: FrboProvider,
+	now: datetime,
+	counts: dict,
+	dnc_check_targets: list[tuple[int, str]],
+) -> None:
+	"""One row's worth of lookup + disposition + insert. Runs inside the
+	caller's per-row SAVEPOINT (run_import) — mutates `counts` and
+	`dnc_check_targets` only after the insert has actually happened, so a
+	mid-function exception leaves both untouched (the savepoint rollback
+	then undoes only the DB side)."""
+	if row.validation_error:
+		_insert_row(
+			session, import_id, client_id, row, county_slug=None,
+			still_owns=None, still_renting=None, disposition=UNKNOWN,
+			requires_human_review=True, now=now,
+		)
+		counts["unknown_count"] += 1
+		return
+
+	county_slug = _resolve_county_slug(session, row.county_input)
+	if county_slug is None:
+		row.validation_error = f"unrecognized county: {row.county_input!r}"
+		_insert_row(
+			session, import_id, client_id, row, county_slug=None,
+			still_owns=None, still_renting=None, disposition=UNKNOWN,
+			requires_human_review=True, now=now,
+		)
+		counts["unknown_count"] += 1
+		return
+
+	still_owns = provider.check_still_owns(county_slug, row.property_address, row.owner_name)
+	# Only spend an FRBO lookup when it can actually change the outcome — a
+	# confirmed-sold or unresolved-ownership row is SOLD/UNKNOWN regardless
+	# of rental status (see compute_disposition).
+	still_renting = frbo.check_active_listing(row.property_address) if still_owns else None
+	disposition = compute_disposition(still_owns, still_renting)
+	requires_review = disposition == UNKNOWN
+
+	non_poach_hit = _check_non_poach(session, row.email)
+	if disposition == SOLD:
+		# The DoD's own requirement: a confirmed-sold owner is suppressed
+		# outright, independent of DNC/non-poach — there is no scenario
+		# where a SOLD row should ever re-enter consideration.
+		suppression_state = True
+		suppression_reason = "SOLD"
+	elif non_poach_hit:
+		suppression_state = True
+		suppression_reason = "NON_POACH_MATCH"
+	else:
+		suppression_state = False
+		suppression_reason = None
+
+	winback_row_id = _insert_row(
+		session, import_id, client_id, row, county_slug=county_slug,
+		still_owns=still_owns, still_renting=still_renting, disposition=disposition,
+		requires_human_review=requires_review, now=now,
+		suppression_state=suppression_state, suppression_reason=suppression_reason,
+	)
+
+	counts[_DISPOSITION_BUCKET_KEYS.get(disposition, "unknown_count")] += 1
+	if suppression_state:
+		counts["suppressed_count"] += 1
+	elif row.phone and disposition in _OUTREACH_ELIGIBLE_DISPOSITIONS:
+		# DNC scrub runs AFTER disposition and non-poach, before any
+		# sequence could arm — per the spec's explicit ordering requirement.
+		# Gated on outreach-eligible dispositions (not just "has a phone and
+		# isn't already suppressed") — a SOLD/UNKNOWN row can never be
+		# sequenced regardless of DNC status, so scrubbing its phone would
+		# only spend a Tracerfy credit for nothing.
+		normalized_phone = _normalize_phone(row.phone)
+		if normalized_phone:
+			dnc_check_targets.append((winback_row_id, normalized_phone))
 
 
 def _insert_row(
@@ -523,6 +599,21 @@ def _flag_unscrubbed(session: Session, winback_row_ids: list[int]) -> None:
 	)
 
 
+_FORMULA_LEADING_CHARS = ("=", "+", "-", "@")
+
+
+def _csv_safe(value) -> object:
+	"""Neutralize a leading formula-trigger character (=, +, -, @) so a
+	client-CSV-controlled string (owner_name, property_address — this
+	pipeline's input, not a fully trusted first-party source) can't execute
+	as a formula when the exported CSV is opened in Excel/Sheets. Prefixing
+	a single quote is the standard mitigation; non-strings pass through
+	unchanged."""
+	if isinstance(value, str) and value.startswith(_FORMULA_LEADING_CHARS):
+		return "'" + value
+	return value
+
+
 def export_csv(session: Session, import_id: str) -> str:
 	"""Render the dispositioned rows for one import back out as CSV — the
 	admin router's GET /export.csv endpoint. Column order matches the
@@ -547,5 +638,5 @@ def export_csv(session: Session, import_id: str) -> str:
 		]
 	)
 	for row in rows:
-		writer.writerow(list(row))
+		writer.writerow([_csv_safe(v) for v in row])
 	return buf.getvalue()

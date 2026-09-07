@@ -80,7 +80,7 @@ DDL = [
 			disposition IN ('PENDING', 'STILL_OWNS_STILL_RENTING', 'STILL_OWNS_NOT_RENTING', 'SOLD', 'UNKNOWN')
 		),
 		CONSTRAINT ck_winback_rows_suppression_reason CHECK (
-			suppression_reason IS NULL OR suppression_reason IN ('DNC_LISTED', 'NON_POACH_MATCH')
+			suppression_reason IS NULL OR suppression_reason IN ('DNC_LISTED', 'NON_POACH_MATCH', 'SOLD')
 		)
 	)
 	""",

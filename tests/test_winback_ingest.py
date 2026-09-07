@@ -10,6 +10,7 @@ the actual business logic the plan doc's disposition matrix depends on,
 which is where a real bug would live.
 """
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 from src.services.winback_ingest import (
@@ -17,12 +18,16 @@ from src.services.winback_ingest import (
 	STILL_OWNS_NOT_RENTING,
 	STILL_OWNS_STILL_RENTING,
 	UNKNOWN,
+	ParsedRow,
 	StagingTableAssessorProvider,
 	StubFrboProvider,
 	_check_non_poach,
+	_csv_safe,
 	_email_domain,
+	_process_row,
 	_resolve_county_slug,
 	compute_disposition,
+	export_csv,
 	normalize_address,
 	parse_csv,
 )
@@ -230,3 +235,143 @@ def test_resolve_county_slug_empty_input_returns_none_without_querying():
 	session = MagicMock()
 	assert _resolve_county_slug(session, "") is None
 	session.execute.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _process_row — SOLD suppression, disposition-gated DNC targeting
+# (findings from the post-implementation audit, not just the plan)
+# ---------------------------------------------------------------------------
+
+class _ScriptedResult:
+	def __init__(self, fetchone_value=None, scalar_one_value=None):
+		self._fetchone_value = fetchone_value
+		self._scalar_one_value = scalar_one_value
+
+	def fetchone(self):
+		return self._fetchone_value
+
+	def scalar_one(self):
+		return self._scalar_one_value
+
+
+class _ScriptedSession:
+	"""Returns queued results in call order — county resolution, assessor
+	lookup, non-poach check, then the row insert, matching _process_row's
+	fixed call sequence."""
+
+	def __init__(self, results):
+		self._results = list(results)
+
+	def execute(self, *_args, **_kwargs):
+		return self._results.pop(0)
+
+
+def _row(**overrides):
+	base = dict(
+		owner_name="Jane Doe",
+		property_address="123 Main St",
+		county_input="hillsborough_fl",
+		phone="8135550100",
+		email="jane@example.com",
+		validation_error=None,
+	)
+	base.update(overrides)
+	return ParsedRow(**base)
+
+
+def test_process_row_sold_sets_suppression_state_and_reason():
+	# county resolves, assessor name mismatch (still_owns=False -> SOLD),
+	# non-poach check runs but its result must not matter for a SOLD row.
+	session = _ScriptedSession(
+		[
+			_ScriptedResult(fetchone_value=("hillsborough_fl",)),  # county resolution
+			_ScriptedResult(fetchone_value=("Totally Different Person",)),  # assessor lookup
+			_ScriptedResult(fetchone_value=None),  # non-poach: no match
+			_ScriptedResult(scalar_one_value=1),  # insert
+		]
+	)
+	counts = {"total_rows": 1, "still_owns_still_renting_count": 0, "still_owns_not_renting_count": 0,
+			  "sold_count": 0, "unknown_count": 0, "suppressed_count": 0}
+	dnc_targets: list = []
+	_process_row(session, "import-1", "acme_pm", _row(), StagingTableAssessorProvider(session), StubFrboProvider(),
+				 datetime.now(timezone.utc), counts, dnc_targets)
+	assert counts["sold_count"] == 1
+	assert counts["suppressed_count"] == 1
+	assert dnc_targets == []  # SOLD must never queue a paid DNC scrub
+
+
+def test_process_row_outreach_eligible_queues_dnc_target_with_normalized_phone():
+	session = _ScriptedSession(
+		[
+			_ScriptedResult(fetchone_value=("hillsborough_fl",)),
+			_ScriptedResult(fetchone_value=("Jane Doe",)),  # assessor match -> still_owns=True
+			_ScriptedResult(fetchone_value=None),  # non-poach: no match
+			_ScriptedResult(scalar_one_value=42),  # insert
+		]
+	)
+	counts = {"total_rows": 1, "still_owns_still_renting_count": 0, "still_owns_not_renting_count": 0,
+			  "sold_count": 0, "unknown_count": 0, "suppressed_count": 0}
+	dnc_targets: list = []
+	frbo = StubFrboProvider()
+	# still_renting stays None under the stub -> disposition UNKNOWN, so
+	# force a real FRBO answer here to exercise the outreach-eligible path.
+	frbo.check_active_listing = lambda address: True
+	_process_row(session, "import-1", "acme_pm", _row(), StagingTableAssessorProvider(session), frbo,
+				 datetime.now(timezone.utc), counts, dnc_targets)
+	assert counts["still_owns_still_renting_count"] == 1
+	assert counts["suppressed_count"] == 0
+	# +1 country code must be normalized away, matching dnc_refresh.py's
+	# own _normalize_phone convention, not a bare digit-strip.
+	assert dnc_targets == [(42, "8135550100")]
+
+
+def test_process_row_non_poach_hit_suppresses_and_skips_dnc():
+	session = _ScriptedSession(
+		[
+			_ScriptedResult(fetchone_value=("hillsborough_fl",)),
+			_ScriptedResult(fetchone_value=("Jane Doe",)),
+			_ScriptedResult(fetchone_value=(1,)),  # non-poach: match found
+			_ScriptedResult(scalar_one_value=7),
+		]
+	)
+	counts = {"total_rows": 1, "still_owns_still_renting_count": 0, "still_owns_not_renting_count": 0,
+			  "sold_count": 0, "unknown_count": 0, "suppressed_count": 0}
+	dnc_targets: list = []
+	frbo = StubFrboProvider()
+	frbo.check_active_listing = lambda address: True
+	_process_row(session, "import-1", "acme_pm", _row(), StagingTableAssessorProvider(session), frbo,
+				 datetime.now(timezone.utc), counts, dnc_targets)
+	assert counts["suppressed_count"] == 1
+	assert dnc_targets == []
+
+
+# ---------------------------------------------------------------------------
+# _csv_safe / export_csv — formula-injection guard
+# ---------------------------------------------------------------------------
+
+def test_csv_safe_neutralizes_leading_formula_characters():
+	for hostile in ("=cmd|'/c calc'!A0", "+1+1", "-1+1", "@SUM(1,1)"):
+		assert _csv_safe(hostile).startswith("'")
+
+
+def test_csv_safe_passes_through_normal_strings():
+	assert _csv_safe("123 Main St") == "123 Main St"
+
+
+def test_csv_safe_passes_through_non_strings():
+	assert _csv_safe(None) is None
+	assert _csv_safe(True) is True
+
+
+def test_export_csv_neutralizes_formula_in_owner_name():
+	class _ExportResult:
+		def fetchall(self):
+			return [("=cmd|'/c calc'!A0", "123 Main St", "hillsborough_fl", "8135550100", "jane@example.com",
+					  SOLD, False, None, False, True, "SOLD", None)]
+
+	class _ExportSession:
+		def execute(self, *_args, **_kwargs):
+			return _ExportResult()
+
+	csv_text = export_csv(_ExportSession(), "import-1")
+	assert "'=cmd" in csv_text
