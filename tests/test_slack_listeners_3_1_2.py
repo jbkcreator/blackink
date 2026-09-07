@@ -22,6 +22,7 @@ import pytest
 from src.services.slack.listeners import (
     _calling_hours_indicator,
     _calling_hours_label,
+    _current_local_time_label,
     _dial_task_content_blocks,
     _linkedin_action_buttons,
     _linkedin_task_content_blocks,
@@ -92,6 +93,29 @@ def test_calling_hours_label_green():
 
 def test_calling_hours_label_red():
     assert "Outside" in _calling_hours_label("🔴")
+
+
+# ── Current local time ─────────────────────────────────────────────────────────
+
+
+def test_current_local_time_label_formats_et():
+    """1 PM ET → '1:00 PM ET' (no zero-pad, zone named)."""
+    assert _current_local_time_label(_at_hour(13)) == "1:00 PM ET"
+
+
+def test_current_local_time_label_morning():
+    assert _current_local_time_label(_at_hour(8)) == "8:00 AM ET"
+
+
+def test_dial_task_shows_current_local_time():
+    """DoD 3.1.2: dial card renders the prospect's current local time."""
+    order = _fake_order(
+        action_class="DIAL_TASK",
+        payload={"contact_name": "Jane Doe", "firm_name": "Acme PM", "county": "Hillsborough", "phone": "+18135550100", "run_id": "r1"},
+    )
+    txt = str(_dial_task_content_blocks(order))
+    assert "Local time" in txt
+    assert "ET" in txt
 
 
 # ── Dial-task card blocks ─────────────────────────────────────────────────────

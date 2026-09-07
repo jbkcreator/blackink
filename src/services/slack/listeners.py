@@ -117,6 +117,15 @@ def _calling_hours_label(indicator: str) -> str:
 	return "Outside calling hours — do not call"
 
 
+def _current_local_time_label(now: Optional[datetime] = None) -> str:
+	"""Recipient's current local wall-clock time, stamped at post time.
+	All 10 launch counties are Eastern (D14), so local == ET; the label names
+	the zone explicitly so it stays honest if a non-ET county is ever added."""
+	now_et = (now or datetime.now(timezone.utc)).astimezone(_CALLING_TZ)
+	# %I is zero-padded and cross-platform (%-I is not on Windows); strip the pad.
+	return now_et.strftime("%I:%M %p ET").lstrip("0")
+
+
 def _log_event(client_id: str, event_type: str, *, entity_id: str, actor: str, payload: dict) -> None:
 	"""Matches the raw-SQL pattern already established in
 	src/tasks/promotion_sweep.py — no shared events-writer helper exists
@@ -269,14 +278,19 @@ def _dial_task_content_blocks(order: "wo.WorkOrder") -> list:
 	county = payload.get("county") or "Unknown"
 	phone = payload.get("phone") or "_(no phone on record)_"
 	run_id_short = str(payload.get("run_id", ""))[:8]
-	indicator = _calling_hours_indicator()
+	# One clock read shared by the indicator and the local-time field so they
+	# never disagree by a tick.
+	now_utc = datetime.now(timezone.utc)
+	indicator = _calling_hours_indicator(now_utc)
 	hours_label = _calling_hours_label(indicator)
+	local_time = _current_local_time_label(now_utc)
 
 	fields = [
 		{"type": "mrkdwn", "text": f"*Contact*\n{contact_name}"},
 		{"type": "mrkdwn", "text": f"*Firm*\n{firm_name}"},
 		{"type": "mrkdwn", "text": f"*County*\n{county}"},
 		{"type": "mrkdwn", "text": f"*Phone*\n{phone}"},
+		{"type": "mrkdwn", "text": f"*Local time*\n{local_time}"},
 	]
 	door_count = payload.get("door_count")
 	if door_count is not None:
