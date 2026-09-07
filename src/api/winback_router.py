@@ -25,7 +25,9 @@ from sqlalchemy import text
 
 from src.api.deps import require_admin_jwt
 from src.core.database import get_db_context
+from src.services.booking_link import resolve_owner_booking_link
 from src.services.winback_ingest import export_csv, parse_csv, run_import
+from src.services.winback_sequencer import arm_winback_run
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +94,59 @@ async def upload_winback_csv(client_id: str, file: UploadFile, admin=Depends(req
 		raise HTTPException(status_code=502, detail="Win-back import failed — see server logs")
 
 	return {"import_id": import_id, "status": "COMPLETED", **counts}
+
+
+@router.post("/imports/{import_id}/arm")
+def arm_winback_import(import_id: str, client_id: str):
+	"""Subtask 3.1.2 — arms the 3-touch sequence for every armable
+	(STILL_OWNS_STILL_RENTING / STILL_OWNS_NOT_RENTING, not suppressed) row
+	in this import. One shared `armed_at` for the whole batch, not per-row
+	NOW() calls, so the priority-ordering offset in arm_winback_run (0 days
+	for STILL_OWNS_STILL_RENTING, +1 day for STILL_OWNS_NOT_RENTING) lands
+	exact across the batch — a per-row NOW() would let ordering drift row by
+	row over the course of a long-running request."""
+	armed_at = datetime.now(timezone.utc)
+
+	with get_db_context(client_id=client_id) as session:
+		exists = session.execute(
+			text("SELECT 1 FROM winback_imports WHERE import_id = :import_id AND client_id = :client_id"),
+			{"import_id": import_id, "client_id": client_id},
+		).fetchone()
+		if not exists:
+			raise HTTPException(status_code=404, detail="Import not found")
+
+		rows = session.execute(
+			text(
+				"SELECT * FROM winback_rows WHERE import_id = :import_id AND client_id = :client_id "
+				"AND disposition IN ('STILL_OWNS_STILL_RENTING', 'STILL_OWNS_NOT_RENTING') "
+				"AND suppression_state = FALSE AND stopped_at IS NULL"
+			),
+			{"import_id": import_id, "client_id": client_id},
+		).fetchall()
+
+		# Reported in the response only — arm_winback_run resolves its own
+		# per-row link (with GHL prefill) below rather than reusing this one,
+		# since a single batch-level lookup can't carry each owner's own
+		# name/email into the prefill.
+		booking_link_provisioned = resolve_owner_booking_link(session, client_id) is not None
+
+		armed_row_ids: list[int] = []
+		for row in rows:
+			action_ids = arm_winback_run(session, client_id, row, armed_at)
+			if action_ids:
+				armed_row_ids.append(row.winback_row_id)
+		session.commit()
+
+	logger.info(
+		"arm_winback_import: import_id=%s client_id=%s armed %d/%d row(s)",
+		import_id, client_id, len(armed_row_ids), len(rows),
+	)
+	return {
+		"import_id": import_id,
+		"armed_count": len(armed_row_ids),
+		"eligible_count": len(rows),
+		"booking_link_provisioned": booking_link_provisioned,
+	}
 
 
 @router.get("/imports/{import_id}/export.csv")

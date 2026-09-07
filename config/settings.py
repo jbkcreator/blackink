@@ -333,6 +333,11 @@ class AppSettings(BaseSettings):
 	# rationale as calendar_oauth_state_secret above: unrelated token
 	# families must be able to rotate independently.
 	no_show_token_secret: Optional[SecretStr] = Field(default=None, env="NO_SHOW_TOKEN_SECRET")
+	# Signs one-click email-unsubscribe tokens (src/services/email_unsubscribe.py).
+	# Deliberately its own secret, not a reuse of admin_jwt_secret — same
+	# rationale as calendar_oauth_state_secret above: a public-facing token
+	# must not share a signing key with an internal-admin-scoped one.
+	email_unsubscribe_secret: Optional[SecretStr] = Field(default=None, env="EMAIL_UNSUBSCRIBE_SECRET")
 	# ── Rent valuation adapter ───────────────────────────────────────────────
 	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
 	# False: no valuation vendor is under contract, so enabling this would

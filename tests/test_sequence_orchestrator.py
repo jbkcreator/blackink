@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from src.services.email_sender import SendResult
 from src.services.sequence_orchestrator import dispatch_touch
 
@@ -10,6 +12,19 @@ from src.services.sequence_orchestrator import dispatch_touch
 # ---------------------------------------------------------------------------
 # Shared test fixtures
 # ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _stub_unsubscribe():
+    """Subtask 3.1.2's mandatory one-click unsubscribe footer/header is
+    computed unconditionally on every send path that reaches sender.send()
+    — stub it here rather than in every individual test, since
+    email_unsubscribe.unsubscribe_url() needs EMAIL_UNSUBSCRIBE_SECRET
+    configured, which this test suite deliberately never sets."""
+    with (
+        patch("src.services.sequence_orchestrator.unsubscribe_url", return_value="https://app.example.com/unsub?token=t"),
+        patch("src.services.sequence_orchestrator.append_unsubscribe_footer", side_effect=lambda body, url: body),
+    ):
+        yield
 
 def _contact(contact_id=1, company_id="comp_abc", email="owner@acme.com"):
     return SimpleNamespace(contact_id=contact_id, company_id=company_id, email=email)

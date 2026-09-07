@@ -203,6 +203,18 @@ def _card_text(order: "wo.WorkOrder") -> str:
 			f"{body_preview}"
 		)
 
+	if order.action_class == "DISPATCH_WINBACK_TOUCH":
+		touch_step = payload.get("touch_step", "?")
+		winback_row_id = payload.get("winback_row_id", "?")
+		subject = payload.get("subject") or f"Touch {touch_step} — win-back sequence"
+		body_preview = payload.get("body") or "(approved copy missing)"
+		return (
+			f"*Win-Back Touch {touch_step}* (`{order.action_id[:8]}`) — winback_row `{winback_row_id}`\n"
+			f"To: `{order.recipient or 'n/a'}`\n"
+			f"Subject: _{subject}_\n"
+			f"{body_preview}"
+		)
+
 	subject = payload.get("subject")
 	preview = subject or str(order.payload)[:120]
 	return (
@@ -344,6 +356,43 @@ def _linkedin_task_content_blocks(order: "wo.WorkOrder") -> list:
 			"type": "context",
 			"elements": [
 				{"type": "mrkdwn", "text": f"run `{run_id_short}`  ·  `{order.action_id[:8]}`"},
+			],
+		},
+		{"type": "divider"},
+	]
+
+
+def _winback_touch_content_blocks(order: "wo.WorkOrder") -> list:
+	"""Rich Block Kit layout for a DISPATCH_WINBACK_TOUCH approval card
+	(Subtask 3.1.2) — same shape as _email_touch_content_blocks above, but
+	for the 3-touch win-back sequence: 'Step N of 3' (not 5), no run_id/
+	attachment concepts (win-back has neither — no threading id to show
+	until a reply exists, no PDF attachment), winback_row_id shown instead
+	in the context line. Reads payload['body'] directly (the actual key
+	winback_sequencer.arm_winback_run persists — not 'body_preview', which
+	nothing in this sequence's payload ever sets)."""
+	payload = order.payload if isinstance(order.payload, dict) else {}
+	touch_step = payload.get("touch_step", "?")
+	winback_row_id = payload.get("winback_row_id", "?")
+	subject = payload.get("subject") or f"Touch {touch_step} — win-back sequence"
+	body = payload.get("body") or "_Approved copy missing — this card should not have been posted._"
+	quoted = "\n".join(f"> {ln}" for ln in body.splitlines()[:6]) or f"> {body}"
+
+	return [
+		{"type": "header", "text": {"type": "plain_text", "text": f"\U0001F504 Win-Back Touch {touch_step} · Approval needed", "emoji": True}},
+		{
+			"type": "section",
+			"fields": [
+				{"type": "mrkdwn", "text": f"*To*\n{order.recipient or 'n/a'}"},
+				{"type": "mrkdwn", "text": f"*Touch*\nStep {touch_step} of 3"},
+			],
+		},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Subject*\n{subject}"}},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Preview*\n{quoted}"}},
+		{
+			"type": "context",
+			"elements": [
+				{"type": "mrkdwn", "text": f"\U0001F3E0 winback_row `{winback_row_id}`  ·  `{order.action_id[:8]}`"},
 			],
 		},
 		{"type": "divider"},
@@ -526,6 +575,8 @@ def sales_reply_content_blocks(
 def _card_text_blocks(order: "wo.WorkOrder") -> list:
 	if order.action_class == "DISPATCH_EMAIL_TOUCH":
 		return _email_touch_content_blocks(order) + _card_button_blocks(order)
+	if order.action_class == "DISPATCH_WINBACK_TOUCH":
+		return _winback_touch_content_blocks(order) + _card_button_blocks(order)
 	if order.action_class == "DIAL_TASK":
 		return _dial_task_content_blocks(order) + _simple_action_button_blocks(order, label="Mark Called ✓")
 	if order.action_class == "LINKEDIN_TASK":
