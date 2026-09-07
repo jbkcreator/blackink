@@ -25,7 +25,7 @@ from sqlalchemy import text
 
 from src.api.deps import require_admin_jwt
 from src.core.database import get_db_context
-from src.services.winback_ingest import export_csv, run_import
+from src.services.winback_ingest import export_csv, parse_csv, run_import
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,15 @@ async def upload_winback_csv(client_id: str, file: UploadFile, admin=Depends(req
 		raw_csv = raw_bytes.decode("utf-8-sig")
 	except UnicodeDecodeError:
 		raise HTTPException(status_code=400, detail="File is not valid UTF-8 text")
+
+	# A header-only (or otherwise data-row-free) CSV has bytes but parses to
+	# zero rows — reject it before ever creating a winback_imports row, so
+	# an operator never sees a misleadingly "COMPLETED" import with
+	# total_rows=0 for a file that imported nothing. Re-parsed by run_import
+	# below; parsing a several-hundred-row CSV twice is negligible cost for
+	# the certainty of never creating a misleading import record.
+	if not parse_csv(raw_csv):
+		raise HTTPException(status_code=400, detail="CSV has no data rows")
 
 	import_id = str(uuid.uuid4())
 	uploaded_by = admin.get("sub") or admin.get("username") or "unknown-admin"

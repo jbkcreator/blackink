@@ -2,12 +2,15 @@
 called from.
 
 Extracted out of src/tasks/dnc_refresh.py (Subtask 3.1.1) so
-compliance_gate.py's TracerfyDncProvider and winback_ingest.py's batch
-scrub step share exactly one implementation of the vendor's submit-batch /
+dnc_refresh.py's monthly batch and winback_ingest.py's own post-disposition
+batch scrub share exactly one implementation of the vendor's submit-batch /
 poll-queue / download-CSV flow, per reuse_ledger_week0.md's own stated
 intent ("Shares DncProvider / EmailVerificationProvider interfaces with
 compliance_gate.py — no duplicate vendor code"). dnc_refresh.py imports the
-primitives from here instead of defining its own copies.
+primitives from here instead of defining its own copies. Deliberately NOT
+wired into compliance_gate.py's live per-contact gate — see that module's
+own comment on why (Tracerfy's queue is a batch-shaped API, unsuited to a
+synchronous per-contact check).
 
 API shape (Tracerfy /v1/api/):
   POST /dnc/scrub/  {"phones": [...]}  -> {"dnc_queue_id": "..."}
@@ -23,6 +26,8 @@ import logging
 import time
 
 import requests
+
+from src.services.email_suppression import _normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +101,16 @@ def scrub_phones(phones: list[str], api_key: str) -> dict[str, bool]:
     internal chunking — callers with more than BATCH_SIZE phones chunk
     their own loop, same as dnc_refresh.py's monthly sweep does).
 
-    Returns {normalized_phone: is_clean} for every phone Tracerfy actually
-    returned a result for. A phone missing from the return value means
-    Tracerfy's result CSV didn't include it — callers must treat that as
-    unknown, never assume clean.
+    `phones` must already be normalized (callers submit digits-only,
+    country-code-stripped values — see _normalize_phone). The RETURNED CSV's
+    phone column is normalized the same way before being used as a result
+    key: Tracerfy is free to echo the phone back in a different shape
+    (formatted, with a country code, etc.) than what was submitted, and an
+    exact-string match against the normalized submission would silently
+    miss it — the same normalize-both-sides discipline dnc_refresh.py's own
+    _persist_results already applies. A phone missing from the return value
+    means Tracerfy's result CSV didn't include it at all — callers must
+    treat that as unknown, never assume clean.
 
     Raises on a total submit/poll failure (network error, bad key, timeout)
     — callers decide how to treat "the vendor call itself failed" (e.g. the
@@ -112,7 +123,7 @@ def scrub_phones(phones: list[str], api_key: str) -> dict[str, bool]:
     csv_rows = poll_queue(queue_id, api_key)
     result: dict[str, bool] = {}
     for row in csv_rows:
-        phone = str(row.get("phone", "")).strip()
+        phone = _normalize_phone(str(row.get("phone", "")).strip())
         if not phone:
             continue
         result[phone] = not is_dnc_hit(row)

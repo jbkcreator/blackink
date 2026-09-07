@@ -127,12 +127,17 @@ def test_documented_migration_order_matches_ci():
 	for workflow in WORKFLOWS:
 		in_any_ci |= set(re.findall(r"migrations/(apply_\w+\.py)", workflow.read_text(encoding="utf-8")))
 
-	# apply_akrash_grant.py is deliberately runbook-only: it grants INSERT to
-	# the akrash_ingest role, and no leakage test exercises that path (the
-	# function-privilege assertions in test_tenant_isolation.py come from
-	# apply_compliance_gate_audit.py). Listed here so the exemption is a
-	# decision on the record rather than a silent gap.
-	runbook_only = {"apply_akrash_grant.py"}
+	# apply_akrash_grant.py used to be exempted here as "deliberately
+	# runbook-only, no leakage test exercises that path" — that exemption is
+	# exactly what let a real bug ship silently (a PR review finding on
+	# Subtask 3.1.1: a table-creation migration granted akrash_ingest access
+	# directly, which this migration's own REVOKE ALL then wiped with no
+	# error, since a later run had nothing "unexpected" left to warn about).
+	# It now runs in every migration-running workflow, and
+	# test_tenant_isolation.py's test_akrash_ingest_can_insert_but_not_
+	# select_raw_assessor_parcels actually exercises the grant it produces —
+	# no exemption needed.
+	runbook_only: set[str] = set()
 
 	assert documented - in_any_ci - runbook_only == set(), (
 		"documented in CLAUDE.md but never run in any CI workflow: "

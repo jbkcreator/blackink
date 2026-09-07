@@ -103,6 +103,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_appointment_ops.py
           PYTHONPATH=. python migrations/apply_winback_imports.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
+          PYTHONPATH=. python migrations/apply_akrash_grant.py
       # Full suite — this is what actually gates a PR on every change, not
       # just the tenant-leakage path-filtered nightly. Runs
       # tests/test_sms_dispatch.py (the cold-SMS application-layer linter)

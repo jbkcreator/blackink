@@ -13,6 +13,16 @@ Not registered in config/tenant_policies.py — same "Akrash has no client
 visibility by design" reasoning already documented there for
 raw_prospect_companies / raw_prospect_contacts.
 
+Akrash's own INSERT grant is NOT issued here — it lives in
+apply_akrash_grant.py alongside the other two staging tables' grants.
+apply_akrash_grant.py runs LAST (after RLS, per CLAUDE.md) and REVOKEs ALL
+privileges from akrash_ingest before re-granting only its own explicit
+list; a grant issued here would be silently wiped by that later REVOKE ALL
+and never restored (a real bug an earlier version of this migration had —
+Akrash could insert immediately after this migration ran, then lost
+access again the moment the full sequence reached apply_akrash_grant.py,
+with no error raised anywhere to surface it).
+
 Idempotent: CREATE TABLE IF NOT EXISTS.
 Run after apply_counties.py (FK target). Not tenant-bearing, so ordering
 relative to apply_rls_policies.py doesn't matter, but keep it grouped with
@@ -46,13 +56,10 @@ DDL = [
 	# _lookup_assessor_parcel().
 	"CREATE INDEX IF NOT EXISTS ix_raw_assessor_parcels_lookup "
 	"ON raw_assessor_parcels (county_slug, parcel_address_normalized)",
-	# akrash_ingest: INSERT-only, same restricted posture as the two existing
-	# raw_prospect_* staging tables — a compromised/misbehaving Akrash feed
-	# can add rows but never read, modify, or delete what's already staged.
-	"GRANT SELECT, INSERT ON raw_assessor_parcels TO akrash_ingest",
-	"REVOKE UPDATE, DELETE ON raw_assessor_parcels FROM akrash_ingest",
 	# blackink_system: winback_ingest.py's assessor lookup runs BYPASSRLS,
 	# same as promotion_sweep.py's reads of the other raw_prospect_* tables.
+	# akrash_ingest's own grant lives in apply_akrash_grant.py — see the
+	# module docstring above for why it must not be issued here.
 	"GRANT SELECT ON raw_assessor_parcels TO blackink_system",
 ]
 
