@@ -65,6 +65,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_sms_dispatch_log.py
           PYTHONPATH=. python migrations/apply_sending_domains.py
           PYTHONPATH=. python migrations/apply_mailbox_last_used.py
+          PYTHONPATH=. python migrations/apply_mailbox_smtp_credentials.py
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_meeting_outcomes.py
           PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
@@ -73,6 +74,14 @@ jobs:
           PYTHONPATH=. python migrations/apply_companies_google_place_id.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py
           PYTHONPATH=. python migrations/apply_owner_visibility_scores.py
+          PYTHONPATH=. python migrations/apply_owner_contacts.py
+          PYTHONPATH=. python migrations/apply_calendar_connections.py
+          PYTHONPATH=. python migrations/apply_bookings.py
+          PYTHONPATH=. python migrations/apply_booking_reminder_jobs.py
+          PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py
+          PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py
+          PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py
+          PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
       - name: Run tenant leakage suite
         run: PYTHONPATH=. pytest tests/test_tenant_isolation.py -v
