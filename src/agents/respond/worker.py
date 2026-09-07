@@ -1,0 +1,304 @@
+"""Respond triage worker — classify and route inbound owner-reply emails.
+
+Reads from the respond:inbound Redis Stream, loads the inbound_messages DB
+row, classifies the intent, writes the result back, then routes:
+
+  UNSUBSCRIBE  → SUPPRESSED  + Slack #command alert
+  LEGAL_GRIEF  → ESCALATED   + Slack #command urgent alert
+  LATER        → DEFERRED    (contact next-touch handled by reply dispatcher)
+  all others   → ROUTED      (context card posting handled by reply dispatcher)
+
+Control flow per iteration:
+  1. read_batch()      — claim one message from the stream.
+  2. Load row          — fetch inbound_messages by db_id; status must be PENDING.
+  3. Mark PROCESSING   — optimistic status update before the LLM call.
+  4. classify()        — deterministic fast-path or single Haiku call.
+  5. _route()          — write terminal/intermediate status + fire Slack if needed.
+  6. ack()             — only after the DB write commits.
+
+Stale-message sweep runs every CLAIM_SWEEP_EVERY_N_LOOPS iterations.
+SIGINT/SIGTERM: finish in-flight message, then exit.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import socket
+import time
+import uuid
+from typing import Any, Dict, Optional
+
+from sqlalchemy import text
+
+from src.agents.respond import queue
+from src.agents.respond.classifier import ClassificationResult, classify
+from src.agents.respond.intents import Intent
+from src.core.database import Database
+
+logger = logging.getLogger(__name__)
+
+CLAIM_MIN_IDLE_MS = 60_000
+CLAIM_SWEEP_EVERY_N_LOOPS = 12
+DB_SCAN_SWEEP_EVERY_N_LOOPS = 60   # ~1 min at 1s block_ms
+DB_SCAN_MIN_AGE_SECONDS = 120       # only rows stuck for 2+ minutes
+IDLE_SLEEP_SECONDS = 5
+
+_INTENT_TO_STATUS: Dict[Intent, str] = {
+    Intent.UNSUBSCRIBE: "SUPPRESSED",
+    Intent.LEGAL_GRIEF: "ESCALATED",
+    Intent.LATER: "DEFERRED",
+}
+_DEFAULT_ROUTED_STATUS = "ROUTED"
+
+
+def _consumer_name() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def _load_row(db: Any, db_id: int) -> Optional[Dict[str, Any]]:
+    row = db.execute(
+        text(
+            "SELECT id, client_id, sender_email, subject, body_text, status "
+            "FROM inbound_messages WHERE id = :id"
+        ),
+        {"id": db_id},
+    ).mappings().first()
+    return dict(row) if row else None
+
+
+def _mark_processing(db: Any, db_id: int) -> None:
+    db.execute(
+        text("UPDATE inbound_messages SET status = 'PROCESSING' WHERE id = :id AND status = 'PENDING'"),
+        {"id": db_id},
+    )
+
+
+def _write_result(db: Any, db_id: int, result: ClassificationResult, final_status: str) -> None:
+    db.execute(
+        text(
+            "UPDATE inbound_messages "
+            "SET status = :status, "
+            "    intent = :intent, "
+            "    intent_confidence = :confidence, "
+            "    classified_at = NOW(), "
+            "    classification_meta = :meta ::jsonb "
+            "WHERE id = :id"
+        ),
+        {
+            "id": db_id,
+            "status": final_status,
+            "intent": result.intent.value,
+            "confidence": result.confidence,
+            "meta": json.dumps({
+                "reasoning": result.reasoning,
+                **result.meta,
+            }),
+        },
+    )
+
+
+async def _post_slack_alert(channel_key: str, text_body: str) -> None:
+    try:
+        from src.services.slack.post import post_action_card
+
+        await post_action_card(
+            channel_key=channel_key,
+            text=text_body,
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text_body}}],
+        )
+    except Exception as exc:
+        logger.warning("respond.worker: Slack alert failed: %s", exc)
+
+
+def _route(db: Any, db_id: int, client_id: str, sender_email: str, result: ClassificationResult) -> str:
+    """Determine terminal status, write it, fire any side-effects. Returns final status."""
+    final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
+    _write_result(db, db_id, result, final_status)
+    db.commit()
+
+    if result.intent == Intent.UNSUBSCRIBE:
+        msg = (
+            f":no_entry: *Opt-out received*\n"
+            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+            f"Message ID: `{db_id}` — marked SUPPRESSED. Remove from all active sequences."
+        )
+        asyncio.run(_post_slack_alert("command", msg))
+
+    elif result.intent == Intent.LEGAL_GRIEF:
+        msg = (
+            f":rotating_light: *LEGAL THREAT — immediate review required*\n"
+            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+            f"Message ID: `{db_id}` — marked ESCALATED. Halt all outreach to this sender manually."
+        )
+        asyncio.run(_post_slack_alert("command", msg))
+
+    return final_status
+
+
+def _process_message(msg: queue.InboundQueueMessage) -> None:
+    db_obj = Database()
+    with db_obj.system_session_scope() as db:
+        row = _load_row(db, msg.db_id)
+        if row is None:
+            logger.warning(
+                "respond.worker: db_id=%s not found — acking to clear queue",
+                msg.db_id,
+            )
+            queue.ack(msg.message_id)
+            return
+
+        if row["status"] not in ("PENDING", "PROCESSING"):
+            # Already handled by a previous delivery — idempotent ack.
+            logger.info(
+                "respond.worker: db_id=%s already in status=%s — skipping",
+                msg.db_id, row["status"],
+            )
+            queue.ack(msg.message_id)
+            return
+
+        _mark_processing(db, msg.db_id)
+        db.commit()
+
+    # Classification runs outside the DB transaction — LLM call has its own latency.
+    result = classify(
+        body_text=row.get("body_text") or "",
+        subject=row.get("subject") or "",
+        sender_email=row.get("sender_email") or "",
+    )
+
+    with db_obj.system_session_scope() as db:
+        final_status = _route(
+            db=db,
+            db_id=msg.db_id,
+            client_id=row["client_id"],
+            sender_email=row.get("sender_email") or "",
+            result=result,
+        )
+
+    logger.info(
+        "respond.worker: db_id=%s client_id=%s intent=%s confidence=%.2f status=%s",
+        msg.db_id, row["client_id"], result.intent.value, result.confidence, final_status,
+    )
+    queue.ack(msg.message_id)
+
+
+def _sweep_unpublished_pending() -> None:
+    """Re-publish PENDING rows that never made it into the Redis stream.
+
+    Targets rows older than DB_SCAN_MIN_AGE_SECONDS whose publish failed
+    silently (e.g. Redis was down at intake time). Safe to run concurrently —
+    duplicate publishes are deduplicated by the worker's idempotency check on
+    the DB row status.
+    """
+    db_obj = Database()
+    with db_obj.system_session_scope() as db:
+        rows = db.execute(
+            text(
+                f"SELECT id, client_id, idempotency_key FROM inbound_messages "
+                f"WHERE status = 'PENDING' "
+                f"AND received_at < NOW() - INTERVAL '{DB_SCAN_MIN_AGE_SECONDS} seconds'"
+            )
+        ).mappings().fetchall()
+
+    if not rows:
+        return
+
+    logger.info(
+        "respond.worker: db-scan found %d unpublished PENDING row(s) — re-publishing",
+        len(rows),
+    )
+    for row in rows:
+        stream_id = queue.publish(
+            db_id=row["id"],
+            client_id=row["client_id"],
+            idempotency_key=row["idempotency_key"],
+        )
+        if stream_id:
+            logger.info(
+                "respond.worker: re-published db_id=%s stream_id=%s",
+                row["id"], stream_id,
+            )
+        else:
+            logger.warning(
+                "respond.worker: re-publish failed for db_id=%s — Redis still down?",
+                row["id"],
+            )
+
+
+class Worker:
+    def __init__(self, consumer_name: Optional[str] = None) -> None:
+        self.consumer_name = consumer_name or _consumer_name()
+        self._stop = False
+        self._loop_count = 0
+
+    def request_stop(self, *_args: Any) -> None:
+        logger.info(
+            "respond.worker: shutdown requested (consumer=%s) — finishing in-flight work",
+            self.consumer_name,
+        )
+        self._stop = True
+
+    def install_signal_handlers(self) -> None:
+        signal.signal(signal.SIGINT, self.request_stop)
+        signal.signal(signal.SIGTERM, self.request_stop)
+
+    def _sweep_stale(self) -> None:
+        reclaimed = queue.claim_stale(self.consumer_name, min_idle_ms=CLAIM_MIN_IDLE_MS)
+        for msg in reclaimed:
+            logger.info(
+                "respond.worker: reclaimed stale message_id=%s db_id=%s delivery_count=%d",
+                msg.message_id, msg.db_id, msg.delivery_count,
+            )
+            try:
+                _process_message(msg)
+            except Exception:
+                logger.exception(
+                    "respond.worker: stale message processing failed db_id=%s", msg.db_id
+                )
+
+    def run_forever(self, block_ms: int = 1000) -> None:
+        queue.ensure_group()
+        logger.info("respond.worker: starting (consumer=%s)", self.consumer_name)
+
+        while not self._stop:
+            self._loop_count += 1
+            try:
+                if self._loop_count % CLAIM_SWEEP_EVERY_N_LOOPS == 0:
+                    self._sweep_stale()
+
+                if self._loop_count % DB_SCAN_SWEEP_EVERY_N_LOOPS == 0:
+                    try:
+                        _sweep_unpublished_pending()
+                    except Exception:
+                        logger.exception("respond.worker: db-scan sweep failed")
+
+                messages = queue.read_batch(self.consumer_name, count=1, block_ms=block_ms)
+                for msg in messages:
+                    if self._stop:
+                        break
+                    try:
+                        _process_message(msg)
+                    except Exception:
+                        logger.exception(
+                            "respond.worker: _process_message raised for db_id=%s — leaving unacked",
+                            msg.db_id,
+                        )
+            except Exception:
+                logger.exception("respond.worker: main loop iteration failed — continuing")
+                time.sleep(IDLE_SLEEP_SECONDS)
+
+        logger.info("respond.worker: stopped (consumer=%s)", self.consumer_name)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    worker = Worker()
+    worker.install_signal_handlers()
+    worker.run_forever()
+
+
+if __name__ == "__main__":
+    main()

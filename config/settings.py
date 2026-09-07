@@ -334,6 +334,17 @@ class AppSettings(BaseSettings):
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
+	# ── Respond Reply Triage Agent ───────────────────────────────────────────
+	# Fail-closed: if ANTHROPIC_API_KEY is unset the classifier returns the
+	# NURTURE fallback on every non-deterministic message rather than raising.
+	anthropic_api_key: Optional[SecretStr] = Field(default=None, env="ANTHROPIC_API_KEY")
+	# Shared secret the inbound parse service adds as X-Blackink-Inbound-Secret.
+	# Fail-closed: if unset every inbound POST returns 503.
+	inbound_parse_secret: Optional[SecretStr] = Field(default=None, env="INBOUND_PARSE_SECRET")
+	# Domain suffix used to construct per-client inbound addresses:
+	# replies@{client_id}.{inbound_email_domain}
+	inbound_email_domain: str = Field(default="getblackink.com", env="INBOUND_EMAIL_DOMAIN")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

@@ -54,6 +54,7 @@ PYTHONPATH=. python migrations/apply_no_show_prompt_jobs.py        # Subtask 3.2
 PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2.3 — No-Show Handler
 PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
+PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -71,6 +72,7 @@ python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
+python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
 
