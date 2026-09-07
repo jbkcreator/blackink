@@ -287,13 +287,7 @@ def _build_blocks(
 
     # Prior thread
     if prior_messages:
-        lines = []
-        for msg in reversed(prior_messages):
-            ts     = msg.get("received_at")
-            ts_str = ts.strftime("%b %d") if isinstance(ts, datetime) else "–"
-            text_  = (msg.get("body_text") or "")[:120].replace("\n", " ")
-            lines.append(f"[{ts_str}] _{text_}_")
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Prior thread*\n" + "\n".join(lines)}})
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "*Prior thread*\n" + _format_thread(prior_messages)}})
 
     blocks.append({"type": "divider"})
 
@@ -369,7 +363,7 @@ async def post_context_card(
         weak_signals = _weakest_signals((ovs or {}).get("signal_detail")) if ovs else []
 
         now           = datetime.now(timezone.utc)
-        posted_at_iso = now.isoformat()
+        posted_at_iso = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
         hash_value    = compute_card_hash(db_id, client_id, intent.value, posted_at_iso)
 
         objection_subtype = getattr(result, "objection_subtype", None)

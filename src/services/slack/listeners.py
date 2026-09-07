@@ -915,7 +915,7 @@ async def handle_log_meeting_outcome(ack, body, respond, action, client):
 
 # ── Context card claim (Subtask 2.1.2 — Reply Triage Agent) ─────────────────
 
-_CONTEXT_CARD_TTL = timedelta(hours=24)
+from src.agents.respond.context_cards import CARD_EXPIRY as _CONTEXT_CARD_TTL, compute_card_hash
 
 
 @app.action("claim_context_card")
@@ -974,8 +974,7 @@ async def handle_claim_context_card(ack, body, respond, action, client):
 		await respond(response_type="ephemeral", text=":warning: This card has expired (>24 hours). The lead may have been reallocated.")
 		return
 
-	# Hash verification — import deferred to avoid circular import at module load.
-	from src.agents.respond.context_cards import compute_card_hash
+	# Hash verification
 	card_posted_at_iso = card_posted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 	expected = compute_card_hash(db_id, card_client_id, row["intent"] or "", card_posted_at_iso)
 	if not _hmac.compare_digest(provided_hash, expected):
