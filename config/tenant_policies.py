@@ -44,9 +44,42 @@ TENANT_POLICIES = {
 	"sending_domains": {"mode": "direct", "column": "client_id"},
 	"mailboxes": {"mode": "direct", "column": "client_id"},
 	"agent_work_orders": {"mode": "direct", "column": "client_id"},
+	"meeting_outcomes": {"mode": "direct", "column": "client_id"},
 	"sequence_runs": {"mode": "direct", "column": "client_id"},
 	"sequence_touch_dispatches": {"mode": "direct", "column": "client_id"},
 	"inbound_messages": {"mode": "direct", "column": "client_id"},
+	# owner_visibility_scores has no client_id column of its own — scoped through
+	# companies.owning_client_id via company_id FK, same join pattern as contacts.
+	"owner_visibility_scores": {
+		"mode": "join",
+		"join_table": "companies",
+		"join_on": "company_id",
+		"join_column": "owning_client_id",
+	},
+	"calendar_connections": {"mode": "direct", "column": "client_id"},
+	"owner_contacts": {"mode": "direct", "column": "client_id"},
+	"bookings": {"mode": "direct", "column": "client_id"},
+	"oauth_connect_nonces": {"mode": "direct", "column": "client_id"},
+	"calendar_sync_queue": {
+		"mode": "join",
+		"join_table": "calendar_connections",
+		"join_on": "connection_id",
+		"join_column": "client_id",
+	},
+	# booking_reminder_jobs has no client_id column of its own — scoped through
+	# bookings.client_id via booking_id FK (Subtask 3.2.2).
+	"booking_reminder_jobs": {
+		"mode": "join",
+		"join_table": "bookings",
+		"join_on": "booking_id",
+		"join_column": "client_id",
+	},
+	# Subtask 3.2.3 — No-Show Handler. Both carry their own client_id column.
+	"no_show_prompt_jobs": {"mode": "direct", "column": "client_id"},
+	"no_show_recovery_jobs": {"mode": "direct", "column": "client_id"},
+	# Addendum to Subtask 3.2.1 — "Log Outcome" trigger card. Carries its own
+	# client_id column (copied from bookings.client_id at schedule time).
+	"meeting_outcome_prompt_jobs": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
@@ -54,4 +87,8 @@ TENANT_POLICIES = {
 #   counties, owner_entities, owner_entity_links — global reference data.
 #   raw_prospect_companies, raw_prospect_contacts — Akrash has no visibility
 #     into the client roster by design; ownership is assigned only at
-#     promotion time (see Dev 1 plan §Key decision 6).
+#     promotion time (ownership is assigned at promotion, not ingestion).
+#   self_serve_audit_submissions (Subtask 3.2.3) — pre-company, pre-tenant
+#     public landing-page staging data, same posture as raw_prospect_*;
+#     ownership is assigned only once the worker resolves/creates a
+#     companies row, never at submission time.

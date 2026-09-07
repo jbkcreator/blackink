@@ -74,6 +74,9 @@ def enroll_contact(
     contact_id: int,
     contact_email: str,
     enrolled_at: Optional[datetime] = None,
+    *,
+    first_name: Optional[str] = None,
+    company_name: Optional[str] = None,
 ) -> Optional[str]:
     """Create a sequence_run and enqueue all 5 touch work orders upfront.
 
@@ -90,6 +93,7 @@ def enroll_contact(
     from sqlalchemy.exc import IntegrityError
 
     from src.services import work_orders as wo
+    from src.services.sequence_content import render_touch
 
     if not may_enroll(contact_id):
         logger.info("enroll_contact: contact_id=%s already in active sequence", contact_id)
@@ -127,10 +131,28 @@ def enroll_contact(
         if touch_step == 2:
             continue
         due_at = now + timedelta(days=day_offset)
+        is_email = touch_step in _EMAIL_TOUCH_STEPS
+        # Touch 2 is `continue`d above (event-driven dial post, ADR 0001), so
+        # only email vs LinkedIn is decided here.
         action_class = (
-            "DISPATCH_EMAIL_TOUCH" if touch_step in _EMAIL_TOUCH_STEPS
+            "DISPATCH_EMAIL_TOUCH" if is_email
             else "LINKEDIN_TASK"
         )
+        # config_fingerprint["channel"] selects the EXECUTION dispatcher (see
+        # work_orders/dispatchers.py DISPATCHERS). Email touches run the real
+        # send path ("setter"); phone/LinkedIn are human-performed and run the
+        # "manual" dispatcher that only records completion (finding #4) — so an
+        # approved DIAL_TASK is never fed to the email sender.
+        channel = "setter" if is_email else "manual"
+        payload = {"run_id": run_id, "touch_step": touch_step}
+        # Email touches must carry approved subject/body/template_version — the
+        # dispatcher is fail-closed on missing content (returns NO_CONTENT).
+        # Persist the approved copy now so the touch is deliverable end to end.
+        if is_email:
+            subject, body, template_version = render_touch(
+                touch_step, first_name=first_name, company_name=company_name
+            )
+            payload.update(subject=subject, body=body, template_version=template_version)
         idempotency_key = f"seq:{run_id}:touch:{touch_step}"
         wo.enqueue(
             client_id=client_id,
@@ -141,8 +163,8 @@ def enroll_contact(
             autonomy_band="BAND_2_ONE_TAP",
             risk_class="LOW",
             recipient=contact_email,
-            payload={"run_id": run_id, "touch_step": touch_step},
-            config_fingerprint={"channel": "setter", "run_id": run_id, "touch_step": touch_step},
+            payload=payload,
+            config_fingerprint={"channel": channel, "run_id": run_id, "touch_step": touch_step},
             idempotency_key=idempotency_key,
             due_at=due_at,
         )

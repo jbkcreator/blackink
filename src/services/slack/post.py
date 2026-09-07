@@ -117,14 +117,57 @@ async def open_modal(*, trigger_id: str, view: dict) -> bool:
 		return False
 
 
-async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[dict]] = None,
-                      attachments: Optional[Sequence[dict]] = None,
-                      thread_ts: Optional[str] = None) -> Optional[str]:
+async def lookup_user_id_by_email(email: str) -> Optional[str]:
+	"""Resolve a Slack user id from an email via users.lookupByEmail.
+
+	Used to derive the assigned closer for the "Log Outcome" card from the
+	booking's own rep-calendar-slot email (bookings.client_rep_email),
+	rather than a hand-entered mapping — the addendum's DoD sources the
+	closer from that webhook field. Requires the bot scope
+	users:read.email.
+
+	Returns the user id, or None when Slack is unconfigured, the email is
+	empty, the user isn't found, or the scope is missing — the caller then
+	falls back to a manually-provisioned override and, failing that, blocks.
+	Never raises."""
+	if not email:
+		return None
+	client = _client_or_none()
+	if client is None:
+		return None
+	try:
+		resp = await client.users_lookupByEmail(email=email)
+	except SlackApiError as exc:
+		logger.info(
+			"[slack.post] users.lookupByEmail(%s) failed: %s",
+			email, exc.response.get("error") if exc.response else exc,
+		)
+		return None
+	user = resp.get("user") or {}
+	return user.get("id")
+
+
+async def post_notice(
+	*,
+	channel_key: str,
+	text: str,
+	blocks: Optional[Sequence[dict]] = None,
+	attachments: Optional[Sequence[dict]] = None,
+	thread_ts: Optional[str] = None,
+) -> Optional[str]:
 	"""Non-interactive, fire-and-forget posts — #blackink-qa health alerts,
-	#blackink-economics rollups, #sales-replies cards. Returns the message ts on
-	success, else None. Never raises. `attachments` enables a colored side bar
-	(e.g. green attributed / amber unattributed reply cards). `thread_ts` posts
-	the message as a reply in an existing thread."""
+	#blackink-economics rollups, #sales-replies cards. Returns the message ts
+	on success, else None. Never raises.
+
+	`attachments` enables a colored side bar (e.g. green attributed / amber
+	unattributed reply cards).
+
+	thread_ts (optional) replies in an existing message's thread instead of
+	posting to the channel top level — used by the "Log Outcome" card's
+	4-hour unclicked reminder ping, which the addendum to Subtask 3.2.1
+	requires land "in the same channel/thread" as the card it's nudging.
+	Omitted (None) keeps the historical top-level behavior for every
+	existing caller."""
 	client = _client_or_none()
 	if client is None:
 		logger.info("[slack.post] Slack not configured — notice not posted (channel_key=%s)", channel_key)
@@ -137,7 +180,8 @@ async def post_notice(*, channel_key: str, text: str, blocks: Optional[Sequence[
 
 	try:
 		response = await client.chat_postMessage(
-			channel=channel_id, text=text,
+			channel=channel_id,
+			text=text,
 			blocks=list(blocks) if blocks else None,
 			attachments=list(attachments) if attachments else None,
 			thread_ts=thread_ts,

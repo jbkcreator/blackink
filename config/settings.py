@@ -33,7 +33,16 @@ class AppSettings(BaseSettings):
 	)
 
 	debug: bool = Field(default=True, env="DEBUG")
+	# Deployment environment. Anything other than "development"/"test" is treated
+	# as production for fail-closed guards (e.g. the email sender must not fall
+	# back to the transmit-nothing stub in production). Default is development so
+	# local dev and CI stay convenient; production must set ENVIRONMENT=production.
+	environment: str = Field(default="development", env="ENVIRONMENT")
 	app_base_url: str = Field(default="http://localhost:8000", env="APP_BASE_URL")
+
+	@property
+	def is_production(self) -> bool:
+		return (self.environment or "development").strip().lower() not in {"development", "dev", "test", "testing", "local"}
 
 	# ── Database ─────────────────────────────────────────────────────────────
 	# Generic fallback DSN (used by tooling/tests that don't care which role).
@@ -96,6 +105,12 @@ class AppSettings(BaseSettings):
 	# warmed Google Workspace / Outlook (smtp.gmail.com:587 / smtp.office365.com:587).
 	# smtp_username defaults to the sending mailbox address at send time; set it
 	# only if the SMTP login differs from the From address.
+	# Sender selection guard (review finding #2). "auto" (default) uses the real
+	# SmtpEmailSender when SMTP is configured, else the StubEmailSender — the
+	# convenient dev/test behaviour. "smtp" is fail-closed: build_email_sender()
+	# raises if SMTP is not configured, so a mis-deployed production box cannot
+	# silently record undelivered mail as SENT. "stub" always uses the stub.
+	email_sender_mode: str = Field(default="auto", env="EMAIL_SENDER_MODE")
 	smtp_host: Optional[str] = Field(default=None, env="SMTP_HOST")
 	smtp_port: int = Field(default=587, env="SMTP_PORT")
 	smtp_use_tls: bool = Field(default=True, env="SMTP_USE_TLS")
@@ -114,11 +129,20 @@ class AppSettings(BaseSettings):
 	# this field's use but doesn't require removing it.
 	slack_app_token: Optional[SecretStr] = Field(default=None, env="SLACK_APP_TOKEN")
 
-	# ── Relay halt / resume (Dev 2, src/agents/relay/) ──────────────────────
+	# ── Relay halt / resume (src/agents/relay/) ─────────────────────────────
 	# HMAC-SHA256 signing key for cryptographic resume tokens
 	# (src/agents/relay/resume_auth.py). Must be set before any halt can be
 	# issued or resumed. Recommended: 32+ bytes of entropy.
 	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
+
+	# ── Demo sandbox dashboard export (src/tasks/seed_demo_sandbox.py) ──────
+	# Service account JSON key path (gitignored `secrets/` dir, never
+	# committed) and target Sheet ID for the sandbox dashboard export that
+	# powers the free-tier Looker Studio demo dashboard. Chosen over a
+	# direct Looker Studio -> Postgres connection specifically to avoid
+	# exposing the shared production database's port to the internet.
+	google_sheets_credentials_path: Optional[str] = Field(default=None, env="GOOGLE_SHEETS_CREDENTIALS_PATH")
+	google_sheets_sandbox_id: Optional[str] = Field(default=None, env="GOOGLE_SHEETS_SANDBOX_ID")
 
 	blackink_qa_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_QA_SLACK_CHANNEL")
 	blackink_command_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_COMMAND_SLACK_CHANNEL")
@@ -129,7 +153,7 @@ class AppSettings(BaseSettings):
 	# Fail-closed workspace-wide approver allowlist — Slack user IDs,
 	# comma-separated (e.g. "U012ABC,U034DEF"). src.services.slack.auth.
 	# approver_authorized() treats an empty/unset list as "nobody
-	# authorized", never "everybody". Dev 3 plan §7.4 — per-tenant
+	# authorized", never "everybody". Per-tenant
 	# approvers are Week 1 (need a clients column that doesn't exist yet);
 	# this is global-only for Week 0.
 	#
@@ -181,8 +205,140 @@ class AppSettings(BaseSettings):
 	# this the /webhooks/inbound-email endpoint rejects all requests.
 	mailgun_signing_key: Optional[SecretStr] = Field(default=None, env="MAILGUN_SIGNING_KEY")
 
+	# ── Internal admin API ───────────────────────────────────────────────────
+	# HS256 signing secret for admin JWT tokens (internal dashboard auth).
+	# Fail-closed: if unset the /auth/login endpoint returns 503.
+	# Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+	admin_jwt_secret: Optional[SecretStr] = Field(default=None, env="ADMIN_JWT_SECRET")
+	admin_jwt_expiry_hours: int = Field(default=8, env="ADMIN_JWT_EXPIRY_HOURS")
+
 	# ── Akrash ingestion ─────────────────────────────────────────────────────
 	akrash_ingest_jwt_secret: Optional[SecretStr] = Field(default=None, env="AKRASH_INGEST_JWT_SECRET")
+
+	# ── Calendar OAuth (Subtask 3.2.1 — Inbound Booking Engine) ─────────────
+	# No Calendly per client comment W1-8 (Blackink_Source_of_Truth.md line
+	# 577) — Google Calendar + Microsoft Graph only. Unlike the DNC/SMS/
+	# RentCast vendors, no third party here is genuinely absent — these are
+	# OAuth apps this project registers itself; unset means "not registered
+	# yet", a required completion gate, not a permanently-deferred provider.
+	google_oauth_client_id: Optional[str] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_ID")
+	google_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_SECRET")
+	microsoft_oauth_client_id: Optional[str] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_ID")
+	microsoft_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_SECRET")
+	# Fernet key (urlsafe base64, 32 bytes) — encrypts OAuth tokens and SMTP
+	# passwords at rest. See src/core/token_crypto.py.
+	token_encryption_key: Optional[SecretStr] = Field(default=None, env="TOKEN_ENCRYPTION_KEY")
+	# Signs connect-link and OAuth `state` tokens (src/services/calendar_oauth.py).
+	# Deliberately its own secret, not a reuse of akrash_ingest_jwt_secret —
+	# these two token families protect unrelated systems and must be able to
+	# rotate independently.
+	calendar_oauth_state_secret: Optional[SecretStr] = Field(default=None, env="CALENDAR_OAUTH_STATE_SECRET")
+	calendar_webhook_base_url: str = Field(
+		default="http://localhost:8000", env="CALENDAR_WEBHOOK_BASE_URL",
+		description="Public base URL the providers POST notifications to — must be internet-reachable in prod.",
+	)
+	# Local-testing-only escape hatch: Google/Microsoft's watch()/subscription
+	# registration calls reject a non-public, non-domain-verified callback
+	# URL (localhost) at registration time — this lets the OAuth callback
+	# complete anyway (real token exchange + real baseline sync still run),
+	# just without a live push subscription. Never set True outside local
+	# dev — a connection created this way never receives real-time webhook
+	# notifications, only whatever calendar_sync_worker's periodic safety
+	# sweep picks up.
+	skip_calendar_watch_registration: bool = Field(default=False, env="SKIP_CALENDAR_WATCH_REGISTRATION")
+
+	# ── Booking confirmation email (Subtask 3.2.1) ──────────────────────────
+	# Default False: per explicit instruction, a missing/disabled real
+	# email provider must be a visible launch blocker (booking_confirmation_
+	# blocked event), never a silent no-op or a stub quietly satisfying a test.
+	email_sending_enabled: bool = Field(default=False, env="EMAIL_SENDING_ENABLED")
+
+	# ── Oxylabs residential proxy ────────────────────────────────────────────
+	oxylabs_username: Optional[str] = Field(default=None, env="OXYLABS_USERNAME")
+	oxylabs_password: Optional[SecretStr] = Field(default=None, env="OXYLABS_PASSWORD")
+
+	# ── Owner Visibility Score ───────────────────────────────────────────────
+	# When absent the stub provider is used — max achievable score is 42/100
+	# (38 website + 4 DBPR). Set to enable live Google Places API calls.
+	google_places_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_PLACES_API_KEY")
+
+	# ── Calendar OAuth (Subtask 3.2.1 — Inbound Booking Engine) ─────────────
+	# No Calendly per client comment W1-8 (Blackink_Source_of_Truth.md line
+	# 577) — Google Calendar + Microsoft Graph only. Unlike the DNC/SMS/
+	# RentCast vendors, no third party here is genuinely absent — these are
+	# OAuth apps this project registers itself; unset means "not registered
+	# yet", a required completion gate, not a permanently-deferred provider.
+	google_oauth_client_id: Optional[str] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_ID")
+	google_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_SECRET")
+	microsoft_oauth_client_id: Optional[str] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_ID")
+	microsoft_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_SECRET")
+	# Fernet key (urlsafe base64, 32 bytes) — encrypts OAuth tokens and SMTP
+	# passwords at rest. See src/core/token_crypto.py.
+	token_encryption_key: Optional[SecretStr] = Field(default=None, env="TOKEN_ENCRYPTION_KEY")
+	# Signs connect-link and OAuth `state` tokens (src/services/calendar_oauth.py).
+	# Deliberately its own secret, not a reuse of akrash_ingest_jwt_secret —
+	# these two token families protect unrelated systems and must be able to
+	# rotate independently.
+	calendar_oauth_state_secret: Optional[SecretStr] = Field(default=None, env="CALENDAR_OAUTH_STATE_SECRET")
+	calendar_webhook_base_url: str = Field(
+		default="http://localhost:8000", env="CALENDAR_WEBHOOK_BASE_URL",
+		description="Public base URL the providers POST notifications to — must be internet-reachable in prod.",
+	)
+	# Local-testing-only escape hatch: Google/Microsoft's watch()/subscription
+	# registration calls reject a non-public, non-domain-verified callback
+	# URL (localhost) at registration time — this lets the OAuth callback
+	# complete anyway (real token exchange + real baseline sync still run),
+	# just without a live push subscription. Never set True outside local
+	# dev — a connection created this way never receives real-time webhook
+	# notifications, only whatever calendar_sync_worker's periodic safety
+	# sweep picks up.
+	skip_calendar_watch_registration: bool = Field(default=False, env="SKIP_CALENDAR_WATCH_REGISTRATION")
+
+	# ── Booking confirmation email (Subtask 3.2.1) ──────────────────────────
+	# Default False: per explicit instruction, a missing/disabled real
+	# email provider must be a visible launch blocker (booking_confirmation_
+	# blocked event), never a silent no-op or a stub quietly satisfying a test.
+	email_sending_enabled: bool = Field(default=False, env="EMAIL_SENDING_ENABLED")
+
+	# ── OVS PDF fetch (Subtask 3.2.2) ────────────────────────────────────────
+	# Comma-separated exact hostnames the pre-demo reminder is allowed to
+	# fetch contacts.ovs_pdf_url from (e.g. an S3/GCS bucket's public host,
+	# once Dev 2's storage step exists — see src/services/show_rate_reminders.py's
+	# _fetch_ovs_pdf()). Default empty means fail-closed: nothing is an
+	# approved host until this is explicitly configured, same posture as
+	# email_sending_enabled defaulting False — a missing/misconfigured value
+	# is a visible BLOCKED reminder job, never a silent fetch-anything.
+	ovs_pdf_allowed_hosts_raw: str = Field(default="", validation_alias="OVS_PDF_ALLOWED_HOSTS")
+
+	@property
+	def ovs_pdf_allowed_hosts(self) -> Tuple[str, ...]:
+		return tuple(v.strip().lower() for v in self.ovs_pdf_allowed_hosts_raw.split(",") if v.strip())
+
+	# ── No-Show Handler / Self-Serve Landing Page (Subtask 3.2.3) ───────────
+	# Same fail-closed posture as ovs_pdf_allowed_hosts: empty means no host
+	# is approved, so resolve_booking_link() returns None (no redirect)
+	# rather than trusting an unvetted stored URL.
+	booking_redirect_allowed_hosts_raw: str = Field(default="", validation_alias="BOOKING_REDIRECT_ALLOWED_HOSTS")
+
+	@property
+	def booking_redirect_allowed_hosts(self) -> Tuple[str, ...]:
+		return tuple(v.strip().lower() for v in self.booking_redirect_allowed_hosts_raw.split(",") if v.strip())
+
+	# Optional — the /audit landing page renders no pixel <script> at all
+	# when unset (see src/api/public_landing_router.py), never a broken tag.
+	meta_pixel_id: Optional[str] = Field(default=None, env="META_PIXEL_ID")
+	google_tag_id: Optional[str] = Field(default=None, env="GOOGLE_TAG_ID")
+	self_serve_rate_limit_per_10min: int = Field(default=5, env="SELF_SERVE_RATE_LIMIT_PER_10MIN")
+	# Deliberately its own secret, not a reuse of relay_resume_secret — same
+	# rationale as calendar_oauth_state_secret above: unrelated token
+	# families must be able to rotate independently.
+	no_show_token_secret: Optional[SecretStr] = Field(default=None, env="NO_SHOW_TOKEN_SECRET")
+	# ── Rent valuation adapter ───────────────────────────────────────────────
+	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
+	# False: no valuation vendor is under contract, so enabling this would
+	# point the adapter at a provider that does not exist. Flipped to True
+	# only when a real RentValuationProvider implementation lands in Q1.
+	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
 
 @lru_cache

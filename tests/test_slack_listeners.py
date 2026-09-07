@@ -542,3 +542,114 @@ async def test_revise_submit_still_rejects_an_already_decided_order(monkeypatch)
 
 	db_mock.assert_not_called()
 	assert "Already decided" in ack.call_args.kwargs["errors"]["revision_note_block"]
+
+
+# ── handle_log_meeting_outcome (Addendum to Subtask 3.2.1) ──────────────
+
+
+def _outcome_button_value(order: WorkOrder, *, contact_id="42",
+                          meeting_occurred_at="2026-09-04T15:00:00+00:00") -> dict:
+	from src.services.slack import payload_hash as ph
+	return {
+		"client_id": order.client_id,
+		"action_id": order.action_id,
+		"contact_id": contact_id,
+		"meeting_occurred_at": meeting_occurred_at,
+		"payload_hash": ph.compute(order),
+	}
+
+
+def _outcome_order(**overrides) -> WorkOrder:
+	base = dict(
+		action_class="MEETING_OUTCOME_PROMPT",
+		recipient="U1",
+		payload={"booking_id": 7, "company_id": "co-7", "contact_id": 42, "meeting_occurred_at": "2026-09-04T15:00:00+00:00"},
+	)
+	base.update(overrides)
+	return _order(**base)
+
+
+@pytest.mark.asyncio
+async def test_log_outcome_opens_modal_for_assigned_closer(monkeypatch):
+	order = _outcome_order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	# The click handler now does a live booking-cancel re-check before opening
+	# the modal; this pure-unit test has no real booking, so stub it not-cancelled.
+	monkeypatch.setattr(listeners, "_booking_is_cancelled", lambda session, booking_id: False)
+	# The handler now delegates to the base's canonical open_meeting_outcome_modal
+	# (which opens the modal via post.open_modal, not the injected client).
+	open_modal = AsyncMock(return_value=True)
+	monkeypatch.setattr(listeners, "open_meeting_outcome_modal", open_modal)
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U1"}, "trigger_id": "trg-1"}
+	action = {"action_id": "log_meeting_outcome", "value": json.dumps(_outcome_button_value(order))}
+
+	await listeners.handle_log_meeting_outcome(ack, body, respond, action, client)
+
+	ack.assert_awaited_once()
+	open_modal.assert_awaited_once()
+	assert open_modal.call_args.kwargs["trigger_id"] == "trg-1"
+	respond.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_log_outcome_rejects_different_closer(monkeypatch):
+	order = _outcome_order(recipient="U_OTHER")
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U1"}, "trigger_id": "trg-1"}
+	action = {"action_id": "log_meeting_outcome", "value": json.dumps(_outcome_button_value(order))}
+
+	await listeners.handle_log_meeting_outcome(ack, body, respond, action, client)
+
+	client.views_open.assert_not_called()
+	assert "different closer" in respond.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_log_outcome_rejects_expired_card(monkeypatch):
+	# Fresh hash, but posted more than 24h ago -> expired, same rejection as altered.
+	old = datetime.now(timezone.utc) - timedelta(hours=24, minutes=1)
+	order = _outcome_order(created_at=old, updated_at=old)
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	monkeypatch.setattr(listeners, "_log_event", lambda *a, **k: None)
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U1"}, "trigger_id": "trg-1"}
+	action = {"action_id": "log_meeting_outcome", "value": json.dumps(_outcome_button_value(order))}
+
+	await listeners.handle_log_meeting_outcome(ack, body, respond, action, client)
+
+	client.views_open.assert_not_called()
+	assert "expired or was altered" in respond.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_log_outcome_rejects_altered_hash(monkeypatch):
+	order = _outcome_order()
+	monkeypatch.setattr(listeners, "approver_authorized", lambda user_id, client_id=None: True)
+	monkeypatch.setattr(listeners.wo, "get", lambda client_id, action_id: order)
+	monkeypatch.setattr(listeners, "_log_event", lambda *a, **k: None)
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	value = _outcome_button_value(order)
+	value["payload_hash"] = "deadbeef" * 8  # wrong, but well-formed length
+	body = {"user": {"id": "U1"}, "trigger_id": "trg-1"}
+	action = {"action_id": "log_meeting_outcome", "value": json.dumps(value)}
+
+	await listeners.handle_log_meeting_outcome(ack, body, respond, action, client)
+
+	client.views_open.assert_not_called()
+	assert "expired or was altered" in respond.call_args.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_log_outcome_malformed_value(monkeypatch):
+	ack, respond, client = AsyncMock(), AsyncMock(), AsyncMock()
+	body = {"user": {"id": "U1"}, "trigger_id": "trg-1"}
+	action = {"action_id": "log_meeting_outcome", "value": "{not json"}
+	await listeners.handle_log_meeting_outcome(ack, body, respond, action, client)
+	ack.assert_awaited_once()
+	assert "Malformed" in respond.call_args.kwargs["text"]
+	client.views_open.assert_not_called()

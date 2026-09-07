@@ -11,6 +11,7 @@ not a failure (ticket 08).
 import logging
 from dataclasses import dataclass
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.services.compliance_gate import evaluate_touch_gate
@@ -44,19 +45,19 @@ _REPLY_TO_STEP: dict[int, int] = {3: 1, 5: 3}
 class TouchResult:
     contact_id: int
     touch_step: int
-    # SENT | COMPLIANCE_BLOCK | NO_MAILBOX | VOLUME_CAP | ALREADY_CLAIMED | SEND_FAILED | RECLAIMED
+    # SENT | COMPLIANCE_BLOCK | NO_MAILBOX | VOLUME_CAP | ALREADY_CLAIMED
+    # | SEND_FAILED | RECLAIMED | NO_CONTENT
     outcome: str
     message_id: str = ""
 
 
-def _compose_touch(touch_step: int, contact) -> tuple[str, str, str]:
-    """Return (subject, body, template_version). Real copy is LLM-generated and
-    owned upstream (Dev 2, ticket 19) — this is a minimal placeholder so the
-    send path is exercisable. template_version names the generator variant."""
-    template_version = f"t{touch_step}_v1"
-    subject = f"[touch {touch_step}] Owner Visibility — {getattr(contact, 'company_id', '')}"
-    body = f"Placeholder body for touch {touch_step}. Real copy generated upstream."
-    return subject, body, template_version
+def _reassert_tenant(session: Session, client_id: str) -> None:
+    """Re-issue SET LOCAL app.current_client_id after a commit. SET LOCAL is
+    transaction-scoped, so once we commit the claim (finding #1 durability) the
+    RLS binding is gone and the next statement (mark_sent/mark_failed) would run
+    unscoped. Re-assert it on the fresh transaction."""
+    if client_id:
+        session.execute(text("SET LOCAL app.current_client_id = :cid"), {"cid": client_id})
 
 
 def dispatch_touch(
@@ -66,9 +67,32 @@ def dispatch_touch(
     touch_step: int,
     run_id: str = "",
     sender: EmailSender | None = None,
+    *,
+    subject: str | None = None,
+    body: str | None = None,
+    template_version: str = "",
 ) -> TouchResult:
-    """Run compliance, pick an under-cap mailbox, claim the slot, send, resolve."""
+    """Run compliance, pick an under-cap mailbox, claim the slot, send, resolve.
+
+    Content is fail-closed (finding #5): approved subject+body must be supplied
+    by the caller (from the work-order payload). If either is missing we return
+    NO_CONTENT and never send — placeholder/internal copy can no longer reach a
+    real contact. Real copy is LLM-generated upstream (Dev 2, ticket 19).
+
+    Durability (finding #1): the SENDING claim is committed in its own
+    transaction BEFORE the external send, then SENT/FAILED is committed in a
+    separate transaction. A crash after the send commits nothing new, leaving a
+    durable SENDING row for the stuck-dispatch sweep to reconcile — the UNIQUE
+    (run_id, touch_step) claim then blocks any re-send.
+    """
     sender = sender or build_email_sender()
+
+    if not subject or not body:
+        logger.error(
+            "sequence_orchestrator: NO_CONTENT contact_id=%s touch=%d — approved subject/body absent; not sending",
+            contact.contact_id, touch_step,
+        )
+        return TouchResult(contact_id=contact.contact_id, touch_step=touch_step, outcome="NO_CONTENT")
 
     gate = evaluate_touch_gate(session, contact, client_id)
     if not gate.ready:
@@ -88,13 +112,8 @@ def dispatch_touch(
         logger.error("sequence_orchestrator: no mailbox for client_id=%s — %s", client_id, exc)
         return TouchResult(contact_id=contact.contact_id, touch_step=touch_step, outcome="NO_MAILBOX")
 
-    dispatch_id = claim_touch(session, client_id, run_id, touch_step, mailbox.mailbox_id)
-    if dispatch_id is None:
-        return TouchResult(contact_id=contact.contact_id, touch_step=touch_step, outcome="ALREADY_CLAIMED")
-
-    subject, body, template_version = _compose_touch(touch_step, contact)
-
     # Look up the prior touch's Message-ID so email clients thread the reply.
+    # Done BEFORE the claim commit so it shares the RLS-scoped read transaction.
     in_reply_to: str | None = None
     if run_id and touch_step in _REPLY_TO_STEP:
         in_reply_to = get_touch_message_id(session, run_id, _REPLY_TO_STEP[touch_step])
@@ -103,9 +122,19 @@ def dispatch_touch(
                 "sequence_orchestrator: threading touch=%d in_reply_to=%s", touch_step, in_reply_to
             )
 
-    # INSERT SENDING (done) → send → UPDATE SENT/FAILED. The row is always
-    # resolved before returning, so nothing is left stuck in SENDING by the
-    # happy or the error path (ticket 22).
+    dispatch_id = claim_touch(session, client_id, run_id, touch_step, mailbox.mailbox_id)
+    if dispatch_id is None:
+        return TouchResult(contact_id=contact.contact_id, touch_step=touch_step, outcome="ALREADY_CLAIMED")
+
+    # Durability boundary (finding #1): commit the SENDING claim in its OWN
+    # transaction before the external send. If the worker dies after SMTP
+    # accepts but before we record SENT, this row survives as SENDING (not
+    # rolled back), the stuck-dispatch sweep alerts, and the UNIQUE claim blocks
+    # any re-send. Re-assert the tenant binding for the post-commit transaction.
+    session.commit()
+    _reassert_tenant(session, client_id)
+
+    # send → UPDATE SENT/FAILED, each in the fresh (post-claim-commit) txn.
     try:
         result = sender.send(
             from_address=mailbox.mailbox_address,
@@ -137,6 +166,7 @@ def dispatch_touch(
         mailbox_id=mailbox.mailbox_id,
         sending_domain=mailbox.sending_domain,
         template_version=template_version,
+        recipient_email=contact.email,
     )
 
     if touch_step >= _FINAL_TOUCH_STEP and run_id:

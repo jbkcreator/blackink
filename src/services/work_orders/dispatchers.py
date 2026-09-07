@@ -43,6 +43,9 @@ def dispatch_email_touch(order: WorkOrder) -> dict:
 	run_id = order.payload.get("run_id", "")
 	touch_step = int(order.payload.get("touch_step", 0))
 	contact_id = int(order.entity_id)
+	subject = order.payload.get("subject")
+	body = order.payload.get("body")
+	template_version = order.payload.get("template_version", "")
 
 	with get_db_context(client_id=order.client_id) as session:
 		row = session.execute(
@@ -51,9 +54,12 @@ def dispatch_email_touch(order: WorkOrder) -> dict:
 		).fetchone()
 		if row is None:
 			logger.error("dispatch_email_touch: contact_id=%s not found", contact_id)
-			return {"outcome": "CONTACT_NOT_FOUND", "contact_id": contact_id}
+			return {"outcome": "CONTACT_NOT_FOUND", "contact_id": contact_id, "fail": True}
 
-		result = dispatch_touch(session, row, order.client_id, touch_step=touch_step, run_id=run_id)
+		result = dispatch_touch(
+			session, row, order.client_id, touch_step=touch_step, run_id=run_id,
+			subject=subject, body=body, template_version=template_version,
+		)
 
 	logger.info(
 		"dispatch_email_touch: action_id=%s contact_id=%s touch=%d outcome=%s",
@@ -66,14 +72,40 @@ def dispatch_email_touch(order: WorkOrder) -> dict:
 		"run_id": run_id,
 		"message_id": result.message_id,
 	}
-	# VOLUME_CAP is transient and self-healing — signal the sweep to DEFER the
-	# order (SNOOZED + pushed due_at) instead of finalising it (ticket 08).
-	if result.outcome == "VOLUME_CAP":
+	# Explicit outcome routing (finding #3) — only SENT (and the terminal
+	# no-send verdicts COMPLIANCE_BLOCK/ALREADY_CLAIMED) may become DONE. Every
+	# other outcome must NOT be silently finalised as success:
+	#   defer  → transient/self-healing availability; SNOOZE + retry later.
+	#   fail   → send failed or ambiguous; route to FAILED + #blackink-qa alert
+	#            for manual reconciliation (never drop the touch silently).
+	if result.outcome in _DEFER_OUTCOMES:
 		receipt["defer"] = True
+	elif result.outcome in _FAIL_OUTCOMES:
+		receipt["fail"] = True
 	return receipt
 
+
+def dispatch_manual_task(order: WorkOrder) -> dict:
+	"""DIAL_TASK / LINKEDIN_TASK — human-performed touches (phone, LinkedIn).
+
+	There is no automated channel: the sequence_sweep posts the card to the
+	relevant Slack channel, a human performs the touch offline, and Approving
+	the card lands here. This dispatcher only records completion — it does not
+	send anything — closing the state machine so the row cannot sit QUEUED
+	forever (finding #4)."""
+	logger.info(
+		"[dispatchers] manual task acknowledged action_id=%s action_class=%s contact=%s",
+		order.action_id, order.action_class, order.entity_id,
+	)
+	return {"dispatcher": "manual", "action_class": order.action_class, "note": "manual touch acknowledged"}
+
+
+# Outcomes from dispatch_touch that must NOT finalise a work order as DONE.
+_DEFER_OUTCOMES = {"VOLUME_CAP", "NO_MAILBOX"}          # transient availability — retry
+_FAIL_OUTCOMES = {"SEND_FAILED", "RECLAIMED", "NO_CONTENT"}  # ambiguous/failed — reconcile
 
 DISPATCHERS: Dict[str, Callable[[WorkOrder], dict]] = {
 	"noop": noop_dispatch,
 	"setter": dispatch_email_touch,
+	"manual": dispatch_manual_task,
 }

@@ -146,23 +146,61 @@ class SmtpEmailSender:
         return SendResult(message_id=message_id)
 
 
-def build_email_sender() -> EmailSender:
-    """Return a real SmtpEmailSender when SMTP is configured, else the stub.
+class EmailSenderNotConfigured(RuntimeError):
+    """Raised when EMAIL_SENDER_MODE=smtp but SMTP creds are absent. Fail
+    closed rather than silently degrade to the (transmit-nothing) stub —
+    review finding #2."""
 
-    Wiring real client creds is a config change (set SMTP_HOST + SMTP_PASSWORD
-    + friends), not a code change — dispatch_touch calls this by default."""
+
+def _build_smtp_sender(s) -> SmtpEmailSender:
+    return SmtpEmailSender(
+        host=s.smtp_host,
+        port=s.smtp_port,
+        password=s.smtp_password.get_secret_value(),
+        username=s.smtp_username,
+        use_tls=s.smtp_use_tls,
+        reply_to=s.email_reply_to,
+        bcc=s.email_bcc,
+    )
+
+
+def build_email_sender() -> EmailSender:
+    """Pick the sender per EMAIL_SENDER_MODE (review finding #2).
+
+    - "stub": always the StubEmailSender (transmits nothing) — tests/local dev.
+    - "smtp": require SMTP config; raise EmailSenderNotConfigured otherwise, so
+      a mis-deployed production box fails loudly instead of recording
+      undelivered mail as SENT.
+    - "auto" (default): SmtpEmailSender when SMTP is configured, else the stub —
+      wiring real creds stays a config change, not a code change.
+    """
     from config.settings import get_settings
 
     s = get_settings()
-    if s.smtp_host and s.smtp_password:
-        return SmtpEmailSender(
-            host=s.smtp_host,
-            port=s.smtp_port,
-            password=s.smtp_password.get_secret_value(),
-            username=s.smtp_username,
-            use_tls=s.smtp_use_tls,
-            reply_to=s.email_reply_to,
-            bcc=s.email_bcc,
+    mode = (s.email_sender_mode or "auto").lower()
+    configured = bool(s.smtp_host and s.smtp_password)
+
+    if mode == "stub":
+        logger.info("build_email_sender: EMAIL_SENDER_MODE=stub — using StubEmailSender")
+        return StubEmailSender()
+    if mode == "smtp":
+        if not configured:
+            raise EmailSenderNotConfigured(
+                "EMAIL_SENDER_MODE=smtp but SMTP_HOST/SMTP_PASSWORD are not set — "
+                "refusing to fall back to the stub (would record undelivered mail as SENT)."
+            )
+        return _build_smtp_sender(s)
+    # auto
+    if configured:
+        return _build_smtp_sender(s)
+    # Fail-closed in production: "auto" must NOT silently degrade to the stub on
+    # a real deployment (would record undelivered mail as SENT). Only dev/test/CI
+    # may fall back. Set EMAIL_SENDER_MODE=stub to opt in explicitly.
+    if s.is_production:
+        raise EmailSenderNotConfigured(
+            "EMAIL_SENDER_MODE=auto with SMTP unconfigured is not allowed in "
+            f"ENVIRONMENT={s.environment!r} — set SMTP_HOST/SMTP_PASSWORD, or "
+            "EMAIL_SENDER_MODE=stub to send nothing on purpose."
         )
-    logger.info("build_email_sender: SMTP not configured — using StubEmailSender")
+    logger.info("build_email_sender: SMTP not configured (mode=auto, non-production) — using StubEmailSender")
     return StubEmailSender()
