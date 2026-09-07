@@ -79,6 +79,15 @@ TENANT_POLICIES = {
 	# Addendum to Subtask 3.2.1 — "Log Outcome" trigger card. Carries its own
 	# client_id column (copied from bookings.client_id at schedule time).
 	"meeting_outcome_prompt_jobs": {"mode": "direct", "column": "client_id"},
+	# Subtask 1.1.1 — Appointment operations. The blueprint's printed
+	# `client_id UUID REFERENCES companies` is adapted to this repo's real
+	# tenant boundary: a VARCHAR(40) client_id added directly to all four
+	# appointment tables (see apply_appointment_ops.py), so each is scoped at
+	# the row it is written on rather than through a parent join.
+	"appointments": {"mode": "direct", "column": "client_id"},
+	"confirmation_logs": {"mode": "direct", "column": "client_id"},
+	"appointment_dispositions": {"mode": "direct", "column": "client_id"},
+	"appointment_disputes": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
