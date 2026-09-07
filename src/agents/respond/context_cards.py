@@ -109,10 +109,10 @@ def compute_card_hash(db_id: int, client_id: str, intent: str, card_posted_at_is
 def _fetch_contact(db: Session, sender_email: str) -> Optional[dict[str, Any]]:
     row = db.execute(
         text(
-            "SELECT c.id, c.first_name, c.last_name, c.email, "
-            "       co.name AS company_name, co.door_count_est, co.county_slug, co.id AS company_id "
+            "SELECT c.contact_id, c.first_name, c.last_name, c.email, "
+            "       co.company_name, co.door_count_est, co.county_slug, co.company_id "
             "FROM contacts c "
-            "JOIN companies co ON co.id = c.company_id "
+            "JOIN companies co ON co.company_id = c.company_id "
             "WHERE c.email = :email "
             "LIMIT 1"
         ),
@@ -359,7 +359,7 @@ async def post_context_card(
             company_id = (contact or {}).get("company_id")
             ovs        = _fetch_ovs(db, company_id)
             prior_msgs = _fetch_prior_messages(db, client_id, sender_email, db_id)
-            engagement = _fetch_engagement(db, (contact or {}).get("id"))
+            engagement = _fetch_engagement(db, (contact or {}).get("contact_id"))
             body_row   = db.execute(
                 text("SELECT body_text, sender_name FROM inbound_messages WHERE id = :id"),
                 {"id": db_id},
