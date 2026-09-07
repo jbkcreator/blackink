@@ -3,10 +3,16 @@
 Reads from the respond:inbound Redis Stream, loads the inbound_messages DB
 row, classifies the intent, writes the result back, then routes:
 
-  UNSUBSCRIBE  → SUPPRESSED  + Slack #command alert
-  LEGAL_GRIEF  → ESCALATED   + Slack #command urgent alert
-  LATER        → DEFERRED    (contact next-touch handled by reply dispatcher)
-  all others   → ROUTED      (context card posting handled by reply dispatcher)
+  UNSUBSCRIBE  → SUPPRESSED  + contact suppressed + Slack #command alert
+  LEGAL_GRIEF  → ESCALATED   + CLIENT relay halt  + Slack #command P0 alert
+  COMPLAINT    → ROUTED      + domain suppressed  + sequence halted + #blackink-qa alert
+  HOT_LEAD     → ROUTED      + context card       + sequence halted
+  WHALE_OWNER  → ROUTED      + context card
+  OBJECTION    → ROUTED      + context card
+  QUESTION     → ROUTED      + requires_human_review=TRUE if confidence < 0.90
+  PARTNER      → ROUTED      + Slack #client-growth notice
+  LATER        → DEFERRED
+  NURTURE      → ROUTED
 
 Control flow per iteration:
   1. read_batch()      — claim one message from the stream.
@@ -14,7 +20,8 @@ Control flow per iteration:
   3. Mark PROCESSING   — optimistic status update before the LLM call.
   4. classify()        — deterministic fast-path or single Haiku call.
   5. _route()          — write terminal/intermediate status + fire Slack if needed.
-  6. ack()             — only after the DB write commits.
+  6. log_event()       — inbound_reply_classified event.
+  7. ack()             — only after the DB write commits.
 
 Stale-message sweep runs every CLAIM_SWEEP_EVERY_N_LOOPS iterations.
 SIGINT/SIGTERM: finish in-flight message, then exit.
@@ -39,6 +46,7 @@ from src.agents.respond.classifier import ClassificationResult, classify
 from src.agents.respond.context_cards import CONTEXT_CARD_INTENTS, post_context_card
 from src.agents.respond.intents import Intent
 from src.core.database import Database
+from src.services.events import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +99,7 @@ def _write_result(
     result: ClassificationResult,
     final_status: str,
     sla_due_at: Optional[datetime] = None,
+    requires_human_review: bool = False,
 ) -> None:
     db.execute(
         text(
@@ -100,7 +109,8 @@ def _write_result(
             "    intent_confidence = :confidence, "
             "    classified_at = NOW(), "
             "    classification_meta = :meta ::jsonb, "
-            "    sla_due_at = :sla_due_at "
+            "    sla_due_at = :sla_due_at, "
+            "    requires_human_review = :human_review "
             "WHERE id = :id"
         ),
         {
@@ -114,6 +124,7 @@ def _write_result(
                 **result.meta,
             }),
             "sla_due_at": sla_due_at,
+            "human_review": requires_human_review,
         },
     )
 
@@ -131,6 +142,22 @@ async def _post_slack_alert(channel_key: str, text_body: str) -> None:
         logger.warning("respond.worker: Slack alert failed: %s", exc)
 
 
+def _halt_sequence(db: Any, sender_email: str, client_id: str) -> None:
+    """Set HALTED on the contact's active sequence run (if any)."""
+    db.execute(
+        text(
+            "UPDATE sequence_runs sr "
+            "SET status = 'HALTED', updated_at = NOW() "
+            "FROM contacts c "
+            "WHERE c.contact_id = sr.contact_id "
+            "  AND lower(c.email) = :email "
+            "  AND sr.client_id = :client_id "
+            "  AND sr.status = 'ACTIVE'"
+        ),
+        {"email": sender_email.strip().lower(), "client_id": client_id},
+    )
+
+
 def _route(
     db: Any,
     db_id: int,
@@ -146,32 +173,74 @@ def _route(
         received_at_dt = datetime.now(timezone.utc)
 
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
-    sla_due_at = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
-    _write_result(db, db_id, result, final_status, sla_due_at=sla_due_at)
+    sla_due_at   = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
 
+    # QUESTION: flag for human review when confidence is below threshold.
+    requires_human_review = (
+        result.intent == Intent.QUESTION and result.confidence < 0.90
+    )
+
+    # Pre-commit side-effects that must be atomic with the status write.
     if result.intent == Intent.UNSUBSCRIBE:
-        # Suppress the contact atomically with the status write so a crash
-        # between the two can't leave the contact reachable.
         from src.services.email_suppression import suppress_by_email
         suppress_by_email(db, sender_email, reason="inbound_opt_out")
 
+    elif result.intent == Intent.COMPLAINT:
+        from src.services.email_suppression import suppress_by_domain
+        domain = sender_email.split("@")[-1].strip().lower() if "@" in sender_email else ""
+        if domain:
+            suppress_by_domain(db, domain, reason="inbound_complaint")
+        _halt_sequence(db, sender_email, client_id)
+
+    elif result.intent == Intent.HOT_LEAD:
+        _halt_sequence(db, sender_email, client_id)
+
+    _write_result(db, db_id, result, final_status, sla_due_at=sla_due_at,
+                  requires_human_review=requires_human_review)
     db.commit()
 
+    # Post-commit Slack side-effects (non-transactional).
     if result.intent == Intent.UNSUBSCRIBE:
-        msg = (
+        asyncio.run(_post_slack_alert(
+            "command",
             f":no_entry: *Opt-out received*\n"
             f"Client: `{client_id}` | Sender: `{sender_email}`\n"
-            f"Message ID: `{db_id}` — marked SUPPRESSED, contact suppressed."
-        )
-        asyncio.run(_post_slack_alert("command", msg))
+            f"Message ID: `{db_id}` — marked SUPPRESSED, contact suppressed.",
+        ))
 
     elif result.intent == Intent.LEGAL_GRIEF:
-        msg = (
+        from src.agents.relay.halt_service import issue_halt
+        try:
+            issue_halt(
+                scope="CLIENT",
+                scope_id=client_id,
+                reason=f"Legal threat from {sender_email} — inbound_message id={db_id}",
+                issued_by="respond_worker",
+            )
+        except Exception:
+            logger.exception("respond.worker: relay halt failed for LEGAL_GRIEF db_id=%s", db_id)
+        asyncio.run(_post_slack_alert(
+            "command",
             f":rotating_light: *LEGAL THREAT — immediate review required*\n"
             f"Client: `{client_id}` | Sender: `{sender_email}`\n"
-            f"Message ID: `{db_id}` — marked ESCALATED. Halt all outreach to this sender manually."
-        )
-        asyncio.run(_post_slack_alert("command", msg))
+            f"Message ID: `{db_id}` — CLIENT halt issued. All outreach halted.",
+        ))
+
+    elif result.intent == Intent.COMPLAINT:
+        asyncio.run(_post_slack_alert(
+            "qa",
+            f":loudspeaker: *Complaint received*\n"
+            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+            f"Message ID: `{db_id}` — domain suppressed, sequence halted.",
+        ))
+
+    elif result.intent == Intent.PARTNER:
+        asyncio.run(_post_slack_alert(
+            "client-growth",
+            f":handshake: *Partner inquiry*\n"
+            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+            f"Message ID: `{db_id}` — route to Referral Agent.",
+        ))
 
     elif result.intent in CONTEXT_CARD_INTENTS and sla_due_at:
         card_meta = asyncio.run(post_context_card(
@@ -249,6 +318,24 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
             received_at=row.get("received_at") or datetime.now(timezone.utc),
             result=result,
         )
+
+    try:
+        log_event(
+            row["client_id"],
+            "inbound_reply_classified",
+            entity_type="inbound_message",
+            entity_id=str(msg.db_id),
+            payload={
+                "detected_intent":   result.intent.value,
+                "confidence_score":  result.confidence,
+                "final_status":      final_status,
+                "objection_subtype": result.objection_subtype,
+                "path":              result.meta.get("path", "llm"),
+            },
+            actor="respond_worker",
+        )
+    except Exception:
+        logger.exception("respond.worker: log_event failed for db_id=%s", msg.db_id)
 
     logger.info(
         "respond.worker: db_id=%s client_id=%s intent=%s confidence=%.2f status=%s",

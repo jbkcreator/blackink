@@ -150,6 +150,7 @@ class AppSettings(BaseSettings):
 	sales_replies_slack_channel: Optional[str] = Field(default=None, env="SALES_REPLIES_SLACK_CHANNEL")
 	dial_tasks_slack_channel: Optional[str] = Field(default=None, env="DIAL_TASKS_SLACK_CHANNEL")
 	blackink_economics_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_ECONOMICS_SLACK_CHANNEL")
+	client_growth_slack_channel: Optional[str] = Field(default=None, env="CLIENT_GROWTH_SLACK_CHANNEL")
 	# Fail-closed workspace-wide approver allowlist — Slack user IDs,
 	# comma-separated (e.g. "U012ABC,U034DEF"). src.services.slack.auth.
 	# approver_authorized() treats an empty/unset list as "nobody

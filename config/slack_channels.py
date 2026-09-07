@@ -49,6 +49,9 @@ CHANNEL_REGISTRY: dict[str, ChannelSpec] = {
 	"economics": ChannelSpec(
 		name="#blackink-economics", settings_field="blackink_economics_slack_channel", interactive=False
 	),
+	"client-growth": ChannelSpec(
+		name="#client-growth", settings_field="client_growth_slack_channel", interactive=False
+	),
 }
 
 

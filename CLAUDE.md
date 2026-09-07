@@ -56,6 +56,7 @@ PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
+PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
