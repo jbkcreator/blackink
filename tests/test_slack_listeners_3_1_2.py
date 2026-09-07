@@ -26,6 +26,7 @@ from src.services.slack.listeners import (
     _dial_task_content_blocks,
     _linkedin_action_buttons,
     _linkedin_task_content_blocks,
+    _post_dial_task_after_touch1_approval,
     sales_reply_content_blocks,
     _simple_action_button_blocks,
 )
@@ -412,3 +413,58 @@ def test_sales_reply_body_blockquoted():
     message_section = next((s for s in text_sections if "> Hello" in str(s)), None)
     assert message_section is not None
     assert "> World" in str(message_section)
+
+
+# ── PR #26 finding 2: dial task must be created for normally-enrolled Touch 1 ──
+
+
+def _touch1_order(payload, entity_id="42", client_id="c1"):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        payload=payload, entity_id=entity_id, client_id=client_id, action_id="a1",
+    )
+
+
+def _fake_db_ctx(contact_row):
+    session = MagicMock()
+    result = MagicMock()
+    result.mappings.return_value.first.return_value = contact_row
+    session.execute.return_value = result
+    cm = MagicMock()
+    cm.__enter__ = lambda s: session
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
+def test_dial_task_created_when_touch1_payload_lacks_contact_id():
+    """enroll_contact()'s Touch-1 payload has only {run_id, touch_step} — the
+    dial poster must fall back to order.entity_id, not early-return (finding 2)."""
+    contact_row = {
+        "first_name": "Jane", "last_name": "Doe", "phone": "+18135550100",
+        "company_name": "Acme PM", "county_slug": "hillsborough",
+        "company_id": "co-1", "door_count_est": 120,
+    }
+    order = _touch1_order(payload={"run_id": "run-1", "touch_step": 1})
+    with patch("src.services.slack.listeners.get_db_context", return_value=_fake_db_ctx(contact_row)), \
+         patch("src.services.slack.listeners.fetch_latest_ovs", return_value=None), \
+         patch("src.services.slack.listeners.wo.enqueue") as mock_enqueue, \
+         patch("src.services.slack.listeners.post_work_order_card", new_callable=AsyncMock) as mock_post:
+        mock_enqueue.return_value = object()
+        import asyncio
+        asyncio.run(_post_dial_task_after_touch1_approval(order))
+
+    mock_enqueue.assert_called_once()
+    kwargs = mock_enqueue.call_args.kwargs
+    assert kwargs["action_class"] == "DIAL_TASK"
+    assert kwargs["entity_id"] == "42"          # fell back to order.entity_id
+    assert kwargs["idempotency_key"] == "seq:run-1:touch:2"
+    mock_post.assert_awaited_once()
+
+
+def test_dial_task_skipped_when_no_run_id():
+    """Still guards the genuinely-unusable case: no run_id → no enqueue."""
+    order = _touch1_order(payload={"touch_step": 1})  # no run_id
+    with patch("src.services.slack.listeners.wo.enqueue") as mock_enqueue:
+        import asyncio
+        asyncio.run(_post_dial_task_after_touch1_approval(order))
+    mock_enqueue.assert_not_called()

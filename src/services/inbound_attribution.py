@@ -167,7 +167,14 @@ def _attribute_by_message_id(
     client_id: str,
     message_id: str,
 ) -> Optional[AttributionResult]:
-    """Tier 1: In-Reply-To header → sequence_touch_dispatches → contact."""
+    """Tier 1: In-Reply-To header → sequence_touch_dispatches → contact.
+
+    The dispatch MUST belong to the same client the inbound alias resolved to
+    (`AND std.client_id = :client_id`). Without that guard a reply routed to
+    client B's alias but carrying a Message-ID minted for client A would be
+    attributed to — and expose an opt-out action against — client A's contact:
+    a cross-tenant leak. A Message-ID that belongs to another tenant is treated
+    as no tier-1 match (falls through to tier-2 / unattributed)."""
     row = session.execute(
         text(
             "SELECT std.run_id::text, std.touch_step, std.client_id, "
@@ -179,9 +186,10 @@ def _attribute_by_message_id(
             "JOIN contacts c ON c.contact_id = sr.contact_id "
             "JOIN companies co ON co.company_id = c.company_id "
             "WHERE std.message_id = :message_id AND std.status = 'SENT' "
+            "  AND std.client_id = :client_id "
             "LIMIT 1"
         ),
-        {"message_id": message_id},
+        {"message_id": message_id, "client_id": client_id},
     ).mappings().first()
 
     if row is None:
@@ -199,7 +207,10 @@ def _attribute_by_message_id(
         row["contact_id"],
     )
     return AttributionResult(
-        client_id=row["client_id"],  # use the client_id from the dispatch, not alias
+        # Alias-derived client, not the dispatch row's — the query already
+        # guarantees they are equal, and pinning to the alias client keeps the
+        # tenant boundary explicit at the point the result is built.
+        client_id=client_id,
         contact_id=row["contact_id"],
         run_id=row["run_id"],
         touch_step=row["touch_step"],

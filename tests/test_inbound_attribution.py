@@ -151,8 +151,35 @@ def test_attribute_tier1_in_reply_to_match():
     assert result.contact_name == "Jane Doe"
     assert result.firm_name == "Acme PM"
     assert result.firm_domain == "acmepm.com"
-    # client_id comes from the dispatch row
-    assert result.client_id == "client-from-dispatch"
+    # client_id is pinned to the ALIAS client, never the dispatch row's — the
+    # tier-1 query also filters std.client_id = alias, so they are equal anyway
+    # (PR #26 finding 1). The tier-1 bind must carry the alias client_id.
+    assert result.client_id == "client-alias"
+    tier1_params = session.execute.call_args_list[0].args[1]
+    assert tier1_params["client_id"] == "client-alias"
+
+
+def test_attribute_tier1_does_not_cross_tenant():
+    """A Message-ID minted for another tenant must NOT attribute to that tenant.
+
+    The tier-1 query is scoped `AND std.client_id = :alias`, so a dispatch
+    belonging to a different client yields no row — attribution falls through
+    to tier-2 and, failing that, unattributed. Modeled here by the DB returning
+    no tier-1 row (the guard filtered it) and no tier-2 match."""
+    session = _session_sequence([None, None])  # tier1 filtered out, tier2 no match
+
+    result = attribute(
+        session,
+        client_id="client-B",
+        in_reply_to="<msg-id-belongs-to-client-A@example.com>",
+        from_address="someone@other.com",
+    )
+
+    assert result.attribution_status != "attributed"
+    assert result.contact_id is None
+    # The tier-1 query was scoped to the alias client, not left global.
+    tier1_params = session.execute.call_args_list[0].args[1]
+    assert tier1_params["client_id"] == "client-B"
 
 
 # ── attribute — tier 2 (sender email) ────────────────────────────────────────

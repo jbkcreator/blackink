@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, ".")
 
@@ -28,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 _EMAIL_TOUCH_ACTION = "DISPATCH_EMAIL_TOUCH"
 _LINKEDIN_TASK_ACTION = "LINKEDIN_TASK"
+
+# Compliance-block handling for LinkedIn touches (PR #26 finding 3). A block is
+# either PERMANENT (opt-out / suppression — never self-resolves) or RETRYABLE
+# (e.g. a DNC ABSTAIN that may clear once a vendor is wired). A permanent block
+# is terminally SKIPPED so due_batch never re-selects it; a retryable block is
+# deferred by a bounded backoff so it is re-checked at most once per interval
+# (not every sweep tick), and terminally SKIPPED once the retry window is spent.
+_LINKEDIN_RETRY_BACKOFF = timedelta(hours=6)
+_LINKEDIN_MAX_RETRY_AGE = timedelta(days=3)
 
 # Every touch action class the sweep surfaces, mapped to its Slack channel key
 # (config/slack_channels.py). Without DIAL_TASK/LINKEDIN_TASK here they would
@@ -81,10 +91,42 @@ async def _post_due_linkedin_card(order) -> bool:
 
         gate = evaluate_touch_gate(session, contact, order.client_id)
         if not gate.ready:
+            # Permanent = opt-out / suppression (never self-resolves). Everything
+            # else is treated as retryable, but bounded: once the order has been
+            # around longer than _LINKEDIN_MAX_RETRY_AGE it is terminally skipped
+            # too, so nothing loops forever.
+            now = datetime.now(timezone.utc)
+            permanent = bool(getattr(contact, "is_opted_out", False) or getattr(contact, "suppression_state", False))
+            order_created = getattr(order, "created_at", None)
+            exhausted = order_created is not None and (now - order_created) > _LINKEDIN_MAX_RETRY_AGE
+            terminal = permanent or exhausted
+            disposition = "SKIPPED_PERMANENT" if permanent else ("SKIPPED_RETRY_EXHAUSTED" if exhausted else "DEFERRED")
+
             logger.info(
-                "sequence_sweep: LINKEDIN_TASK compliance block contact_id=%s reasons=%s — skipping",
-                contact_id, gate.blocked_reasons,
+                "sequence_sweep: LINKEDIN_TASK compliance block contact_id=%s reasons=%s disposition=%s",
+                contact_id, gate.blocked_reasons, disposition,
             )
+            # Status change and the audit event share ONE transaction, so a
+            # terminally-skipped order can never re-emit the event on a later
+            # tick (the guarded WHERE status='QUEUED' makes the SKIP idempotent).
+            if terminal:
+                session.execute(
+                    text(
+                        "UPDATE agent_work_orders "
+                        "SET status = 'SKIPPED', decided_by = 'sequence_sweep:compliance', "
+                        "    decided_at = NOW(), updated_at = NOW() "
+                        "WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED'"
+                    ),
+                    {"action_id": str(order.action_id), "client_id": order.client_id},
+                )
+            else:
+                session.execute(
+                    text(
+                        "UPDATE agent_work_orders SET due_at = :next_due, updated_at = NOW() "
+                        "WHERE action_id = :action_id AND client_id = :client_id AND status = 'QUEUED'"
+                    ),
+                    {"next_due": now + _LINKEDIN_RETRY_BACKOFF, "action_id": str(order.action_id), "client_id": order.client_id},
+                )
             session.execute(
                 text(
                     "INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
@@ -98,6 +140,7 @@ async def _post_due_linkedin_card(order) -> bool:
                         "touch_step": touch_step,
                         "action_class": _LINKEDIN_TASK_ACTION,
                         "blocked_reasons": gate.blocked_reasons,
+                        "disposition": disposition,
                     }),
                 },
             )

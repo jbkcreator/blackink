@@ -606,7 +606,12 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 	Contact info is looked up synchronously from DB (same pattern as
 	_log_event — get_db_context is sync, safe to call from async context)."""
 	payload = order.payload if isinstance(order.payload, dict) else {}
-	contact_id = payload.get("contact_id")
+	# enroll_contact()'s email-touch payload carries only {run_id, touch_step} —
+	# no contact_id — so fall back to the work order's own entity_id (the
+	# contact id every touch order is keyed to). Without this fallback EVERY
+	# normally-enrolled Touch 1 hit the early return and no dial card was ever
+	# posted (PR #26 finding 2).
+	contact_id = payload.get("contact_id") or order.entity_id
 	run_id = payload.get("run_id")
 	if not contact_id or not run_id:
 		logger.warning(

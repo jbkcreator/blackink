@@ -73,6 +73,93 @@ def test_linkedin_card_skipped_and_logged_when_gate_blocks():
     session.commit.assert_called_once()
 
 
+# ── PR #26 finding 3: blocked LinkedIn tasks must not loop forever ────────────
+
+from datetime import datetime, timedelta, timezone
+
+
+def _order_with_created(created_at, contact_id="55", client_id="client-x"):
+    o = _order(contact_id=contact_id, client_id=client_id)
+    o.created_at = created_at
+    return o
+
+
+def _sql_of(session):
+    return " ".join(str(c.args[0]) for c in session.execute.call_args_list)
+
+
+def _params_of(session):
+    return [c.args[1] for c in session.execute.call_args_list if len(c.args) > 1]
+
+
+def test_permanent_optout_terminally_skips_order():
+    """An opted-out contact → the work order is SKIPPED in the same txn as the
+    event, so due_batch never re-selects it and never re-logs (finding 3)."""
+    contact = SimpleNamespace(contact_id=55, company_id="co-1", is_opted_out=True, suppression_state=False)
+    cm, session = _db_ctx_returning_contact(contact_row=contact)
+    gate = SimpleNamespace(ready=False, blocked_reasons=["email_verified: FAIL - is_opted_out=true"])
+    with patch("src.core.database.get_db_context", return_value=cm), \
+         patch("src.services.compliance_gate.evaluate_touch_gate", return_value=gate), \
+         patch("src.services.slack.listeners.post_work_order_card", new_callable=AsyncMock) as mock_post:
+        import asyncio
+        ok = asyncio.run(sweep._post_due_linkedin_card(_order_with_created(datetime.now(timezone.utc))))
+    assert ok is False
+    mock_post.assert_not_awaited()
+    sql = _sql_of(session)
+    assert "UPDATE agent_work_orders" in sql and "status = 'SKIPPED'" in sql
+    assert "due_at = :next_due" not in sql  # not merely deferred
+    assert '"disposition": "SKIPPED_PERMANENT"' in sql or "SKIPPED_PERMANENT" in json_payloads(session)
+    session.commit.assert_called_once()
+
+
+def test_retryable_block_defers_due_at_without_skipping():
+    """A non-permanent block on a young order defers due_at (bounded backoff),
+    keeping the order QUEUED so it is re-checked at most once per interval."""
+    contact = SimpleNamespace(contact_id=55, company_id="co-1", is_opted_out=False, suppression_state=False)
+    cm, session = _db_ctx_returning_contact(contact_row=contact)
+    gate = SimpleNamespace(ready=False, blocked_reasons=["dnc: ABSTAIN - unknown"])
+    with patch("src.core.database.get_db_context", return_value=cm), \
+         patch("src.services.compliance_gate.evaluate_touch_gate", return_value=gate), \
+         patch("src.services.slack.listeners.post_work_order_card", new_callable=AsyncMock):
+        import asyncio
+        ok = asyncio.run(sweep._post_due_linkedin_card(_order_with_created(datetime.now(timezone.utc))))
+    assert ok is False
+    sql = _sql_of(session)
+    assert "due_at = :next_due" in sql
+    assert "status = 'SKIPPED'" not in sql
+    session.commit.assert_called_once()
+
+
+def test_retryable_block_terminally_skips_once_window_exhausted():
+    """A non-permanent block on an order older than the retry window is
+    terminally SKIPPED — bounded, never retried forever."""
+    contact = SimpleNamespace(contact_id=55, company_id="co-1", is_opted_out=False, suppression_state=False)
+    cm, session = _db_ctx_returning_contact(contact_row=contact)
+    gate = SimpleNamespace(ready=False, blocked_reasons=["dnc: ABSTAIN - unknown"])
+    old = datetime.now(timezone.utc) - sweep._LINKEDIN_MAX_RETRY_AGE - timedelta(hours=1)
+    with patch("src.core.database.get_db_context", return_value=cm), \
+         patch("src.services.compliance_gate.evaluate_touch_gate", return_value=gate), \
+         patch("src.services.slack.listeners.post_work_order_card", new_callable=AsyncMock):
+        import asyncio
+        ok = asyncio.run(sweep._post_due_linkedin_card(_order_with_created(old)))
+    assert ok is False
+    sql = _sql_of(session)
+    assert "status = 'SKIPPED'" in sql
+    assert "due_at = :next_due" not in sql
+    session.commit.assert_called_once()
+
+
+def json_payloads(session):
+    """Concatenate the JSON payload bind params passed to session.execute."""
+    import json as _json
+    out = []
+    for p in _params_of(session):
+        val = p.get("payload") if isinstance(p, dict) else None
+        if isinstance(val, str):
+            out.append(val)
+    return " ".join(out)
+
+
 def test_run_sweep_routes_linkedin_and_email(monkeypatch):
     """run_sweep dispatches email orders to _post_due_card and LinkedIn orders
     to _post_due_linkedin_card; dial orders are ignored entirely."""
