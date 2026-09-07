@@ -58,10 +58,27 @@ class MailboxAssignment:
     sending_domain: str  # domain of the associated sending_domains row
 
 
+def _resolve_daily_send_cap(session: Session, client_id: str) -> int:
+    """Per-client rolling-24h send cap, sourced from clients.daily_send_ceiling.
+
+    clients.daily_send_ceiling is the source of truth (per mailbox). It defaults
+    to 0, which we treat as "unset" and fall back to DEFAULT_DAILY_SEND_CAP so a
+    freshly-provisioned client is never accidentally floored to zero sends. A
+    positive ceiling overrides the default.
+    """
+    ceiling = session.execute(
+        text("SELECT daily_send_ceiling FROM clients WHERE client_id = :client_id"),
+        {"client_id": client_id},
+    ).scalar()
+    if ceiling is None or ceiling <= 0:
+        return DEFAULT_DAILY_SEND_CAP
+    return int(ceiling)
+
+
 def get_active_mailbox_for_client(
     session: Session,
     client_id: str,
-    daily_send_cap: int = DEFAULT_DAILY_SEND_CAP,
+    daily_send_cap: Optional[int] = None,
 ) -> MailboxAssignment:
     """Pick the least-recently-used warmed+active+under-cap mailbox for this client.
 
@@ -74,6 +91,10 @@ def get_active_mailbox_for_client(
     that can't send (wayfinder ticket 08). Sends are counted against
     sequence_touch_dispatches (SENDING + SENT rows in the last 24h).
 
+    The cap is per-client: when the caller passes no explicit daily_send_cap it
+    is resolved from clients.daily_send_ceiling (0/NULL → DEFAULT_DAILY_SEND_CAP).
+    An explicit argument still wins (tests, callers that already know the cap).
+
     Uses SELECT FOR UPDATE SKIP LOCKED so concurrent dispatch workers never
     double-pick the same mailbox. Updates last_used_at in the same transaction.
 
@@ -83,6 +104,9 @@ def get_active_mailbox_for_client(
         NoWarmedMailbox: no mailbox has completed warmup yet.
         NoMailboxAvailable: no mailboxes provisioned at all.
     """
+    if daily_send_cap is None:
+        daily_send_cap = _resolve_daily_send_cap(session, client_id)
+
     # Check whether any warmed mailbox exists at all (ignoring domain state),
     # so we can raise a specific cause when domain quarantine is the blocker.
     warmed_count = session.execute(
