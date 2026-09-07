@@ -72,28 +72,34 @@ def record_door_signed(
 	handle.
 	"""
 	try:
-		row = session.execute(
-			text(
-				"INSERT INTO pms_agreements "
-				"(client_id, company_id, owner_contact_id, opportunity_id, pms_property_ref, "
-				" door_count, agreement_source, door_signed_at) "
-				"VALUES (:client_id, :company_id, :owner_contact_id, :opportunity_id, :pms_property_ref, "
-				"        :door_count, :agreement_source, :door_signed_at) "
-				"RETURNING pms_agreement_id"
-			),
-			{
-				"client_id": client_id,
-				"company_id": company_id,
-				"owner_contact_id": owner_contact_id,
-				"opportunity_id": opportunity_id,
-				"pms_property_ref": pms_property_ref,
-				"door_count": door_count,
-				"agreement_source": agreement_source,
-				"door_signed_at": door_signed_at,
-			},
-		).one()
+		with session.begin_nested():
+			row = session.execute(
+				text(
+					"INSERT INTO pms_agreements "
+					"(client_id, company_id, owner_contact_id, opportunity_id, pms_property_ref, "
+					" door_count, agreement_source, door_signed_at) "
+					"VALUES (:client_id, :company_id, :owner_contact_id, :opportunity_id, :pms_property_ref, "
+					"        :door_count, :agreement_source, :door_signed_at) "
+					"RETURNING pms_agreement_id"
+				),
+				{
+					"client_id": client_id,
+					"company_id": company_id,
+					"owner_contact_id": owner_contact_id,
+					"opportunity_id": opportunity_id,
+					"pms_property_ref": pms_property_ref,
+					"door_count": door_count,
+					"agreement_source": agreement_source,
+					"door_signed_at": door_signed_at,
+				},
+			).one()
 	except IntegrityError:
-		session.rollback()
+		# SAVEPOINT rollback (via begin_nested()), NOT session.rollback() — a
+		# bare session.rollback() here would discard the caller's ENTIRE
+		# transaction, including any prior successful work in the same
+		# session (a real bug caught by
+		# tests/test_settlement_live.py::test_exactly_once_billing_across_multiple_appointments_sharing_opportunity
+		# during live-DB verification).
 		logger.info(
 			"settlement.record_door_signed: duplicate agreement (client=%s opportunity=%s door_signed_at=%s) — no-op",
 			client_id, opportunity_id, door_signed_at,
@@ -179,33 +185,37 @@ def open_settlement(
 	plan = compute_split(terms, door_count=agreement.door_count, door_signed_at=agreement.door_signed_at)
 
 	try:
-		row = session.execute(
-			text(
-				"INSERT INTO settlement_transactions "
-				"(client_id, pms_agreement_id, opportunity_id, company_id, offer_code, door_count, "
-				" total_bounty_cents, installment_1_cents, installment_2_cents, "
-				" installment_2_scheduled_for, door_signed_at) "
-				"VALUES (:client_id, :pms_agreement_id, :opportunity_id, :company_id, :offer_code, :door_count, "
-				"        :total_bounty_cents, :installment_1_cents, :installment_2_cents, "
-				"        :installment_2_scheduled_for, :door_signed_at) "
-				"RETURNING transaction_id"
-			),
-			{
-				"client_id": client_id,
-				"pms_agreement_id": pms_agreement_id,
-				"opportunity_id": agreement.opportunity_id,
-				"company_id": agreement.company_id,
-				"offer_code": offer_code,
-				"door_count": agreement.door_count,
-				"total_bounty_cents": plan.total_bounty_cents,
-				"installment_1_cents": plan.installment_1_cents,
-				"installment_2_cents": plan.installment_2_cents,
-				"installment_2_scheduled_for": plan.installment_2_scheduled_for,
-				"door_signed_at": agreement.door_signed_at,
-			},
-		).one()
+		with session.begin_nested():
+			row = session.execute(
+				text(
+					"INSERT INTO settlement_transactions "
+					"(client_id, pms_agreement_id, opportunity_id, company_id, offer_code, door_count, "
+					" total_bounty_cents, installment_1_cents, installment_2_cents, "
+					" installment_2_scheduled_for, door_signed_at) "
+					"VALUES (:client_id, :pms_agreement_id, :opportunity_id, :company_id, :offer_code, :door_count, "
+					"        :total_bounty_cents, :installment_1_cents, :installment_2_cents, "
+					"        :installment_2_scheduled_for, :door_signed_at) "
+					"RETURNING transaction_id"
+				),
+				{
+					"client_id": client_id,
+					"pms_agreement_id": pms_agreement_id,
+					"opportunity_id": agreement.opportunity_id,
+					"company_id": agreement.company_id,
+					"offer_code": offer_code,
+					"door_count": agreement.door_count,
+					"total_bounty_cents": plan.total_bounty_cents,
+					"installment_1_cents": plan.installment_1_cents,
+					"installment_2_cents": plan.installment_2_cents,
+					"installment_2_scheduled_for": plan.installment_2_scheduled_for,
+					"door_signed_at": agreement.door_signed_at,
+				},
+			).one()
 	except IntegrityError:
-		session.rollback()
+		# SAVEPOINT rollback via begin_nested() — see record_door_signed()'s
+		# matching comment; a bare session.rollback() here would also
+		# discard a prior successful open_settlement() call in the same
+		# session/transaction (the exactly-once-billing test's real bug).
 		logger.info(
 			"settlement.open_settlement: duplicate settlement (client=%s opportunity=%s agreement=%s) — no-op",
 			client_id, agreement.opportunity_id, pms_agreement_id,

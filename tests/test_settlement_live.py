@@ -298,7 +298,7 @@ def test_non_poach_claim_survives_agreement_termination(offer, agreement, canary
 	ctx = canary_tenants[CANARY_A]
 	domain = ctx["domain"]
 	with get_system_db_context() as s:
-		record_door_signed(
+		extra_pms_agreement_id = record_door_signed(
 			s, client_id=CANARY_A, opportunity_id=str(uuid.uuid4()), door_signed_at=datetime.now(timezone.utc),
 			agreement_source="PMS_SYNC", company_id=ctx["company_id"], owner_domain=domain,
 		)
@@ -327,6 +327,7 @@ def test_non_poach_claim_survives_agreement_termination(offer, agreement, canary
 
 	with get_owner_db_context() as s:
 		s.execute(text("DELETE FROM client_pm_books WHERE client_id = :cid AND owner_domain = :d"), {"cid": CANARY_A, "d": domain})
+		s.execute(text("DELETE FROM pms_agreements WHERE pms_agreement_id = :id"), {"id": extra_pms_agreement_id})
 
 
 def test_concurrent_claim_installment_2_claims_disjoint_sets(offer, canary_tenants):

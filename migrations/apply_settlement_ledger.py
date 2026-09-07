@@ -195,13 +195,17 @@ DDL = [
 		CONSTRAINT ck_settlement_inst2_charged_at CHECK (
 			(installment_2_status = 'CHARGED') = (installment_2_charged_at IS NOT NULL)
 		),
-		-- Fail-closed evidence-packet gate: a charge (or even the CHARGING/
-		-- SETTLING attempt) cannot be recorded without a published, linked
-		-- packet. Reinforced by the trigger below, which additionally rejects
-		-- the transition (not just the resulting state).
+		-- Fail-closed evidence-packet gate: a charge (SETTLING or CHARGED —
+		-- the states meaning Stripe was actually asked to move money) cannot
+		-- be recorded without a published, linked packet. Deliberately does
+		-- NOT cover CHARGING (the claim/attempt bookkeeping state entered
+		-- before charge.py has had a chance to publish the packet) — see the
+		-- matching comment on the trigger below. Reinforced by the trigger,
+		-- which additionally rejects the transition (not just the resulting
+		-- state).
 		CONSTRAINT ck_settlement_evidence_packet_required CHECK (
-			installment_1_status NOT IN ('CHARGING', 'SETTLING', 'CHARGED')
-			AND installment_2_status NOT IN ('CHARGING', 'SETTLING', 'CHARGED')
+			installment_1_status NOT IN ('SETTLING', 'CHARGED')
+			AND installment_2_status NOT IN ('SETTLING', 'CHARGED')
 			OR evidence_packet_url IS NOT NULL
 		),
 		-- Exactly-once billing (see module docstring).
@@ -220,6 +224,21 @@ DDL = [
 	"""
 	CREATE UNIQUE INDEX IF NOT EXISTS uq_settlement_inst2_invoice
 		ON settlement_transactions(inst2_stripe_invoice_id) WHERE inst2_stripe_invoice_id IS NOT NULL
+	""",
+	# Self-correcting upgrade for an already-applied instance of this
+	# migration whose ck_settlement_evidence_packet_required CHECK still
+	# covers CHARGING (found by live-DB testing to make the claim step
+	# itself unreachable — see the CHECK's own comment above). CREATE TABLE
+	# IF NOT EXISTS doesn't touch an existing table's constraints, so this
+	# re-run always drops and re-adds it with the corrected predicate —
+	# harmless once already correct, same pattern as apply_appointment_ops.py.
+	"ALTER TABLE settlement_transactions DROP CONSTRAINT IF EXISTS ck_settlement_evidence_packet_required",
+	"""
+	ALTER TABLE settlement_transactions ADD CONSTRAINT ck_settlement_evidence_packet_required CHECK (
+		installment_1_status NOT IN ('SETTLING', 'CHARGED')
+		AND installment_2_status NOT IN ('SETTLING', 'CHARGED')
+		OR evidence_packet_url IS NOT NULL
+	)
 	""",
 	# ── Transition guard — mirrors appointments_guard_transition() ──
 	"""
@@ -270,10 +289,20 @@ DDL = [
 			FROM settlement_offer_config WHERE offer_code = NEW.offer_code;
 
 			-- Fail-closed: no charge without a published, linked evidence packet.
-			IF (NEW.installment_1_status IN ('CHARGING', 'SETTLING', 'CHARGED')
-				AND OLD.installment_1_status NOT IN ('CHARGING', 'SETTLING', 'CHARGED'))
-				OR (NEW.installment_2_status IN ('CHARGING', 'SETTLING', 'CHARGED')
-				AND OLD.installment_2_status NOT IN ('CHARGING', 'SETTLING', 'CHARGED')) THEN
+			-- Deliberately checked only on entry into SETTLING/CHARGED — the
+			-- ACTUAL money-moving states — not on entry into CHARGING. CHARGING
+			-- is the claim/attempt bookkeeping state that ledger.claim_installment_1/2
+			-- sets BEFORE charge.py has had a chance to compile and publish the
+			-- packet; gating CHARGING here would make the claim step itself
+			-- permanently unreachable (a real bug caught by
+			-- tests/test_settlement_live.py::test_concurrent_claim_installment_2_claims_disjoint_sets
+			-- during live-DB verification). charge.py's own preflight refusal
+			-- still blocks BEFORE any Stripe call if the packet never publishes;
+			-- this trigger is the backstop for the ACTUAL charge, not the attempt.
+			IF (NEW.installment_1_status IN ('SETTLING', 'CHARGED')
+				AND OLD.installment_1_status NOT IN ('SETTLING', 'CHARGED'))
+				OR (NEW.installment_2_status IN ('SETTLING', 'CHARGED')
+				AND OLD.installment_2_status NOT IN ('SETTLING', 'CHARGED')) THEN
 				IF NEW.evidence_packet_url IS NULL THEN
 					RAISE EXCEPTION 'cannot charge transaction % without a published evidence_packet_url', NEW.transaction_id;
 				END IF;
