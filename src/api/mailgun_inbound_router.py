@@ -30,6 +30,7 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.inbound_lead_orchestrator import InboundLead, run_inbound_pipeline
+from src.services.portal_parsers import EmailParts, classify_and_parse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/webhooks", tags=["inbound"])
@@ -109,19 +110,29 @@ async def mailgun_inbound(request: Request) -> dict:
     ).hexdigest()
     idempotency_key = f"{client_id}:{stable}"
 
+    # 4.2.3 — classify the portal and extract structured fields.
+    parsed = classify_and_parse(EmailParts(
+        sender=sender,
+        subject=subject,
+        body_plain=body_plain,
+        body_html=body_html,
+        fallback_email=email,
+    ))
+
     lead = InboundLead(
         client_id=client_id,
         channel="EMAIL",
-        source_channel="LISTING_PORTAL",   # refined by 4.2.3 portal parsers
+        source_channel=parsed.source_channel,
         idempotency_key=idempotency_key,
         destination_address=recipient,
-        prospect_name=None,
-        email=email,
-        phone=None,
-        property_address=None,
-        inquiry_text=body_plain[:2000],
+        prospect_name=parsed.prospect_name,
+        email=parsed.email or email,
+        phone=parsed.phone,
+        property_address=parsed.property_address,
+        inquiry_text=(parsed.inquiry_text or body_plain)[:2000],
         subject=subject or None,
         body_html=body_html,
+        requires_human_review=parsed.requires_human_review,
     )
 
     try:
