@@ -5,7 +5,7 @@ send_at <= NOW() AND status = 'RECEIVED'.
 
 Runs under the BYPASSRLS system session (same posture as
 booking_confirmation_sender.py) so the sweep spans all clients in one
-pass. Per-client template resolution drops into session_scope(client_id)
+pass. Per-client template resolution drops into get_db_context(client_id)
 for the actual send so the send is still RLS-scoped.
 
     python -m src.tasks.speed_to_lead_sweep
@@ -20,7 +20,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.core.database import get_system_db_context, session_scope
+from src.core.database import get_system_db_context, get_db_context
 from src.services.booking_link import resolve_booking_link
 from src.services.email_sender import build_email_sender
 from src.services.events import log_event
@@ -70,10 +70,10 @@ def _send_response(row) -> None:
     client_id = row.client_id
     message_id = str(row.message_id)
 
-    with session_scope(client_id=client_id) as session:
+    with get_db_context(client_id=client_id) as session:
         # Resolve contact email
         contact = session.execute(
-            text("SELECT first_name, email FROM contacts WHERE id = :id"),
+            text("SELECT first_name, email FROM contacts WHERE contact_id = :id"),
             {"id": row.contact_id},
         ).first() if row.contact_id else None
 

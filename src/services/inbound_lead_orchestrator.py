@@ -28,7 +28,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from src.core.database import session_scope
+from src.core.database import get_db_context
 from src.services.events import log_event
 from src.services.business_hours import compute_send_at
 
@@ -59,9 +59,9 @@ class PipelineResult:
 
 def run_inbound_pipeline(lead: InboundLead) -> PipelineResult:
     """Execute the shared inbound pipeline. Caller owns no session — this
-    function opens its own session_scope so the entire pipeline is atomic."""
+    function opens its own get_db_context so the entire pipeline is atomic."""
 
-    with session_scope(client_id=lead.client_id) as session:
+    with get_db_context(client_id=lead.client_id) as session:
         return _run(session, lead)
 
 
@@ -145,8 +145,8 @@ def _upsert_contact(session: Session, lead: InboundLead) -> Optional[int]:
     # when the contact already exists under this client.
     row = session.execute(
         text(
-            "SELECT c.id FROM contacts c "
-            "JOIN companies co ON co.id = c.company_id "
+            "SELECT c.contact_id FROM contacts c "
+            "JOIN companies co ON co.company_id = c.company_id "
             "WHERE co.owning_client_id = :client_id "
             "AND (c.email = :email OR c.phone = :phone) "
             "LIMIT 1"
@@ -154,7 +154,7 @@ def _upsert_contact(session: Session, lead: InboundLead) -> Optional[int]:
         {"client_id": lead.client_id, "email": lead.email or "", "phone": lead.phone or ""},
     ).first()
     if row:
-        return row.id
+        return row.contact_id
 
     # New contact — we need a company shell to FK into. Use a "INBOUND" pseudo-company
     # keyed by client_id + email domain (or phone hash) so repeated inbound
@@ -172,7 +172,7 @@ def _upsert_contact(session: Session, lead: InboundLead) -> Optional[int]:
             "SET email = COALESCE(EXCLUDED.email, contacts.email), "
             "    phone = COALESCE(EXCLUDED.phone, contacts.phone), "
             "    first_name = COALESCE(EXCLUDED.first_name, contacts.first_name) "
-            "RETURNING id"
+            "RETURNING contact_id"
         ),
         {
             "company_id": company_id,
@@ -184,8 +184,9 @@ def _upsert_contact(session: Session, lead: InboundLead) -> Optional[int]:
     return result
 
 
-def _ensure_inbound_company(session: Session, lead: InboundLead) -> Optional[int]:
+def _ensure_inbound_company(session: Session, lead: InboundLead) -> Optional[str]:
     """Return or create a lightweight company shell for this inbound lead.
+    Returns the companies.company_id (VARCHAR SHA-256), not a serial int.
     Uses SHA-256 of (client_id + email_domain_or_phone) as company_id,
     consistent with BaseIngestLoader.compute_company_id convention."""
     if lead.email and "@" in lead.email:
@@ -199,25 +200,25 @@ def _ensure_inbound_company(session: Session, lead: InboundLead) -> Optional[int
     company_id = hashlib.sha256(raw_key.encode()).hexdigest()
 
     exists = session.execute(
-        text("SELECT id FROM companies WHERE company_id = :company_id LIMIT 1"),
+        text("SELECT company_id FROM companies WHERE company_id = :company_id LIMIT 1"),
         {"company_id": company_id},
     ).scalar()
     if exists:
-        return exists
+        return str(exists)
 
-    result = session.execute(
+    session.execute(
         text(
             "INSERT INTO companies (company_id, owning_client_id, company_name, created_at) "
             "VALUES (:company_id, :client_id, :company_name, NOW()) "
-            "RETURNING id"
+            "ON CONFLICT (company_id) DO NOTHING"
         ),
         {
             "company_id": company_id,
             "client_id": lead.client_id,
             "company_name": lead.company_name or (f"Inbound:{domain}" if lead.email and "@" in lead.email else "Inbound"),
         },
-    ).scalar()
-    return result
+    )
+    return company_id
 
 
 def _resolve_company_id(session: Session, lead: InboundLead) -> Optional[str]:

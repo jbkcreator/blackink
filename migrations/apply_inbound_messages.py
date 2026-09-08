@@ -48,7 +48,7 @@ DDL = [
         -- ── Identity ──────────────────────────────────────────────────────
         message_id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
         client_id               VARCHAR(40)     NOT NULL REFERENCES clients(client_id),
-        contact_id              BIGINT          REFERENCES contacts(id),
+        contact_id              BIGINT          REFERENCES contacts(contact_id),
 
         -- ── Dev 4 ingest columns ──────────────────────────────────────────
         channel                 VARCHAR(20)     NOT NULL
