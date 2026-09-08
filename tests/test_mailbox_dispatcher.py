@@ -38,38 +38,45 @@ def _session_with_mailbox(
     client_id="client_a",
     domain="clienta-outreach.com",
     daily_send_ceiling=0,
+    client_24h_count=0,
 ):
     """Session that returns one warmed mailbox joined to an active domain.
 
-    execute() call order (cap resolved from clients when caller passes none):
-      0. SELECT clients.daily_send_ceiling → ceiling (0 → fallback default)
-      1. COUNT warmed mailboxes → 1
-      2. SELECT ... JOIN sending_domains → row
-      3. UPDATE last_used_at → (ignored)
+    execute() call order:
+      0. SELECT pg_advisory_xact_lock(...)      — per-client serialize (ignored)
+      1. SELECT clients.daily_send_ceiling      — per-client ceiling (0 = none)
+      [1b. COUNT client 24h sends — only when ceiling > 0]
+      2. COUNT warmed mailboxes → 1
+      3. SELECT ... JOIN sending_domains → row
+      4. UPDATE last_used_at → (ignored)
+    (indices shift +1 when ceiling > 0 inserts the 24h count)
     """
     session = MagicMock()
-    session.execute.side_effect = [
-        _scalar(daily_send_ceiling),                                    # clients ceiling
-        _scalar(1),                                                     # warmed count
+    calls = [MagicMock(), _scalar(daily_send_ceiling)]              # advisory lock, ceiling
+    if daily_send_ceiling and daily_send_ceiling > 0:
+        calls.append(_scalar(client_24h_count))                    # client 24h total
+    calls += [
+        _scalar(1),                                                # warmed count
         _fetchone((mailbox_id, address, instantly_email, client_id, domain)),  # JOIN row
-        MagicMock(),                                                    # UPDATE
+        MagicMock(),                                               # UPDATE
     ]
+    session.execute.side_effect = calls
     return session
 
 
 def _session_no_mailbox(warmed_count=0, any_count=0, warmed_active_count=0, daily_send_ceiling=0):
     """Session where the (warmed + active + under-cap) JOIN finds nothing.
 
-    execute() call order (cap resolved from clients when caller passes none):
-      0. SELECT clients.daily_send_ceiling → ceiling
-      1. COUNT warmed mailboxes
-      2. SELECT ... JOIN (cap-filtered) → None
-      3. COUNT warmed + active mailboxes (ignoring cap) — distinguishes "all
-         capped" from "all quarantined"
-      4. COUNT all mailboxes (only reached if not capped and warmed_count == 0)
+    execute() call order (ceiling = 0, so no 24h count):
+      0. SELECT pg_advisory_xact_lock(...)  — per-client serialize (ignored)
+      1. SELECT clients.daily_send_ceiling  — 0 (no aggregate cap)
+      2. COUNT warmed mailboxes
+      3. SELECT ... JOIN (cap-filtered) → None
+      4. COUNT warmed + active mailboxes (ignoring cap) — "capped" vs "quarantined"
+      5. COUNT all mailboxes (only reached if not capped and warmed_count == 0)
     """
     session = MagicMock()
-    calls = [_scalar(daily_send_ceiling), _scalar(warmed_count), _fetchone(None), _scalar(warmed_active_count)]
+    calls = [MagicMock(), _scalar(daily_send_ceiling), _scalar(warmed_count), _fetchone(None), _scalar(warmed_active_count)]
     if warmed_active_count == 0 and warmed_count == 0:
         calls.append(_scalar(any_count))
     session.execute.side_effect = calls
@@ -98,9 +105,9 @@ def test_sending_domain_included_in_assignment():
 def test_updates_last_used_at_after_pick():
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    # Fourth execute call must be the UPDATE (index 0 is the clients ceiling lookup)
-    assert session.execute.call_count == 4
-    update_sql = str(session.execute.call_args_list[3][0][0]).upper()
+    # Order: 0 advisory-lock, 1 ceiling, 2 warmed-count, 3 JOIN pick, 4 UPDATE.
+    assert session.execute.call_count == 5
+    update_sql = str(session.execute.call_args_list[4][0][0]).upper()
     assert "UPDATE" in update_sql
     assert "LAST_USED_AT" in update_sql
 
@@ -197,7 +204,7 @@ def test_query_joins_sending_domains():
     """Dispatcher must join sending_domains — the key fix for the sentinel bug."""
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    join_sql = str(session.execute.call_args_list[2][0][0])
+    join_sql = str(session.execute.call_args_list[3][0][0])
     assert "sending_domains" in join_sql
 
 
@@ -205,21 +212,21 @@ def test_query_checks_domain_quarantine_state():
     """Must check sd.quarantine_state, not just mailboxes.quarantine_state."""
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    join_sql = str(session.execute.call_args_list[2][0][0])
+    join_sql = str(session.execute.call_args_list[3][0][0])
     assert "sd.quarantine_state" in join_sql or "sending_domains" in join_sql
 
 
 def test_query_filters_by_client_id():
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    join_params = session.execute.call_args_list[2][0][1]
+    join_params = session.execute.call_args_list[3][0][1]
     assert join_params["client_id"] == "client_a"
 
 
 def test_query_uses_for_update_skip_locked():
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    join_sql = str(session.execute.call_args_list[2][0][0]).upper()
+    join_sql = str(session.execute.call_args_list[3][0][0]).upper()
     assert "FOR UPDATE" in join_sql
     assert "SKIP LOCKED" in join_sql
 
@@ -227,58 +234,72 @@ def test_query_uses_for_update_skip_locked():
 def test_query_filters_warmed_and_active_domain():
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    join_sql = str(session.execute.call_args_list[2][0][0])
+    join_sql = str(session.execute.call_args_list[3][0][0])
     assert "warmed" in join_sql
     assert "active" in join_sql
 
 
 # ---------------------------------------------------------------------------
-# Per-client daily send ceiling (wayfinder dev4-week2 ticket 01)
+# Per-mailbox cap + per-client daily ceiling (PR #35 review)
 # ---------------------------------------------------------------------------
 
-def test_cap_resolved_from_client_ceiling_when_caller_passes_none():
-    """A positive clients.daily_send_ceiling becomes the cap in the JOIN query."""
-    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=30)
-    get_active_mailbox_for_client(session, "client_a")
-    # call 0 = ceiling lookup against clients; call 2 = the JOIN pick with :cap bound
-    ceiling_sql = str(session.execute.call_args_list[0][0][0]).lower()
-    assert "daily_send_ceiling" in ceiling_sql and "clients" in ceiling_sql
-    assert session.execute.call_args_list[2][0][1]["cap"] == 30
-
-
-def test_zero_ceiling_falls_back_to_default_cap():
-    """daily_send_ceiling = 0 means 'unset' → DEFAULT_DAILY_SEND_CAP, never a 0 floor."""
-    from src.services.mailbox_dispatcher import DEFAULT_DAILY_SEND_CAP
+def test_per_mailbox_cap_defaults_to_platform_max():
+    """With no ceiling and no override, the JOIN uses MAX_DAILY_SEND_CAP as the
+    per-mailbox cap (the blueprint's 30–50/mailbox deliverability limit)."""
+    from src.services.mailbox_dispatcher import MAX_DAILY_SEND_CAP
     session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=0)
     get_active_mailbox_for_client(session, "client_a")
-    assert session.execute.call_args_list[2][0][1]["cap"] == DEFAULT_DAILY_SEND_CAP
+    # index 3 is the JOIN pick (0 lock, 1 ceiling, 2 warmed, 3 JOIN)
+    assert session.execute.call_args_list[3][0][1]["cap"] == MAX_DAILY_SEND_CAP
 
 
-def test_ceiling_above_platform_max_is_capped():
-    """A daily_send_ceiling above MAX_DAILY_SEND_CAP is clamped down — a
-    misconfigured 100 can never raise a mailbox past the platform max of 50."""
-    from src.services.mailbox_dispatcher import MAX_DAILY_SEND_CAP
-    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=100)
+def test_explicit_daily_send_cap_overrides_per_mailbox_cap():
+    """An explicit daily_send_cap sets the per-mailbox cap in the JOIN."""
+    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=0)
+    get_active_mailbox_for_client(session, "client_a", daily_send_cap=17)
+    assert session.execute.call_args_list[3][0][1]["cap"] == 17
+
+
+def test_takes_per_client_advisory_lock_first():
+    """The first execute must be the per-client advisory lock — serializing the
+    ceiling check + claim so concurrent workers can't overshoot."""
+    session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
-    assert session.execute.call_args_list[2][0][1]["cap"] == MAX_DAILY_SEND_CAP
+    first_sql = str(session.execute.call_args_list[0][0][0]).lower()
+    assert "pg_advisory_xact_lock" in first_sql
 
 
-def test_ceiling_below_platform_max_is_honored():
-    """A ceiling below the platform max lowers the cap as-is."""
-    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=30)
-    get_active_mailbox_for_client(session, "client_a")
-    assert session.execute.call_args_list[2][0][1]["cap"] == 30
+def test_zero_ceiling_means_no_aggregate_cap():
+    """daily_send_ceiling = 0 → no per-client total check (no 24h count query),
+    only the per-mailbox cap applies. Mailbox is still handed out."""
+    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=0)
+    result = get_active_mailbox_for_client(session, "client_a")
+    assert result.mailbox_id == 1
+    # Exactly 5 calls: lock, ceiling, warmed, JOIN, UPDATE. A per-client 24h
+    # count (the 6th) is only issued when ceiling > 0.
+    assert session.execute.call_count == 5
 
 
-def test_explicit_cap_argument_skips_client_lookup():
-    """An explicit daily_send_cap wins and does not query clients at all."""
+def test_client_at_ceiling_defers_before_handing_out_a_mailbox():
+    """When the client's 24h total across all mailboxes has reached the ceiling,
+    no mailbox is handed out — AllMailboxesCapped, counted by client_id."""
+    from src.services.mailbox_dispatcher import AllMailboxesCapped
     session = MagicMock()
     session.execute.side_effect = [
-        _scalar(1),                                                          # warmed count
-        _fetchone((1, "a@x.com", "a@x.com", "client_a", "x.com")),           # JOIN row
-        MagicMock(),                                                         # UPDATE
+        MagicMock(),        # advisory lock
+        _scalar(50),        # daily_send_ceiling = 50 (per-client total)
+        _scalar(50),        # client 24h sends across mailboxes = 50 → at ceiling
     ]
-    get_active_mailbox_for_client(session, "client_a", daily_send_cap=17)
-    # No clients ceiling lookup — first call is the warmed-count COUNT.
-    assert "daily_send_ceiling" not in str(session.execute.call_args_list[0][0][0]).lower()
-    assert session.execute.call_args_list[1][0][1]["cap"] == 17
+    with pytest.raises(AllMailboxesCapped, match="per-client daily send ceiling"):
+        get_active_mailbox_for_client(session, "client_a")
+
+
+def test_client_below_ceiling_proceeds_to_pick():
+    """Client total below the ceiling → pick proceeds; the 24h count query is
+    scoped by client_id (aggregate), not mailbox_id."""
+    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=100, client_24h_count=10)
+    result = get_active_mailbox_for_client(session, "client_a")
+    assert result.mailbox_id == 1
+    # index 2 is the client 24h count (0 lock, 1 ceiling, 2 count) — by client_id.
+    count_sql = str(session.execute.call_args_list[2][0][0]).lower()
+    assert "sequence_touch_dispatches" in count_sql and "client_id" in count_sql
