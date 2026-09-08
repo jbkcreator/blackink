@@ -23,7 +23,11 @@ from pydantic import BaseModel, Field
 
 from config.settings import get_settings
 from src.core.database import get_db_context
-from src.services.settlement.ledger import open_settlement, record_door_signed
+from src.services.settlement.ledger import (
+	open_settlement,
+	record_door_signed,
+	reopen_failed_permanent_installment,
+)
 
 router = APIRouter(prefix="/api/v1/settlement", tags=["settlement"])
 
@@ -79,3 +83,33 @@ def post_door_signed(body: DoorSignedRequest, x_settlement_operator_key: Optiona
 			raise HTTPException(status_code=409, detail="settlement already exists for this opportunity/agreement")
 
 	return {"pms_agreement_id": pms_agreement_id, "transaction_id": transaction_id}
+
+
+class ReopenInstallmentRequest(BaseModel):
+	client_id: str
+	transaction_id: int
+	installment: int = Field(ge=1, le=2)
+	reason: str = Field(min_length=1)
+
+
+@router.post("/installments/reopen")
+def post_reopen_installment(body: ReopenInstallmentRequest, x_settlement_operator_key: Optional[str] = Header(default=None)):
+	"""PR #37 review finding #2's "controlled manual reopening" — operator-only,
+	same fail-closed key check as /door-signed. Real production entry point
+	for src/services/settlement/ledger.py::reopen_failed_permanent_installment(),
+	not just an orphan helper: an operator calls this once a client's
+	declined payment method is fixed, so the next settlement sweep tick makes
+	a genuinely new Stripe attempt (see charge.py's attempt-numbered payment
+	idempotency keys) instead of the installment sitting FAILED_PERMANENT
+	forever."""
+	_require_operator(x_settlement_operator_key)
+
+	now = datetime.now(timezone.utc)
+	with get_db_context(client_id=body.client_id) as session:
+		reopened = reopen_failed_permanent_installment(
+			session, transaction_id=body.transaction_id, installment=body.installment,
+			reason=body.reason, as_of=now,
+		)
+	if not reopened:
+		raise HTTPException(status_code=409, detail="installment is not currently FAILED_PERMANENT")
+	return {"reopened": True}

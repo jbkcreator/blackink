@@ -30,7 +30,8 @@ API contract for the frontend Stripe Elements integration.
 ║    endpoint 3 below, or wait for your own server-side notification    ║
 ║    once the webhook (endpoint 4) completes it.                        ║
 ║                                                                        ║
-║ 3. GET /api/v1/onboarding/payment-auth/status?onboarding_token=<jwt>  ║
+║ 3. GET /api/v1/onboarding/payment-auth/status                        ║
+║    Header:   Authorization: Bearer <jwt>                              ║
 ║    Response: {"payment_auth_completed": bool,                         ║
 ║               "has_card_payment_method": bool,                        ║
 ║               "has_ach_payment_method": bool,                         ║
@@ -66,7 +67,7 @@ import logging
 from typing import Literal, Optional
 
 import stripe
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -306,11 +307,19 @@ def confirm_payment_auth(body: ConfirmRequest) -> ConfirmResponse:
 
 
 @router.get("/status", response_model=StatusResponse)
-def payment_auth_status(onboarding_token: str = Query(...)) -> StatusResponse:
+def payment_auth_status(authorization: Optional[str] = Header(default=None)) -> StatusResponse:
 	"""Secure status-check endpoint — same onboarding_token auth as the
-	other two endpoints. Lets the frontend poll after an "ach_pending"
-	confirm response to learn when the webhook has finished the ACH rail,
-	without re-deriving state itself."""
+	other two endpoints, but carried in the Authorization header rather
+	than a URL query parameter. A query-string token is routinely retained
+	in browser history, reverse-proxy/access logs, and observability
+	systems — none of which should see a live onboarding credential (PR #37
+	review finding #7, recovering a fix first written under PR #36's review
+	on a since-abandoned branch). Lets the frontend poll after an
+	"ach_pending" confirm response to learn when the webhook has finished
+	the ACH rail, without re-deriving state itself."""
+	if not authorization or not authorization.startswith("Bearer "):
+		raise HTTPException(status_code=401, detail="Expected 'Authorization: Bearer <onboarding_token>'")
+	onboarding_token = authorization[len("Bearer "):]
 	claims = _decode_token(onboarding_token)
 	with get_db_context(client_id=claims.client_id) as session:
 		row = session.execute(

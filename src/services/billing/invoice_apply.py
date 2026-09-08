@@ -39,11 +39,20 @@ def apply_pending_credits_to_invoice(
 	re-derives the same key rather than creating a second Stripe object,
 	same convention as settlement/charge.py.
 
-	billing_period is REQUIRED (PR #37 review finding): without it, EVERY
-	still-PENDING credit for this client — including one issued for a
-	future or a past billing period — would land on whatever invoice happens
-	to be open right now. Only credits whose own billing_period matches the
-	invoice being built are eligible.
+	billing_period gates which credits are eligible (PR #37 review finding):
+	without any bound at all, EVERY still-PENDING credit for this client —
+	including one issued for a period that hasn't arrived yet — would land on
+	whatever invoice happens to be open right now. A strict equality bound
+	was tried first and created a second, opposite bug (PR #37 second review
+	finding #5): a credit issued after a client's LAST sit of a month has no
+	future invoice in that same month to attach to, since this function's
+	only caller (sit_invoice.py) builds one invoice per sit, not one invoice
+	per period — an equality match stranded that credit forever, since no
+	later invoice's billing_period ever equals its own past one again. Per
+	the source of truth ("writes a $50 credit line to the client's NEXT
+	invoice" — not "an invoice in the same period"), the bound is `<=`: any
+	credit whose period has already arrived (this one or an earlier one
+	still outstanding) is eligible, while a future-dated credit still is not.
 
 	Returns the number of credits applied. A credit already APPLIED/VOIDED is
 	never re-applied (the WHERE clause below only ever selects PENDING rows)."""
@@ -51,7 +60,7 @@ def apply_pending_credits_to_invoice(
 	credits = session.execute(
 		text(
 			"SELECT credit_id, credit_type, amount_cents FROM billing_credits "
-			"WHERE client_id = :client_id AND status = 'PENDING' AND billing_period = :billing_period "
+			"WHERE client_id = :client_id AND status = 'PENDING' AND billing_period <= :billing_period "
 			"ORDER BY credit_id FOR UPDATE SKIP LOCKED"
 		),
 		{"client_id": client_id, "billing_period": billing_period},

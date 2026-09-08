@@ -113,7 +113,11 @@ token · `402` card declined (Stripe error code in the body; also logged as
 customer on file yet (call endpoint 1 first) · `409` card SetupIntent not
 yet `succeeded` · `502` Stripe API error.
 
-### 3. `GET /api/v1/onboarding/payment-auth/status?onboarding_token=<jwt>`
+### 3. `GET /api/v1/onboarding/payment-auth/status`
+
+Header: `Authorization: Bearer <jwt>` (PR #37 review finding #7 — never a
+query-string `onboarding_token`, which browser history/proxy/observability
+logs routinely retain).
 
 Response `200`:
 ```json

@@ -36,17 +36,46 @@ from src.core.database import get_owner_db_context
 DDL = [
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(255)",
     "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS billing_blocked_reason VARCHAR(50)",
+    # PR #37 second review finding #8 — durable link back to the Stripe
+    # invoice a sit was charged against, persisted immediately after
+    # creation (before the remaining invoice-item/credits/finalize steps) so
+    # a retry after a mid-sequence exception resumes against the SAME
+    # invoice instead of creating a second one. See
+    # src/services/billing/sit_invoice.py.
+    # Rollback: additive, nullable column — safe to leave on the live
+    # server; undo only with a manual
+    # `ALTER TABLE appointments DROP COLUMN stripe_invoice_id` if ever
+    # needed (no down-migration exists in this repo).
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS stripe_invoice_id VARCHAR(255)",
+    # PR #37 second review finding #8 (deeper half): billed_offer_code is set
+    # by resolve_sit_charge() independently of, and well before, any Stripe
+    # call succeeds — it is NOT proof the Stripe invoice was ever finished.
+    # Before this column, the claim query's `billed_offer_code IS NULL`
+    # predicate meant a crash between resolve_sit_charge() and
+    # finalize_invoice() dropped the appointment out of the claim query
+    # FOREVER, with no automatic retry of the still-incomplete Stripe side.
+    # This timestamp is set only once finalize_invoice() actually succeeds;
+    # the claim query (billing_sweep.py) reclaims a row with
+    # billed_offer_code set but this still NULL, alongside genuinely new
+    # (billed_offer_code IS NULL) rows.
+    # Rollback: additive, nullable column — safe to leave on the live
+    # server; undo only with a manual
+    # `ALTER TABLE appointments DROP COLUMN sit_invoice_finalized_at` if
+    # ever needed (no down-migration exists in this repo).
+    "ALTER TABLE appointments ADD COLUMN IF NOT EXISTS sit_invoice_finalized_at TIMESTAMPTZ",
     "ALTER TABLE appointments DROP CONSTRAINT IF EXISTS ck_appointments_billing_blocked_reason",
     """
     ALTER TABLE appointments ADD CONSTRAINT ck_appointments_billing_blocked_reason
         CHECK (billing_blocked_reason IS NULL OR billing_blocked_reason IN ('NO_STRIPE_CUSTOMER'))
     """,
-    # Claim-query index: unbilled, non-blocked ATTENDED appointments only.
+    # Claim-query index: not-yet-finalized ATTENDED appointments (covers both
+    # brand-new rows and PR #37 second review finding #8's billed-but-not-
+    # finalized reclaim case — see billing_sweep.py's run_sit_invoice_sweep).
+    "DROP INDEX IF EXISTS ix_appointments_unbilled_attended",
     """
-    CREATE INDEX IF NOT EXISTS ix_appointments_unbilled_attended
+    CREATE INDEX IF NOT EXISTS ix_appointments_unfinalized_attended
         ON appointments (client_id, scheduled_for)
-        WHERE state = 'ATTENDED' AND is_billable AND billed_offer_code IS NULL
-              AND billing_blocked_reason IS NULL
+        WHERE state = 'ATTENDED' AND is_billable AND sit_invoice_finalized_at IS NULL
     """,
 ]
 

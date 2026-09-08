@@ -17,12 +17,16 @@ import pytest
 from sqlalchemy import text
 
 from src.core.database import get_owner_db_context, get_system_db_context
+from src.services.billing.credits import issue_credit
 from src.services.billing.dispute_credit import DisputeWindowExpiredError, credit_dispute_on_flag
 from src.services.billing.guarantee import evaluate_sixty_day_guarantee
 from src.services.billing.miss_credit import claim_missed_acks, process_missed_ack
 from src.services.billing.offers import apply_rate_migration, create_client_entitlement, load_offer
 from src.services.billing.sit_billing import resolve_sit_charge
+from src.services.billing.sit_invoice import charge_sit_for_appointment
 from src.services.clients import provision_client
+from src.services.settlement.gateway import InvoiceHandle, StripeGateway
+from src.tasks.billing_sweep import run_sit_invoice_sweep
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
 
 
@@ -582,3 +586,301 @@ def test_founding_client_price_unchanged_by_rate_migration(billing_tenant, canar
 				 "VALUES ('respond', 'Respond (Founding)', 39700, 'SUBSCRIPTION_MONTHLY') "
 				 "ON CONFLICT (offer_code) DO UPDATE SET price_cents = 39700"),
 		)
+
+
+# ── PR #37 second review finding #4: NO_STRIPE_CUSTOMER must be reclaimable,
+# race-safely, once the client gets a Stripe customer id ─────────────────
+
+class _FakeSitGateway(StripeGateway):
+	def __init__(self, *, fail_add_item_times: int = 0):
+		self.calls: list[str] = []
+		self._fail_add_item_times = fail_add_item_times
+
+	def create_invoice(self, **kw):
+		self.calls.append("create_invoice")
+		return InvoiceHandle(stripe_invoice_id=f"in_{uuid.uuid4().hex[:8]}", status="draft")
+
+	def add_invoice_item(self, **kw):
+		self.calls.append("add_invoice_item")
+		if self._fail_add_item_times > 0:
+			self._fail_add_item_times -= 1
+			raise RuntimeError("simulated Stripe transport error")
+		return f"ii_{uuid.uuid4().hex[:8]}"
+
+	def update_invoice_metadata(self, **kw):
+		self.calls.append("update_invoice_metadata")
+
+	def finalize_invoice(self, *, stripe_invoice_id, idempotency_key):
+		self.calls.append("finalize_invoice")
+		return InvoiceHandle(stripe_invoice_id=stripe_invoice_id, status="open")
+
+	def pay_invoice(self, **kw):
+		raise AssertionError("sit invoices are never auto-paid — Stripe's send_invoice collection only")
+
+	def void_or_delete_invoice(self, **kw):
+		self.calls.append("void_or_delete_invoice")
+
+
+@pytest.fixture
+def attended_billable_appointment(billing_tenant, canary_tenants):
+	client_id = billing_tenant["client_id"]
+	company_id = billing_tenant["company_id"]
+	contact_id = billing_tenant["contact_id"]
+	as_of = datetime.now(timezone.utc)
+	now_iso = as_of.isoformat()
+	with get_system_db_context() as s:
+		create_client_entitlement(s, client_id=client_id, offer_code="owner_growth")
+		appt = _insert_appointment(
+			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=now_iso, c3=now_iso,
+		)
+	yield {"client_id": client_id, "appointment_id": str(appt.appointment_id), "as_of": as_of}
+
+
+def test_no_stripe_customer_appointment_becomes_claimable_once_customer_id_added(attended_billable_appointment):
+	"""PR #37 second review finding #4: an appointment blocked for
+	NO_STRIPE_CUSTOMER must be reclaimed by the real sweep the moment
+	clients.stripe_customer_id is populated — not stuck forever because the
+	claim query's original predicate only ever looked at
+	billing_blocked_reason IS NULL."""
+	client_id = attended_billable_appointment["client_id"]
+	appointment_id = attended_billable_appointment["appointment_id"]
+	as_of = attended_billable_appointment["as_of"]
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = NULL WHERE client_id = :c"), {"c": client_id})
+
+	gw = _FakeSitGateway()
+	with get_system_db_context() as s:
+		outcome = charge_sit_for_appointment(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "NO_STRIPE_CUSTOMER"
+
+	invoiced_while_blocked = run_sit_invoice_sweep(limit=100, claim_time=as_of)
+	with get_system_db_context() as s:
+		blocked_row = s.execute(
+			text("SELECT billing_blocked_reason, billed_offer_code FROM appointments WHERE client_id = :c AND appointment_id = :a"),
+			{"c": client_id, "a": appointment_id},
+		).one()
+	assert blocked_row.billing_blocked_reason == "NO_STRIPE_CUSTOMER"
+	assert blocked_row.billed_offer_code is None
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_reclaim' WHERE client_id = :c"), {"c": client_id})
+
+	invoiced_after_fix = 0
+	with get_system_db_context() as session:
+		rows = session.execute(
+			text(
+				"SELECT a.client_id, a.appointment_id FROM appointments a "
+				"JOIN clients c ON c.client_id = a.client_id "
+				"WHERE a.state = 'ATTENDED' AND a.is_billable AND a.billed_offer_code IS NULL "
+				"  AND (a.billing_blocked_reason IS NULL "
+				"       OR (a.billing_blocked_reason = 'NO_STRIPE_CUSTOMER' AND c.stripe_customer_id IS NOT NULL)) "
+				"  AND a.appointment_id = :aid "
+				"ORDER BY a.scheduled_for LIMIT 100 FOR UPDATE OF a SKIP LOCKED"
+			),
+			{"aid": appointment_id},
+		).all()
+		assert any(str(r.appointment_id) == appointment_id for r in rows), "must be reclaimable now that stripe_customer_id is set"
+		outcome2 = charge_sit_for_appointment(session, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+		if outcome2.status == "INVOICED":
+			invoiced_after_fix += 1
+
+	assert outcome2.status == "INVOICED"
+	with get_system_db_context() as s:
+		final_row = s.execute(
+			text("SELECT billing_blocked_reason, billed_offer_code FROM appointments WHERE client_id = :c AND appointment_id = :a"),
+			{"c": client_id, "a": appointment_id},
+		).one()
+	assert final_row.billing_blocked_reason is None, "the stale NO_STRIPE_CUSTOMER reason must be cleared on success"
+	assert final_row.billed_offer_code is not None
+
+
+def test_no_stripe_customer_reclaim_is_race_safe(attended_billable_appointment):
+	"""PR #37 second review finding #4's required race-safety proof: two
+	concurrent sweep ticks racing the SAME reclaimed appointment must invoice
+	it EXACTLY ONCE — the existing FOR UPDATE SKIP LOCKED claim (unchanged by
+	this fix) plus billed_offer_code's own claim-exclusion is what
+	guarantees this, same mechanism already proven for other claims in this
+	repo."""
+	import threading
+
+	client_id = attended_billable_appointment["client_id"]
+	appointment_id = attended_billable_appointment["appointment_id"]
+	as_of = attended_billable_appointment["as_of"]
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_race' WHERE client_id = :c"), {"c": client_id})
+
+	results: list[str] = []
+	barrier = threading.Barrier(2)
+
+	def _claim_and_charge():
+		barrier.wait(timeout=5)
+		gw = _FakeSitGateway()
+		with get_system_db_context() as s:
+			rows = s.execute(
+				text(
+					"SELECT client_id, appointment_id FROM appointments "
+					"WHERE appointment_id = :aid AND billed_offer_code IS NULL "
+					"FOR UPDATE SKIP LOCKED"
+				),
+				{"aid": appointment_id},
+			).all()
+			if not rows:
+				results.append("SKIPPED_LOCKED")
+				return
+			outcome = charge_sit_for_appointment(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+			results.append(outcome.status)
+
+	t1 = threading.Thread(target=_claim_and_charge)
+	t2 = threading.Thread(target=_claim_and_charge)
+	t1.start()
+	t2.start()
+	t1.join(timeout=10)
+	t2.join(timeout=10)
+
+	assert results.count("INVOICED") == 1, f"expected exactly one INVOICED outcome, got: {results}"
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = NULL WHERE client_id = :c"), {"c": client_id})
+
+
+# ── PR #37 second review finding #5: a credit issued after the month's
+# final sit rolls forward to the NEXT invoice and applies exactly once ────
+
+def test_credit_from_prior_month_rolls_forward_and_applies_exactly_once(attended_billable_appointment):
+	client_id = attended_billable_appointment["client_id"]
+	appointment_id = attended_billable_appointment["appointment_id"]
+	as_of = attended_billable_appointment["as_of"]
+
+	last_month = date(as_of.year, as_of.month, 1) - timedelta(days=1)
+	last_month_period = date(last_month.year, last_month.month, 1)
+	with get_system_db_context() as s:
+		credited = issue_credit(
+			s, client_id=client_id, credit_type="MISS_CREDIT", amount_cents=5000,
+			source_table="inbound_messages", source_id=f"stranded-{uuid.uuid4()}",
+			issued_at=datetime.now(timezone.utc), billing_period=last_month_period,
+		)
+	assert credited is True
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_credit' WHERE client_id = :c"), {"c": client_id})
+
+	gw = _FakeSitGateway()
+	with get_system_db_context() as s:
+		outcome = charge_sit_for_appointment(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+	assert outcome.status == "INVOICED"
+
+	with get_system_db_context() as s:
+		credit_row = s.execute(
+			text(
+				"SELECT status, applied_at FROM billing_credits "
+				"WHERE client_id = :c AND billing_period = :p"
+			),
+			{"c": client_id, "p": last_month_period},
+		).one()
+	assert credit_row.status == "APPLIED"
+	assert credit_row.applied_at is not None
+	assert gw.calls.count("add_invoice_item") == 1, "the sit charge itself is $0 (first sit) — the only item added is the credit"
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = NULL WHERE client_id = :c"), {"c": client_id})
+
+
+def test_future_dated_credit_is_never_applied_early(attended_billable_appointment):
+	"""Regression guard for the ORIGINAL fix this rule protects (PR #37 first
+	review): the `<=` bound must never let a future-dated credit jump onto
+	an earlier invoice."""
+	client_id = attended_billable_appointment["client_id"]
+	appointment_id = attended_billable_appointment["appointment_id"]
+	as_of = attended_billable_appointment["as_of"]
+
+	next_month = date(as_of.year, as_of.month, 28) + timedelta(days=7)
+	future_period = date(next_month.year, next_month.month, 1)
+	with get_system_db_context() as s:
+		issue_credit(
+			s, client_id=client_id, credit_type="MISS_CREDIT", amount_cents=5000,
+			source_table="inbound_messages", source_id=f"future-{uuid.uuid4()}",
+			issued_at=datetime.now(timezone.utc), billing_period=future_period,
+		)
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_future_credit' WHERE client_id = :c"), {"c": client_id})
+
+	gw = _FakeSitGateway()
+	with get_system_db_context() as s:
+		charge_sit_for_appointment(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+
+	with get_system_db_context() as s:
+		credit_row = s.execute(
+			text("SELECT status FROM billing_credits WHERE client_id = :c AND billing_period = :p"),
+			{"c": client_id, "p": future_period},
+		).one()
+	assert credit_row.status == "PENDING", "a future-dated credit must not apply to an earlier invoice"
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = NULL WHERE client_id = :c"), {"c": client_id})
+
+
+# ── PR #37 second review finding #8: crash after invoice creation
+# reconciles without a duplicate ──────────────────────────────────────────
+
+def test_crash_after_invoice_creation_reconciles_without_duplicate_invoice(attended_billable_appointment):
+	"""Simulates a real mid-sequence Stripe exception (add_invoice_item fails
+	on the FIRST attempt only) — the invoice id must already be durably
+	recorded so the retry resumes against the SAME invoice, never calling
+	create_invoice a second time."""
+	client_id = attended_billable_appointment["client_id"]
+	appointment_id = attended_billable_appointment["appointment_id"]
+	as_of = attended_billable_appointment["as_of"]
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_crash' WHERE client_id = :c"), {"c": client_id})
+
+	# First sit is free (appt_first, $0) — add_invoice_item is never called
+	# for a $0 charge, so force a second appointment (standard $99) to
+	# exercise the add_invoice_item failure path.
+	with get_system_db_context() as s:
+		resolve_sit_charge(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of)  # consumes the free first sit
+		ctx_appt = s.execute(
+			text("SELECT company_id, contact_id FROM appointments WHERE appointment_id = :a"), {"a": appointment_id}
+		).one()
+		second_appt = _insert_appointment(
+			s, client_id=client_id, company_id=ctx_appt.company_id, contact_id=ctx_appt.contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=as_of.isoformat(), c3=as_of.isoformat(),
+		)
+	second_appointment_id = str(second_appt.appointment_id)
+
+	gw = _FakeSitGateway(fail_add_item_times=1)
+	with get_system_db_context() as s:
+		with pytest.raises(RuntimeError):
+			charge_sit_for_appointment(s, client_id=client_id, appointment_id=second_appointment_id, as_of=as_of, gateway=gw)
+
+	with get_system_db_context() as s:
+		mid_crash_row = s.execute(
+			text(
+				"SELECT stripe_invoice_id, billed_offer_code, sit_invoice_finalized_at "
+				"FROM appointments WHERE appointment_id = :a"
+			),
+			{"a": second_appointment_id},
+		).one()
+	assert mid_crash_row.stripe_invoice_id is not None, "the invoice id must survive the raised exception"
+	# resolve_sit_charge() runs BEFORE any Stripe call and commits
+	# independently of it — billed_offer_code IS already set at this point.
+	# That is exactly the deeper half of finding #8 this test also proves:
+	# billed_offer_code alone must NOT short-circuit the retry to
+	# ALREADY_INVOICED while the Stripe side is still incomplete.
+	assert mid_crash_row.billed_offer_code is not None
+	assert mid_crash_row.sit_invoice_finalized_at is None, "not yet finalized — the retry must still run"
+
+	with get_system_db_context() as s:
+		outcome = charge_sit_for_appointment(s, client_id=client_id, appointment_id=second_appointment_id, as_of=as_of, gateway=gw)
+	assert outcome.status == "INVOICED"
+	assert outcome.stripe_invoice_id == mid_crash_row.stripe_invoice_id, "the retry must reuse the SAME invoice"
+	assert gw.calls.count("create_invoice") == 1, "create_invoice must never be called twice across the crash+retry"
+
+	with get_owner_db_context() as s:
+		s.execute(text("DELETE FROM appointments WHERE appointment_id = :a"), {"a": second_appointment_id})
+		s.execute(text("UPDATE clients SET stripe_customer_id = NULL WHERE client_id = :c"), {"c": client_id})

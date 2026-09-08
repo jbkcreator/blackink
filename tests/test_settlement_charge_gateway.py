@@ -18,6 +18,7 @@ _AS_OF = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _ROW = SimpleNamespace(
 	transaction_id=1, client_id="acme", company_id="co1", opportunity_id="opp-1", door_count=3,
 	installment_1_cents=5_000, installment_2_cents=5_000, inst1_attempts=0, inst2_attempts=0,
+	inst1_stripe_invoice_id=None, inst2_stripe_invoice_id=None,
 	evidence_packet_url="https://files.stripe.com/already-published.pdf",
 	door_signed_at=_AS_OF, pms_agreement_id=1, agreement_source="PMS_SYNC", agreement_status="ACTIVE",
 	stripe_customer_id="cus_123", ach_payment_method_id_encrypted="enc-ach", card_payment_method_id_encrypted="enc-card",
@@ -42,8 +43,13 @@ class _FakeSession:
 	"""Dispatches on a substring of the SQL text — enough to answer
 	charge_installment's own queries without a real DB."""
 
-	def __init__(self, row=_ROW):
-		self.row = row
+	def __init__(self, row=None):
+		# Copy, never share, the module-level _ROW — this test's new
+		# stripe_invoice_id persistence UPDATE mutates self.row, and the
+		# default arg is evaluated once at import time, so every test that
+		# didn't pass its own row would otherwise silently mutate every
+		# other test's starting state.
+		self.row = SimpleNamespace(**vars(row if row is not None else _ROW))
 		self.executed = []
 
 	def execute(self, stmt, params=None):
@@ -51,7 +57,23 @@ class _FakeSession:
 		self.executed.append(sql)
 		if "FROM settlement_transactions t" in sql:
 			return _FakeResult(self.row)
+		if "UPDATE settlement_transactions SET" in sql and "stripe_invoice_id" in sql:
+			# The finding-#8-style immediate persist of the invoice id right
+			# after finalize_invoice — record it on the fake row so a
+			# same-test retry could observe it, same as the real UPDATE would.
+			if params and "invoice_id" in params:
+				setattr(self.row, "inst1_stripe_invoice_id", params["invoice_id"])
+			return _FakeResult(None)
 		return _FakeResult(None)
+
+	def begin_nested(self):
+		from contextlib import contextmanager
+
+		@contextmanager
+		def _cm():
+			yield
+
+		return _cm()
 
 	def rollback(self):
 		pass
@@ -133,22 +155,30 @@ def test_transport_error_is_uncertain_without_card_attempt():
 	assert len(gw.pay_calls) == 1  # the double-charge test: no fallback on an indeterminate result
 
 
-def test_idempotency_keys_have_no_timestamp_or_attempt_counter():
+def test_object_creation_keys_have_no_timestamp_or_attempt_counter():
+	"""PR #37 review finding #2: the OBJECT-creation keys (invoice/item/
+	finalize) must stay pinned to (transaction_id, installment) alone — this
+	is what guarantees exactly one Stripe invoice per installment no matter
+	how many times charge_installment() is entered. Only the PAYMENT-attempt
+	keys (checked separately below) are allowed to vary by attempt."""
 	session = _FakeSession()
 	gw = _FakeGateway([PayOutcome(status="paid")])
 	charge_installment(session, 1, 1, as_of=_AS_OF, gateway=gw, store=_StubStore())
-	for key in gw.idempotency_keys:
+	object_keys = [k for k in gw.idempotency_keys if not k.startswith(("settlement-pay-ach|", "settlement-pay-card|"))]
+	assert object_keys, "expected at least one object-creation key to check"
+	for key in object_keys:
 		assert key.startswith("settlement-")
-		assert "|1|1" in key  # transaction_id=1, installment=1 only — no volatile suffix
+		assert key.endswith("|1|1")  # transaction_id=1, installment=1 only — no volatile suffix
 
 
-def test_idempotency_key_identical_across_a_deferred_retry():
+def test_object_creation_key_identical_across_a_deferred_retry():
 	"""PR #30 review, 'no duplicate charge across retries': a row deferred
 	once (e.g. an evidence-packet-publish failure on attempt 1) and re-claimed
-	on attempt 2 must produce byte-identical idempotency keys on the
-	eventual successful charge — the key is derived only from
+	on attempt 2 must produce a byte-identical INVOICE-creation idempotency
+	key on the eventual successful charge — that key is derived only from
 	transaction_id/installment, never inst{N}_attempts, so a retried sweep
-	re-derives the same key and Stripe dedupes rather than double-charging."""
+	re-derives the same key and Stripe dedupes the invoice rather than
+	double-creating it."""
 	row_first_attempt = SimpleNamespace(**{**vars(_ROW), "inst1_attempts": 0})
 	row_second_attempt = SimpleNamespace(**{**vars(_ROW), "inst1_attempts": 1})
 
@@ -158,4 +188,37 @@ def test_idempotency_key_identical_across_a_deferred_retry():
 	gw2 = _FakeGateway([PayOutcome(status="paid")])
 	charge_installment(_FakeSession(row_second_attempt), 1, 1, as_of=_AS_OF, gateway=gw2, store=_StubStore())
 
-	assert gw1.idempotency_keys == gw2.idempotency_keys
+	invoice_key1 = next(k for k in gw1.idempotency_keys if k.startswith("settlement-invoice|"))
+	invoice_key2 = next(k for k in gw2.idempotency_keys if k.startswith("settlement-invoice|"))
+	assert invoice_key1 == invoice_key2
+
+
+def test_payment_attempt_keys_differ_by_attempt_but_stay_idempotent_within_one():
+	"""PR #37 review finding #2 — the actual bug fix: the PAY keys must carry
+	the DB-persisted attempt number (never a timestamp), so a genuinely new
+	attempt (a client fixing their payment method after a decline) reaches
+	Stripe as a fresh request instead of replaying the cached original
+	decline, while two identical calls for the SAME attempt still produce the
+	SAME key (real idempotency, not a new object every call)."""
+	row_attempt_0 = SimpleNamespace(**{**vars(_ROW), "inst1_attempts": 0})
+	row_attempt_1 = SimpleNamespace(**{**vars(_ROW), "inst1_attempts": 1})
+
+	gw0 = _FakeGateway([PayOutcome(status="paid")])
+	charge_installment(_FakeSession(row_attempt_0), 1, 1, as_of=_AS_OF, gateway=gw0, store=_StubStore())
+	pay_key_attempt_0 = next(k for k in gw0.idempotency_keys if k.startswith("settlement-pay-ach|"))
+
+	gw1 = _FakeGateway([PayOutcome(status="paid")])
+	charge_installment(_FakeSession(row_attempt_1), 1, 1, as_of=_AS_OF, gateway=gw1, store=_StubStore())
+	pay_key_attempt_1 = next(k for k in gw1.idempotency_keys if k.startswith("settlement-pay-ach|"))
+
+	assert pay_key_attempt_0 != pay_key_attempt_1
+	assert pay_key_attempt_0.endswith("|a0")
+	assert pay_key_attempt_1.endswith("|a1")
+
+	# Same attempt, called twice (e.g. a duplicate worker execution) — still
+	# produces the identical key, so Stripe (or a fake asserting on the key)
+	# treats it as the same request, not two.
+	gw0_dup = _FakeGateway([PayOutcome(status="paid")])
+	charge_installment(_FakeSession(SimpleNamespace(**vars(row_attempt_0))), 1, 1, as_of=_AS_OF, gateway=gw0_dup, store=_StubStore())
+	pay_key_attempt_0_dup = next(k for k in gw0_dup.idempotency_keys if k.startswith("settlement-pay-ach|"))
+	assert pay_key_attempt_0_dup == pay_key_attempt_0

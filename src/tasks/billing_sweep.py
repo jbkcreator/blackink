@@ -50,9 +50,12 @@ def run_miss_credit_sweep(limit: int = 100, *, claim_time: datetime | None = Non
 		claimed = claim_missed_acks(session, claim_time=claim_time, limit=limit)
 		claimed_count = len(claimed)
 		for message in claimed:
-			with session.begin_nested():
-				if process_missed_ack(session, message, as_of=claim_time):
-					credited += 1
+			try:
+				with session.begin_nested():
+					if process_missed_ack(session, message, as_of=claim_time):
+						credited += 1
+			except Exception:  # noqa: BLE001 - one bad row must not discard the rest of the batch
+				logger.exception("billing_sweep.miss_credit: message %s failed unexpectedly", message["id"])
 	logger.info("billing_sweep.miss_credit: processed %d message(s), credited %d", claimed_count, credited)
 	return credited
 
@@ -116,9 +119,12 @@ def run_guarantee_sweep(limit: int = 100, *, claim_time: datetime | None = None)
 			{"limit": limit},
 		).all()
 		for row in rows:
-			with session.begin_nested():
-				if evaluate_sixty_day_guarantee(session, client_id=row.client_id, as_of=claim_time):
-					applied += 1
+			try:
+				with session.begin_nested():
+					if evaluate_sixty_day_guarantee(session, client_id=row.client_id, as_of=claim_time):
+						applied += 1
+			except Exception:  # noqa: BLE001 - one bad row must not discard the rest of the batch
+				logger.exception("billing_sweep.guarantee: client %s failed unexpectedly", row.client_id)
 	logger.info("billing_sweep.guarantee: applied %d override(s)", applied)
 	return applied
 
@@ -126,29 +132,62 @@ def run_guarantee_sweep(limit: int = 100, *, claim_time: datetime | None = None)
 def run_sit_invoice_sweep(limit: int = 100, *, claim_time: datetime | None = None) -> int:
 	"""Rules 2/5 wired to a real Stripe invoice, and rules 1/4's credits
 	actually reaching one (PR #37 review — blocking findings 1 and 2). Claims
-	ATTENDED, billable, not-yet-billed, not-blocked appointments and turns
-	each into a real invoice via charge_sit_for_appointment(). A row already
-	BLOCKED (no stripe_customer_id) is excluded by the claim query itself,
-	never re-attempted every tick."""
+	ATTENDED, billable appointments not yet FINALIZED and turns each into a
+	real invoice via charge_sit_for_appointment().
+
+	Two independent reclaim branches, both PR #37 second review findings:
+	  - finding #4: a row BLOCKED/NO_STRIPE_CUSTOMER is reclaimable the
+	    moment clients.stripe_customer_id is later populated — a plain
+	    `billing_blocked_reason IS NULL` predicate made that block permanent.
+	  - finding #8: a row whose billed_offer_code is already set (a prior
+	    call's resolve_sit_charge() committed) but whose Stripe invoice was
+	    never finalized (a crash/exception before finalize_invoice()
+	    succeeded) is reclaimed too — `billed_offer_code IS NULL` alone
+	    excluded it forever, even though the Stripe side was left
+	    incomplete. See src/services/billing/sit_invoice.py's module
+	    docstring for the full reasoning on both.
+	Any OTHER (future) block reason stays excluded until its own condition
+	is added here, same fail-closed posture as today."""
 	claim_time = claim_time or datetime.now(timezone.utc)
 	invoiced = 0
 	with get_system_db_context() as session:
 		rows = session.execute(
 			text(
-				"SELECT client_id, appointment_id FROM appointments "
-				"WHERE state = 'ATTENDED' AND is_billable "
-				"  AND billed_offer_code IS NULL AND billing_blocked_reason IS NULL "
-				"ORDER BY scheduled_for LIMIT :limit FOR UPDATE SKIP LOCKED"
+				"SELECT a.client_id, a.appointment_id FROM appointments a "
+				"JOIN clients c ON c.client_id = a.client_id "
+				"WHERE a.state = 'ATTENDED' AND a.is_billable AND a.sit_invoice_finalized_at IS NULL "
+				"  AND (a.billing_blocked_reason IS NULL "
+				"       OR (a.billing_blocked_reason = 'NO_STRIPE_CUSTOMER' AND c.stripe_customer_id IS NOT NULL)) "
+				"ORDER BY a.scheduled_for LIMIT :limit FOR UPDATE OF a SKIP LOCKED"
 			),
 			{"limit": limit},
 		).all()
 		for row in rows:
-			with session.begin_nested():
+			# PR #37 second review finding #8: deliberately NOT wrapped in an
+			# outer session.begin_nested() around the whole call (unlike the
+			# other two loops in this module). A SAVEPOINT rolled back on
+			# exception discards EVERY write since the savepoint began — that
+			# would undo charge_sit_for_appointment's own inner savepoint that
+			# persists stripe_invoice_id right after create_invoice, defeating
+			# the entire point of that checkpoint the moment a LATER step
+			# (add_invoice_item/finalize) in the SAME call raises. A plain
+			# application/transport exception (a Stripe SDK error, a timeout)
+			# leaves the session's transaction healthy — nothing here needs an
+			# explicit rollback to keep processing the next row; the try/except
+			# below is what keeps one bad row from stopping the batch, and
+			# resolve_sit_charge()'s own targeted begin_nested() (in
+			# sit_billing.py) still protects its specific compare-and-swap.
+			try:
 				outcome = charge_sit_for_appointment(
 					session, client_id=row.client_id, appointment_id=row.appointment_id, as_of=claim_time,
 				)
 				if outcome.status == "INVOICED":
 					invoiced += 1
+			except Exception:  # noqa: BLE001 - one bad row must not discard the rest of the batch
+				logger.exception(
+					"billing_sweep.sit_invoice: appointment %s (client=%s) failed unexpectedly",
+					row.appointment_id, row.client_id,
+				)
 	logger.info("billing_sweep.sit_invoice: invoiced %d appointment(s)", invoiced)
 	return invoiced
 

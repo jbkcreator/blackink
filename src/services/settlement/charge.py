@@ -77,6 +77,7 @@ def _load_row(session: Session, transaction_id: int):
 		text(
 			"SELECT t.transaction_id, t.client_id, t.company_id, t.opportunity_id, t.door_count, "
 			"       t.installment_1_cents, t.installment_2_cents, t.inst1_attempts, t.inst2_attempts, "
+			"       t.inst1_stripe_invoice_id, t.inst2_stripe_invoice_id, "
 			"       t.evidence_packet_url, t.door_signed_at, "
 			"       a.pms_agreement_id, a.agreement_source, a.status AS agreement_status, "
 			"       c.stripe_customer_id, c.ach_payment_method_id_encrypted, c.card_payment_method_id_encrypted "
@@ -224,89 +225,139 @@ def charge_installment(
 	gw = gateway or LiveStripeGateway()
 	amount_cents = row.installment_1_cents if installment == 1 else row.installment_2_cents
 	key_prefix = f"settlement|{transaction_id}|{installment}"
+	existing_invoice_id = row.inst1_stripe_invoice_id if installment == 1 else row.inst2_stripe_invoice_id
 
-	invoice = gw.create_invoice(
-		stripe_customer_id=row.stripe_customer_id,
-		default_payment_method_id=ach_pm or card_pm,
-		metadata={
-			"client_id": row.client_id, "transaction_id": str(transaction_id),
-			"installment": str(installment), "opportunity_id": str(row.opportunity_id),
-			"pms_agreement_id": str(row.pms_agreement_id),
-		},
-		idempotency_key=f"settlement-invoice|{key_prefix}",
-	)
+	if existing_invoice_id:
+		# PR #37 review finding #8-adjacent recovery: this installment already
+		# has a Stripe invoice from an earlier attempt (persisted immediately
+		# below the moment create_invoice() first succeeded). Reuse it rather
+		# than calling create_invoice again — the OBJECT-creation idempotency
+		# keys below would return the same invoice anyway within Stripe's
+		# ~24h key retention, but recording and reusing our own id makes that
+		# protection not depend on that window.
+		stripe_invoice_id = existing_invoice_id
+		logger.info(
+			"settlement.charge: transaction=%s installment=%s resuming existing invoice=%s",
+			transaction_id, installment, stripe_invoice_id,
+		)
+	else:
+		invoice = gw.create_invoice(
+			stripe_customer_id=row.stripe_customer_id,
+			default_payment_method_id=ach_pm or card_pm,
+			metadata={
+				"client_id": row.client_id, "transaction_id": str(transaction_id),
+				"installment": str(installment), "opportunity_id": str(row.opportunity_id),
+				"pms_agreement_id": str(row.pms_agreement_id),
+			},
+			idempotency_key=f"settlement-invoice|{key_prefix}",
+		)
+		stripe_invoice_id = invoice.stripe_invoice_id
+		# Persisted in its own savepoint immediately after create_invoice
+		# succeeds — BEFORE add_invoice_item/finalize below — mirroring
+		# src/services/billing/sit_invoice.py's identical checkpoint (code
+		# review finding: this used to sit AFTER finalize_invoice, which left
+		# NO checkpoint at all if add_invoice_item/finalize itself raised). A
+		# LATER exception in this same call now rolls back only the later
+		# work, not this write, so the next claim/retry sees the invoice
+		# already recorded and reuses it via the `existing_invoice_id` branch
+		# above instead of risking a second Stripe invoice past Stripe's own
+		# ~24h idempotency-key retention window.
+		prefix = "inst1" if installment == 1 else "inst2"
+		with session.begin_nested():
+			session.execute(
+				text(f"UPDATE settlement_transactions SET {prefix}_stripe_invoice_id = :invoice_id WHERE transaction_id = :tid"),
+				{"invoice_id": stripe_invoice_id, "tid": transaction_id},
+			)
+
+	# add_invoice_item/finalize run on EVERY entry (resume or fresh), never
+	# only on the fresh-create path — their idempotency keys are pinned to
+	# (transaction_id, installment) alone, so re-running them against an
+	# already-itemized/already-finalized invoice is a safe no-op (Stripe
+	# returns the cached object/result), while a resumed invoice that never
+	# got this far the first time actually gets finished here instead of
+	# jumping straight to an unfinalized pay attempt.
 	gw.add_invoice_item(
-		stripe_invoice_id=invoice.stripe_invoice_id,
+		stripe_invoice_id=stripe_invoice_id,
 		stripe_customer_id=row.stripe_customer_id,
 		amount_cents=amount_cents,
 		description=f"Blackink verified door signed — installment {installment} of 2 ({row.door_count} door(s))",
 		idempotency_key=f"settlement-item|{key_prefix}",
 	)
 	gw.update_invoice_metadata(
-		stripe_invoice_id=invoice.stripe_invoice_id,
+		stripe_invoice_id=stripe_invoice_id,
 		metadata={"evidence_packet_url": url},
 	)
-	invoice = gw.finalize_invoice(
-		stripe_invoice_id=invoice.stripe_invoice_id, idempotency_key=f"settlement-finalize|{key_prefix}"
-	)
+	gw.finalize_invoice(stripe_invoice_id=stripe_invoice_id, idempotency_key=f"settlement-finalize|{key_prefix}")
+
+	# PR #37 review finding #2: the object-creation keys above stay pinned to
+	# (transaction_id, installment) alone — that is what guarantees ONE
+	# invoice/item/finalize per installment no matter how many times this
+	# function is entered. The PAYMENT-ATTEMPT keys below instead carry the
+	# already-incremented, DB-persisted `attempts` counter (set by
+	# claim_installment_1/2's own claim UPDATE, never a timestamp), so retry
+	# N always makes a genuinely new pay_invoice request to Stripe — a client
+	# who fixes their payment method between attempts is actually retried,
+	# instead of Stripe returning the ORIGINAL cached decline for a repeated
+	# identical key.
+	pay_key_suffix = f"|a{attempts}"
 
 	rail = "ACH" if ach_pm else "CARD"
 	outcome = gw.pay_invoice(
-		stripe_invoice_id=invoice.stripe_invoice_id,
+		stripe_invoice_id=stripe_invoice_id,
 		payment_method_id=None,  # uses the invoice's default_payment_method (ACH)
-		idempotency_key=f"settlement-pay-ach|{key_prefix}",
+		idempotency_key=f"settlement-pay-ach|{key_prefix}{pay_key_suffix}",
 	)
 
 	if outcome.status == "paid":
 		mark_installment(
 			session, transaction_id, installment, "CHARGED",
-			charged_at=as_of, stripe_invoice_id=invoice.stripe_invoice_id, rail=rail,
+			charged_at=as_of, stripe_invoice_id=stripe_invoice_id, rail=rail,
 		)
 		log_event(
 			row.client_id, f"settlement_installment_{installment}_charged",
 			entity_type="settlement_transaction", entity_id=str(transaction_id),
 			payload={
 				"transaction_id": transaction_id, "amount_cents": amount_cents,
-				"rail": rail, "stripe_invoice_id": invoice.stripe_invoice_id,
+				"rail": rail, "stripe_invoice_id": stripe_invoice_id,
 			},
 			session=session,
 		)
-		return ChargeOutcome(status="CHARGED", rail=rail, stripe_invoice_id=invoice.stripe_invoice_id)
+		return ChargeOutcome(status="CHARGED", rail=rail, stripe_invoice_id=stripe_invoice_id)
 
 	if outcome.is_transport_error:
 		# Indeterminate — NEVER attempt the card fallback on an indeterminate
 		# ACH result, and never mark FAILED (that would allow a retry to
 		# double-charge if the first attempt actually succeeded at Stripe).
-		mark_installment(session, transaction_id, installment, "UNCERTAIN", error=outcome.error_message)
+		mark_installment(session, transaction_id, installment, "UNCERTAIN", error=outcome.error_message, stripe_invoice_id=stripe_invoice_id)
 		return ChargeOutcome(status="UNCERTAIN", reason=outcome.error_message)
 
 	if outcome.status == "processing":
-		mark_installment(session, transaction_id, installment, "SETTLING", stripe_invoice_id=invoice.stripe_invoice_id)
-		return ChargeOutcome(status="SETTLING", stripe_invoice_id=invoice.stripe_invoice_id)
+		mark_installment(session, transaction_id, installment, "SETTLING", stripe_invoice_id=stripe_invoice_id)
+		return ChargeOutcome(status="SETTLING", stripe_invoice_id=stripe_invoice_id)
 
 	# A definite ACH decline: attempt the card fallback, only here.
 	if card_pm and ach_pm:
 		card_outcome = gw.pay_invoice(
-			stripe_invoice_id=invoice.stripe_invoice_id, payment_method_id=card_pm,
-			idempotency_key=f"settlement-pay-card|{key_prefix}",
+			stripe_invoice_id=stripe_invoice_id, payment_method_id=card_pm,
+			idempotency_key=f"settlement-pay-card|{key_prefix}{pay_key_suffix}",
 		)
 		if card_outcome.status == "paid":
 			mark_installment(
 				session, transaction_id, installment, "CHARGED",
-				charged_at=as_of, stripe_invoice_id=invoice.stripe_invoice_id, rail="CARD",
+				charged_at=as_of, stripe_invoice_id=stripe_invoice_id, rail="CARD",
 			)
 			log_event(
 				row.client_id, f"settlement_installment_{installment}_charged",
 				entity_type="settlement_transaction", entity_id=str(transaction_id),
 				payload={
 					"transaction_id": transaction_id, "amount_cents": amount_cents,
-					"rail": "CARD", "stripe_invoice_id": invoice.stripe_invoice_id,
+					"rail": "CARD", "stripe_invoice_id": stripe_invoice_id,
 				},
 				session=session,
 			)
-			return ChargeOutcome(status="CHARGED", rail="CARD", stripe_invoice_id=invoice.stripe_invoice_id)
+			return ChargeOutcome(status="CHARGED", rail="CARD", stripe_invoice_id=stripe_invoice_id)
 		if card_outcome.is_transport_error:
-			mark_installment(session, transaction_id, installment, "UNCERTAIN", error=card_outcome.error_message)
+			mark_installment(session, transaction_id, installment, "UNCERTAIN", error=card_outcome.error_message, stripe_invoice_id=stripe_invoice_id)
 			return ChargeOutcome(status="UNCERTAIN", reason=card_outcome.error_message)
 		outcome = card_outcome
 
@@ -320,5 +371,24 @@ def charge_installment(
 		},
 		session=session,
 	)
-	mark_installment_failed(session, transaction_id, installment, attempts, error)
+	became_failed_permanent = mark_installment_failed(
+		session, transaction_id, installment, attempts, error, stripe_invoice_id=stripe_invoice_id,
+	)
+	if became_failed_permanent:
+		# PR #37 review finding #2: exactly one incident per terminal
+		# failure, supporting a human deciding to call
+		# ledger.reopen_failed_permanent_installment() (wired to
+		# POST /api/v1/settlement/installments/reopen) once the client's
+		# payment method is fixed.
+		log_event(
+			row.client_id, "settlement_charge_failed_permanent", entity_type="settlement_transaction",
+			entity_id=str(transaction_id),
+			payload={
+				"transaction_id": transaction_id, "installment": installment,
+				"amount_cents": amount_cents, "attempts": attempts + 1,
+				"error_code": outcome.error_code, "error_message": outcome.error_message,
+				"stripe_invoice_id": stripe_invoice_id,
+			},
+			session=session,
+		)
 	return ChargeOutcome(status="FAILED", reason=error)
