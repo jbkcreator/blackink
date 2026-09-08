@@ -2,6 +2,7 @@
 tests/test_winback_ingest.py's scripted-session style."""
 
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -9,10 +10,14 @@ from src.services.owner_enrichment import (
 	EnrichmentInput,
 	EnrichmentResult,
 	StubOwnerEnrichmentProvider,
+	TracerfyEnrichmentProvider,
 	apply_result,
 	build_qa_summary,
 	chunk_inputs,
 	enrich_homestead_drop_signals,
+	_first_present,
+	_split_address,
+	_split_owner_name,
 )
 
 
@@ -233,6 +238,158 @@ def test_build_qa_summary_includes_all_counts():
 
 def test_enrich_homestead_drop_signals_is_a_documented_noop():
 	assert enrich_homestead_drop_signals(None, StubOwnerEnrichmentProvider()) == 0
+
+
+# ---------------------------------------------------------------------------
+# _split_address — the confirmed "STREET, CITY, ST[ ZIP]" convention only
+# ---------------------------------------------------------------------------
+
+def test_split_address_with_zip():
+	assert _split_address("123 Main St, Tampa, FL 33601") == ("123 Main St", "Tampa", "FL")
+
+
+def test_split_address_without_zip():
+	assert _split_address("123 Main St, Tampa, FL") == ("123 Main St", "Tampa", "FL")
+
+
+def test_split_address_no_commas_returns_none():
+	# No guessing — a format this regex doesn't recognize is excluded from
+	# submission entirely, never fed to Tracerfy as a garbage city.
+	assert _split_address("123 Main St") is None
+
+
+def test_split_address_blank_returns_none():
+	assert _split_address("") is None
+	assert _split_address(None) is None
+
+
+def test_split_address_lowercases_state_normalized_to_upper():
+	assert _split_address("1 Elm St, Clearwater, fl 33755") == ("1 Elm St", "Clearwater", "FL")
+
+
+# ---------------------------------------------------------------------------
+# _split_owner_name — deliberately simple (first token / remaining tokens)
+# ---------------------------------------------------------------------------
+
+def test_split_owner_name_two_tokens():
+	assert _split_owner_name("Jane Doe") == ("Jane", "Doe")
+
+
+def test_split_owner_name_three_tokens_keeps_rest_as_last():
+	assert _split_owner_name("Jane Q Doe") == ("Jane", "Q Doe")
+
+
+def test_split_owner_name_single_token_is_last_name_only():
+	assert _split_owner_name("Doe") == ("", "Doe")
+
+
+def test_split_owner_name_blank():
+	assert _split_owner_name("") == ("", "")
+	assert _split_owner_name(None) == ("", "")
+
+
+# ---------------------------------------------------------------------------
+# _first_present
+# ---------------------------------------------------------------------------
+
+def test_first_present_returns_first_nonblank():
+	row = {"email_1": "", "email_2": "  ", "email_3": "jane@example.com", "email_4": "other@example.com"}
+	assert _first_present(row, "email_1", "email_2", "email_3", "email_4") == "jane@example.com"
+
+
+def test_first_present_none_when_all_blank():
+	row = {"email_1": "", "email_2": None}
+	assert _first_present(row, "email_1", "email_2") is None
+
+
+# ---------------------------------------------------------------------------
+# TracerfyEnrichmentProvider — submit()/collect() end to end, transport mocked
+# ---------------------------------------------------------------------------
+
+def _tracerfy_input(**overrides):
+	base = dict(
+		winback_row_id=1,
+		owner_name="Jane Doe",
+		property_address="123 Main St, Tampa, FL 33601",
+		county_slug="hillsborough_fl",
+		known_email=None,
+		known_phone=None,
+	)
+	base.update(overrides)
+	return EnrichmentInput(**base)
+
+
+def test_tracerfy_provider_submits_only_parseable_addresses():
+	unparseable = _tracerfy_input(winback_row_id=2, property_address="123 Main St")  # no city/state
+	parseable = _tracerfy_input(winback_row_id=1)
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)) as mock_submit:
+		handle = provider.submit([parseable, unparseable])
+	records = mock_submit.call_args.args[0]
+	assert len(records) == 1
+	assert records[0]["address"] == "123 Main St"
+	assert records[0]["city"] == "Tampa"
+	assert records[0]["state"] == "FL"
+	assert records[0]["first_name"] == "Jane"
+	assert records[0]["last_name"] == "Doe"
+	# only the parseable row has a match key -- the unparseable one was
+	# never submitted, so it correctly falls into collect()'s not-found path
+	assert list(handle.match_keys.values()) == [1]
+
+
+def test_tracerfy_provider_submits_nothing_when_every_address_unparseable():
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch") as mock_submit:
+		handle = provider.submit([_tracerfy_input(property_address="123 Main St")])
+	mock_submit.assert_not_called()
+	assert handle.match_keys == {}
+
+
+def test_tracerfy_provider_collect_matches_by_normalized_address_not_row_id():
+	# Confirmed contract: Tracerfy does NOT echo back any submitted row id.
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
+		handle = provider.submit([_tracerfy_input(winback_row_id=7)])
+	result_row = {"address": "123 main st", "email_1": "jane@example.com", "primary_phone": "8135550100"}
+	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=[result_row]):
+		results = provider.collect(handle)
+	assert 7 in results
+	assert results[7].email == "jane@example.com"
+	assert results[7].phone == "8135550100"
+	assert results[7].phone_verified is True
+	assert results[7].provider == "tracerfy"
+
+
+def test_tracerfy_provider_collect_unmatched_result_row_is_ignored_not_crashed():
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
+		handle = provider.submit([_tracerfy_input(winback_row_id=1)])
+	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=[{"address": "999 Nowhere Ave"}]):
+		results = provider.collect(handle)
+	assert results == {}
+
+
+def test_tracerfy_provider_collect_no_phone_found_gives_none_not_false():
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
+		handle = provider.submit([_tracerfy_input(winback_row_id=1)])
+	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=[{"address": "123 main st", "email_1": "jane@example.com"}]):
+		results = provider.collect(handle)
+	assert results[1].phone is None
+	assert results[1].phone_verified is None  # never False -- Tracerfy never disproves a phone, only finds or doesn't
+
+
+def test_tracerfy_provider_collect_empty_match_keys_never_calls_poll():
+	# Every input was unparseable -- submit() must not waste an HTTP call
+	# either, and collect() must not waste a poll call.
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch") as mock_submit:
+		handle = provider.submit([_tracerfy_input(property_address="123 Main St")])
+	mock_submit.assert_not_called()
+	with patch("src.services.tracerfy_client.poll_skiptrace_queue") as mock_poll:
+		results = provider.collect(handle)
+	mock_poll.assert_not_called()
+	assert results == {}
 
 
 def test_build_qa_summary_surfaces_submit_failures_loudly():

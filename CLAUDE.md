@@ -677,15 +677,30 @@ CSV-supplied `phone`/`email` through unchanged, so a row that already has
 one keeps exactly the sequenceability it has today (the Win-Back gate below
 cannot regress the moment it lands).
 
-**`TracerfyEnrichmentProvider.submit()` currently raises
-`NotImplementedError`** — Tracerfy's skip-trace endpoint path, request
-body, and result-CSV column names are not confirmed against Tracerfy's real
-API docs (the existing `tracerfy_client.py` integration is DNC-only in both
-directions: `{"phones": [...]}` in, `national_dnc`/`litigator` out). This is
-deliberate: a wrong-guessed parser would silently return an empty result
-for every row, which reads as a plausible "nobody was found" outcome rather
-than a loud failure — see `tracerfy_client.py`'s module docstring before
-removing that `NotImplementedError`.
+**`TracerfyEnrichmentProvider` is fully implemented** (2026-09-08),
+cross-checked against Tracerfy's own API docs and the working, production
+ForcedAction-System reference integration (same vendor, same account
+type — `ForcedAction-System/Forced-action-/src/services/tracerfy_batch.py`).
+Skip-trace is a *different* Tracerfy product from the DNC scrub with its
+own contract: `POST /v1/api/trace/` as **multipart/form-data** (not JSON),
+a `queue_id` response key, and `GET /v1/api/queue/{id}` returning the
+result array **directly** (not DNC's `{"pending","download_url"}`
+wrapper) — completion is a stability window (row count steady across
+several polls, plus a minimum settle time), since Tracerfy streams results
+in; see `tracerfy_client.py`'s `poll_skiptrace_queue()`. Two gaps Tracerfy's
+API creates, both handled in `owner_enrichment.py`, not the transport layer:
+no submitted-row ID is echoed back in the result (matching is by normalized
+street address, reusing `winback_ingest.normalize_address()`), and `city`
+is a required separate request field while `winback_rows` only stores one
+freeform address string (`_split_address()` parses the confirmed
+`"STREET, CITY, ST[ ZIP]"` convention only — an address that doesn't match
+is excluded from that sweep's submission rather than guessed, and simply
+retried next sweep; upgrade path if real CSVs need more formats is the
+`usaddress`-based parser already proven in the ForcedAction-System sibling
+repo). `_split_owner_name()` is a deliberately simple first-token/rest split
+— Win-Back's `owner_name` is a client CSV column for an individual owner,
+not a corporate registry needing ForcedAction's own entity-detection
+machinery.
 
 `winback_rows` carries the enrichment state (`email_status`,
 `email_previous`, `phone_verified`, `requires_enrichment_review`,

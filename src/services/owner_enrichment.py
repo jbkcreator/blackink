@@ -25,6 +25,7 @@ for the full design rationale.
 from __future__ import annotations
 
 import logging
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -71,10 +72,10 @@ class EnrichmentResult:
         if not self.provider:
             raise ValueError("EnrichmentResult.provider must not be blank")
         if self.phone_verified is True and not self.phone:
-            # Defense in depth: the Tracerfy skip-trace response shape is
-            # still unconfirmed (see tracerfy_client.submit_skiptrace_batch's
-            # own docstring), so a provider claiming "verified" with no phone
-            # value is rejected here rather than silently accepted and later
+            # Defense in depth, kept even though the Tracerfy skip-trace
+            # response shape is now confirmed (tracerfy_client.py's module
+            # docstring): a provider claiming "verified" with no phone value
+            # is rejected here rather than silently accepted and later
             # misread by apply_result as verifying whatever phone the row
             # already had before this call.
             raise ValueError("EnrichmentResult.phone_verified=True requires a non-empty phone")
@@ -152,30 +153,101 @@ class StubOwnerEnrichmentProvider(OwnerEnrichmentProvider):
         }
 
 
+# "..., CITY, ST[ ZIP]" trailing pattern — the one comma-separated convention
+# this parses; anything else (no commas, city/state space-separated, a bare
+# street with no city at all) is left unparsed. See _split_address's own
+# docstring for why an unmatched address is excluded from submission rather
+# than guessed.
+_ADDRESS_CITY_STATE_RE = re.compile(
+    r"^(?P<street>.+?),\s*(?P<city>[^,]+?),\s*(?P<state>[A-Za-z]{2})\b\s*(?P<zip>\d{5}(?:-\d{4})?)?\s*$"
+)
+
+
+def _split_address(raw_address: str) -> Optional[tuple[str, str, str]]:
+    """Best-effort split of a freeform property_address_raw string into
+    (street, city, state) for Tracerfy's batch API, which requires city as
+    its own field (winback_rows only ever stores one freeform address
+    string — see the plan doc's §5.1b discussion of this gap).
+
+    ponytail: this is a single regex over one convention
+    ("STREET, CITY, ST ZIP"), not a general US-address parser. The
+    ForcedAction-System sibling repo has a battle-tested one
+    (src/utils/address_normalize.py, built on the `usaddress` library) for
+    exactly this problem — reach for that (and add `usaddress` as a
+    dependency) if real client CSVs turn out to use a format this regex
+    doesn't cover. Returns None (never a guess) when the format doesn't
+    match; the caller excludes that row from this sweep's Tracerfy
+    submission entirely rather than risk paying for a wrong city.
+
+    state is read from the parsed string, not hardcoded to "FL" — the
+    county scope is Florida-only today, but the address string is the more
+    direct source when it parses, and doing so costs nothing extra."""
+    m = _ADDRESS_CITY_STATE_RE.match((raw_address or "").strip())
+    if not m:
+        return None
+    street = m.group("street").strip()
+    city = m.group("city").strip()
+    state = m.group("state").strip().upper()
+    if not street or not city or len(state) != 2:
+        return None
+    return street, city, state
+
+
+def _split_owner_name(raw_name: str) -> tuple[str, str]:
+    """First token -> first_name, remaining tokens joined -> last_name.
+    Deliberately not ForcedAction's own name-parsing engine (comma-form
+    "LAST, FIRST", joint owners "JOHN AND JANE SMITH", corporate-entity
+    detection, surname particles) — that machinery exists there to handle
+    Sunbiz corporate-registry names and deed-roll joint filings. Win-Back's
+    owner_name comes from the client's own lost-lead CSV (a required column,
+    presumably already "First Last" for an individual), not a public
+    registry, and nothing in this repo's spec asks Win-Back to resolve
+    corporate/joint owners to an individual. A single unsplittable token
+    (or an empty string) becomes (first="", last=token) — Tracerfy's
+    first_name_column/last_name_column are documented as independently
+    optional, so a last-name-only submission is still a legal request."""
+    tokens = (raw_name or "").split()
+    if not tokens:
+        return "", ""
+    if len(tokens) == 1:
+        return "", tokens[0]
+    return tokens[0], " ".join(tokens[1:])
+
+
 @dataclass(frozen=True)
 class _TracerfySubmitHandle:
     """What Tracerfy's submit() returns to feed collect(): the queue_id to
-    poll, plus the exact input batch (needed by collect() to know which
-    winback_row_ids to expect back)."""
+    poll, the estimated wait Tracerfy itself reported, and a match_key ->
+    winback_row_id map built from exactly the rows that were actually
+    submitted (address-unparseable inputs are excluded before submission —
+    see _split_address — so they are never in this map and therefore
+    correctly fall into collect()'s "absent = not-found" path without a
+    wasted vendor credit)."""
 
     queue_id: str
-    inputs: list[EnrichmentInput]
+    estimated_wait_seconds: int
+    match_keys: dict[str, int]  # normalized street address -> winback_row_id
 
 
 class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
     """Real skip-trace provider — same Tracerfy account as the DNC scrub
     (config/settings.py's tracerfy_api_key). Thin adapter over
-    tracerfy_client's submit_skiptrace_batch()/poll_queue(): this class owns
-    row_id keying and EnrichmentResult parsing, tracerfy_client owns HTTP
-    transport — same split as compliance_gate.DncProvider vs tracerfy_client
-    for DNC.
+    tracerfy_client's submit_skiptrace_batch()/poll_skiptrace_queue(): this
+    class owns address-key matching and EnrichmentResult parsing,
+    tracerfy_client owns HTTP transport — same split as
+    compliance_gate.DncProvider vs tracerfy_client for DNC.
 
-    submit() will raise NotImplementedError until
-    tracerfy_client.submit_skiptrace_batch() is implemented against
-    Tracerfy's real, confirmed API contract — see that function's own
-    docstring. This class's own logic (batching via chunk_inputs(), row-id
-    matching, result parsing) is complete and ready; only the HTTP call
-    beneath submit() is deliberately unfinished.
+    Result rows are matched by normalized street address, NOT by an
+    embedded row-id field — confirmed (both from Tracerfy's own docs and
+    from the working ForcedAction-System reference integration) that the
+    batch queue result echoes back no submitted identifier at all. Reuses
+    winback_ingest.normalize_address() (uppercase, strip punctuation,
+    collapse whitespace) on both what was submitted and what Tracerfy
+    returns, rather than a new normalization scheme — this is a real,
+    if narrower, guarantee than ForcedAction's own USPS-suffix-standardizing
+    matcher (src/utils/address_normalize.py there), which would catch a
+    "St" vs "Street" style mismatch that this simpler key would miss. See
+    _split_address's own ponytail note for the same upgrade path.
 
     Caller (src/tasks/enrichment_verification.py) MUST call submit() for one
     chunk at a time (chunk_inputs()-sized, never the whole claimed set in one
@@ -191,52 +263,88 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
 
     def submit(self, inputs: list[EnrichmentInput]) -> object:
         from src.services.tracerfy_client import submit_skiptrace_batch
+        from src.services.winback_ingest import normalize_address
 
-        payload = [
-            {
-                "winback_row_id": i.winback_row_id,
-                "owner_name": i.owner_name,
-                "property_address": i.property_address,
-                "county_slug": i.county_slug,
-            }
-            for i in inputs
-        ]
-        queue_id = submit_skiptrace_batch(payload, self._api_key)
-        return _TracerfySubmitHandle(queue_id=queue_id, inputs=inputs)
+        records: list[dict] = []
+        match_keys: dict[str, int] = {}
+        for i in inputs:
+            split = _split_address(i.property_address)
+            if split is None:
+                # Excluded from this submission — no vendor credit spent on
+                # an address we can't even ask about correctly. Absent from
+                # match_keys, so collect() naturally reports it as
+                # not-found, which apply_result already handles: bounded
+                # retry, terminal via self-heal once attempts are exhausted.
+                continue
+            street, city, state = split
+            first_name, last_name = _split_owner_name(i.owner_name)
+            records.append({
+                "label": str(i.winback_row_id),  # Tracerfy dashboard traceability only — not echoed back, not used for matching
+                "first_name": first_name,
+                "last_name": last_name,
+                "address": street,
+                "city": city,
+                "state": state,
+            })
+            key = normalize_address(street)
+            if key:
+                match_keys[key] = i.winback_row_id
+
+        if not records:
+            # Every input in this chunk had an unparseable address — nothing
+            # to submit. A handle with an empty match_keys map still flows
+            # correctly through collect() (nothing to match, empty result),
+            # without a wasted HTTP call.
+            return _TracerfySubmitHandle(queue_id="", estimated_wait_seconds=0, match_keys={})
+
+        queue_id, estimated_wait = submit_skiptrace_batch(records, self._api_key)
+        return _TracerfySubmitHandle(queue_id=queue_id, estimated_wait_seconds=estimated_wait, match_keys=match_keys)
 
     def collect(self, handle: object) -> dict[int, EnrichmentResult]:
-        from src.services.tracerfy_client import poll_queue
+        from src.services.tracerfy_client import poll_skiptrace_queue
+        from src.services.winback_ingest import normalize_address
 
         assert isinstance(handle, _TracerfySubmitHandle)
-        # NOTE: the result-CSV column names read here (winback_row_id,
-        # email, email_status, phone, phone_verified) are a PLACEHOLDER
-        # shape — they must be confirmed against Tracerfy's real skip-trace
-        # response before this parsing is trusted. submit() above raises
-        # NotImplementedError today, so this method is never actually
-        # reached against unverified column names yet.
-        csv_rows = poll_queue(handle.queue_id, self._api_key)
-        by_row_id = {int(r["winback_row_id"]): r for r in csv_rows if r.get("winback_row_id")}
+        if not handle.match_keys:
+            return {}
+
+        result_rows = poll_skiptrace_queue(handle.queue_id, self._api_key, handle.estimated_wait_seconds)
         result: dict[int, EnrichmentResult] = {}
-        for i in handle.inputs:
-            row = by_row_id.get(i.winback_row_id)
-            if row is None:
-                continue  # not-found — caller (apply_result) treats an absent key correctly
-            result[i.winback_row_id] = EnrichmentResult(
-                email=(row.get("email") or "").strip() or None,
-                email_status="ESTIMATED",
-                phone=(row.get("phone") or "").strip() or None,
-                phone_verified=_parse_bool(row.get("phone_verified")),
+        for row in result_rows:
+            key = normalize_address(row.get("address") or "")
+            winback_row_id = handle.match_keys.get(key)
+            if winback_row_id is None:
+                logger.warning("owner_enrichment: skip-trace result row did not match any submitted address: %r", row.get("address"))
+                continue
+
+            phone = _first_present(row, "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4", "mobile_5",
+                                    "landline_1", "landline_2", "landline_3")
+            email = _first_present(row, "email_1", "email_2", "email_3", "email_4", "email_5")
+            result[winback_row_id] = EnrichmentResult(
+                email=email,
+                # ESTIMATED, not VERIFIED — Tracerfy's batch skip-trace has
+                # no verification/confidence field of its own; a returned
+                # value is a database match, not a confirmed-live contact.
+                # Matches the same posture apply_result's own docstring
+                # already documents for why this module never claims
+                # VERIFIED on Tracerfy's behalf.
+                email_status="ESTIMATED" if email else "UNVERIFIED",
+                phone=phone,
+                # True whenever Tracerfy returned a phone at all (presence
+                # IS the hit — confirmed there is no separate verification
+                # field), never False (Tracerfy never tells us a phone is
+                # confirmed WRONG, only that it did or didn't find one).
+                phone_verified=True if phone else None,
                 provider="tracerfy",
             )
         return result
 
 
-def _parse_bool(value) -> Optional[bool]:
-    s = str(value or "").strip().upper()
-    if s in ("Y", "YES", "TRUE", "1"):
-        return True
-    if s in ("N", "NO", "FALSE", "0"):
-        return False
+def _first_present(row: dict, *keys: str) -> Optional[str]:
+    for k in keys:
+        v = (row.get(k) or "").strip()
+        if v:
+            return v
     return None
 
 
@@ -398,16 +506,16 @@ def build_qa_summary(counts: dict) -> str:
     behind healthy-looking counts, since this summary is the pre-pilot green
     light and a human reads it, not just a caller checking an exit code:
 
-      - `provider=stub` means no live verification happened at all (missing
-        TRACERFY_API_KEY, or the skip-trace endpoint contract not yet
-        wired).
-      - `submit_failures > 0` means the vendor call itself is failing (bad
-        key, rate limit, or — before the endpoint contract is confirmed —
-        TracerfyEnrichmentProvider.submit()'s own NotImplementedError). This
-        is worse than provider=stub, because provider reads "tracerfy" (looks
-        live) while nothing is actually being verified — without this line,
-        the summary would read as a harmless "still pending" rather than a
-        broken integration."""
+      - `provider=stub` means no live verification happened at all — no
+        TRACERFY_API_KEY set (StubOwnerEnrichmentProvider is the fallback,
+        see run_sweep()).
+      - `submit_failures > 0` means the vendor call itself is failing —
+        typically a missing/invalid key (401/403) or a rate limit (429),
+        see tracerfy_client.submit_skiptrace_batch. This is worse than
+        provider=stub, because provider reads "tracerfy" (looks live) while
+        nothing is actually being verified — without this line, the summary
+        would read as a harmless "still pending" rather than a broken
+        integration."""
     live_note = "" if counts.get("provider") != "stub" else " — provider=stub, NOT a live verification"
     submit_failures = counts.get("submit_failures", 0)
     failure_note = (
