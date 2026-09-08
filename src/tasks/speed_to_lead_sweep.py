@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 _BATCH = 50
 
 
+class PostSendError(Exception):
+    """A failure that occurred AFTER sender.send() already delivered the email.
+
+    The SMTP send is not reversible, so the row must NOT be reset to RECEIVED
+    (that would resend the same auto-response on the next tick). It goes to the
+    terminal SENT_UNCONFIRMED state for manual reconciliation instead."""
+
+
 def run_sweep(limit: int = _BATCH) -> int:
     dispatched = 0
     with get_system_db_context() as system_session:
@@ -39,11 +47,19 @@ def run_sweep(limit: int = _BATCH) -> int:
         try:
             _send_response(row)
             dispatched += 1
+        except PostSendError:
+            # Email already went out — a pre-send retry would duplicate it.
+            # Flag terminal for manual reconciliation; never re-claim.
+            logger.exception(
+                "[stl-sweep] post-send write failed for id=%s — email already sent, "
+                "marking SENT_UNCONFIRMED (no resend)", row.id,
+            )
+            _mark_sent_unconfirmed(row.id)
         except Exception:
-            # Reset the claim so the row is retried on a later tick instead of
-            # being stranded in SENDING forever. Idempotency is preserved by
-            # _mark_responded only running after a successful send.
-            logger.exception("[stl-sweep] failed for id=%s — resetting to RECEIVED", row.id)
+            # Failure BEFORE the SMTP send (mailbox pick, template, booking
+            # link): safe to reset the claim so a later tick retries instead of
+            # stranding the row in SENDING forever.
+            logger.exception("[stl-sweep] failed before send for id=%s — resetting to RECEIVED", row.id)
             _reset_to_received(row.id)
     logger.info("[stl-sweep] dispatched %d response(s)", dispatched)
     return dispatched
@@ -89,6 +105,22 @@ def _reset_to_received(message_id) -> None:
             session.commit()
     except Exception:
         logger.exception("[stl-sweep] failed to reset id=%s to RECEIVED", message_id)
+
+
+def _mark_sent_unconfirmed(message_id) -> None:
+    """Terminal flag for a row whose email was sent but whose post-send write
+    failed. Never re-claimed by _claim_due (not RECEIVED/SENDING); a human
+    reconciles mailbox_id/responded_at. Prevents duplicate resends."""
+    try:
+        with get_system_db_context() as session:
+            session.execute(
+                text("UPDATE inbound_messages SET status = 'SENT_UNCONFIRMED' "
+                     "WHERE id = :id AND status = 'SENDING'"),
+                {"id": message_id},
+            )
+            session.commit()
+    except Exception:
+        logger.exception("[stl-sweep] failed to mark id=%s SENT_UNCONFIRMED", message_id)
 
 
 def _send_response(row) -> None:
@@ -152,25 +184,32 @@ def _send_response(row) -> None:
             sending_domain=mailbox.sending_domain,
         )
 
-        now = datetime.now(timezone.utc)
-        ack_latency = (now - row.received_at.replace(tzinfo=timezone.utc)).total_seconds()
+        # --- SMTP send has succeeded; everything past this point is a
+        # post-send write. A failure here is NOT retryable-from-scratch (the
+        # email is already out), so any exception is re-raised as PostSendError
+        # for the caller to flag terminal, never reset to RECEIVED. ---
+        try:
+            now = datetime.now(timezone.utc)
+            ack_latency = (now - row.received_at.replace(tzinfo=timezone.utc)).total_seconds()
 
-        # Emit the event BEFORE the status-update commit. _mark_responded()
-        # commits, which ends the transaction and clears SET LOCAL
-        # app.current_client_id — an events INSERT after that commit has no
-        # tenant context and RLS rejects it. Same transaction = one commit,
-        # tenant scope still active for both writes.
-        log_event(
-            client_id,
-            "speed_to_lead_response_sent",
-            entity_type="inbound_message",
-            entity_id=message_id,
-            payload={"message_id": message_id, "ack_latency_seconds": ack_latency},
-            session=session,
-        )
-        # Record the sending mailbox + timestamp so the mailbox picker counts
-        # this send against that mailbox's rolling-24h cap.
-        _mark_responded(session, message_id, ack_latency, mailbox_id=mailbox.mailbox_id)
+            # Emit the event BEFORE the status-update commit. _mark_responded()
+            # commits, which ends the transaction and clears SET LOCAL
+            # app.current_client_id — an events INSERT after that commit has no
+            # tenant context and RLS rejects it. Same transaction = one commit,
+            # tenant scope still active for both writes.
+            log_event(
+                client_id,
+                "speed_to_lead_response_sent",
+                entity_type="inbound_message",
+                entity_id=message_id,
+                payload={"message_id": message_id, "ack_latency_seconds": ack_latency},
+                session=session,
+            )
+            # Record the sending mailbox + timestamp so the mailbox picker counts
+            # this send against that mailbox's rolling-24h cap.
+            _mark_responded(session, message_id, ack_latency, mailbox_id=mailbox.mailbox_id)
+        except Exception as exc:
+            raise PostSendError(str(exc)) from exc
 
 
 def _mark_responded(

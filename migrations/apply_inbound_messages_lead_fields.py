@@ -89,8 +89,11 @@ DDL = [
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS mailbox_id BIGINT",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ",
     # Widen the status CHECK to include Dev 4's RECEIVED/SENDING/RESPONDED
-    # (additive — never removes a Dev 2 value). SENDING is the sweep's own
-    # in-progress sentinel, distinct from Dev 2's DEFERRED (LATER intent).
+    # plus SENT_UNCONFIRMED (additive — never removes a Dev 2 value). SENDING
+    # is the sweep's own in-progress sentinel, distinct from Dev 2's DEFERRED
+    # (LATER intent). SENT_UNCONFIRMED is terminal: the SMTP send succeeded but
+    # the post-send status write failed, so the row must never be re-claimed
+    # (a resend would duplicate the auto-response) — a human reconciles it.
     # Drop-and-recreate so re-running is safe.
     "ALTER TABLE inbound_messages DROP CONSTRAINT IF EXISTS ck_inbound_messages_status",
     """
@@ -98,7 +101,7 @@ DDL = [
         status IN (
             'PENDING','PROCESSING','CLASSIFIED','FAILED','SUPPRESSED','ESCALATED',
             'DEFERRED','ROUTED','REALLOCATED',
-            'RECEIVED','SENDING','RESPONDED'
+            'RECEIVED','SENDING','RESPONDED','SENT_UNCONFIRMED'
         )
     )
     """,
