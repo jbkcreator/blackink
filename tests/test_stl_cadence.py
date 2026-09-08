@@ -153,17 +153,77 @@ def test_touch_still_ready_returns_false_and_skips_for_stopped():
 
 # ── stop_active_stl_cadences ──────────────────────────────────────────────────
 
-def test_stop_active_stl_cadences_issues_update():
+def test_stop_active_stl_cadences_noop_when_no_armed_rows():
     from src.services import stl_cadence
     session = MagicMock()
+    session.execute.return_value.fetchall.return_value = []
 
-    stl_cadence.stop_active_stl_cadences(session, "client_a", "lead@example.com", "OPT_OUT")
+    count = stl_cadence.stop_active_stl_cadences(session, "client_a", "lead@example.com", "OPT_OUT")
 
-    session.execute.assert_called_once()
-    sql_str = str(session.execute.call_args.args[0])
-    # Should touch inbound_messages
-    assert "inbound_messages" in sql_str.lower() or True  # text() wraps it
-    # params check
+    assert count == 0
+    session.execute.assert_called_once()  # only the UPDATE...RETURNING, no cancels/events
     call_params = session.execute.call_args.args[1]
     assert call_params["client_id"] == "client_a"
     assert call_params["reason"] == "OPT_OUT"
+
+
+def test_stop_active_stl_cadences_cancels_touches_and_logs_per_message():
+    from src.services import stl_cadence
+    session = MagicMock()
+    # UPDATE...RETURNING id -> two latched messages
+    session.execute.return_value.fetchall.return_value = [(100,), (200,)]
+
+    with patch("src.services.stl_cadence._cancel_queued_touch_orders") as mock_cancel, \
+         patch("src.services.stl_cadence.log_event") as mock_log:
+        count = stl_cadence.stop_active_stl_cadences(session, "client_a", "lead@example.com", "REPLY")
+
+    assert count == 2
+    assert mock_cancel.call_count == 2
+    assert mock_log.call_count == 2
+    # entity_id is the concrete message id, not a wildcard
+    logged_entity_ids = {c.kwargs["entity_id"] for c in mock_log.call_args_list}
+    assert logged_entity_ids == {"100", "200"}
+
+
+def test_no_email_is_noop():
+    from src.services import stl_cadence
+    session = MagicMock()
+    assert stl_cadence.stop_active_stl_cadences(session, "client_a", "", "OPT_OUT") == 0
+    session.execute.assert_not_called()
+
+
+# ── in-body unsubscribe link (CLAUDE.md hard requirement) ─────────────────────
+
+def test_rendered_touch_includes_visible_unsubscribe_link():
+    from src.services import stl_cadence
+    tmpl = stl_cadence._default_touch_template(1)["body"]
+    html = stl_cadence._render_touch_html(tmpl, "Jane", "https://book.example.com",
+                                          "https://unsub.example.com/t?token=abc")
+    assert "https://unsub.example.com/t?token=abc" in html
+    assert "Unsubscribe" in html
+    assert "{{unsubscribe}}" not in html  # token must be substituted, not left raw
+
+
+# ── durable SENT_UNCONFIRMED guard (no resend after post-send write failure) ──
+
+def test_mark_sent_unconfirmed_writes_terminal_status_independently():
+    from src.services import stl_cadence
+    captured = {}
+
+    def _fake_update(session, message_id, touch_step, status, mailbox_id=None, sent_at=None):
+        captured["status"] = status
+        captured["mailbox_id"] = mailbox_id
+
+    with patch("src.services.stl_cadence.get_db_context") as ctx, \
+         patch("src.services.stl_cadence._update_dispatch_status", side_effect=_fake_update):
+        sess = MagicMock()
+        ctx.return_value.__enter__ = lambda s: sess
+        ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+        from datetime import datetime, timezone
+        stl_cadence._mark_sent_unconfirmed("client_a", 100, 3, 7, datetime.now(timezone.utc))
+
+    # Terminal state written; never reset to SENDING/RECEIVED.
+    assert captured["status"] == "SENT_UNCONFIRMED"
+    assert captured["mailbox_id"] == 7
+    sess.commit.assert_called_once()

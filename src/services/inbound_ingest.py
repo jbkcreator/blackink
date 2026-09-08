@@ -150,6 +150,13 @@ async def ingest_inbound_reply(parsed: InboundParsed) -> dict:
             },
         )
 
+        # Task 4.2.2 — a Speed-to-Lead lead who replies must stop their inbound
+        # cadence. STL leads are contactless (contact_id NULL), so the cold
+        # attribution above can never latch them; this is a separate, additive
+        # stop keyed purely on the sender email against ARMED STL cadences.
+        from src.services.stl_cadence import stop_active_stl_cadences
+        stop_active_stl_cadences(session, result.client_id, from_address, "REPLY")
+
         thread_lines = _recent_thread(session, contact_id=result.contact_id, run_id=result.run_id, exclude_id=inbound_id)
         ovs_lines = ovs_card_lines(fetch_latest_ovs(session, result.firm_company_id))
 

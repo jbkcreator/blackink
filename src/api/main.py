@@ -81,6 +81,10 @@ _RESPOND_SLA_SWEEP_INTERVAL_SECONDS = 60
 # Task 4.2.2 — sequence_sweep surfaces due STL cadence arm-checks (auto) and
 # touch approval cards (human-gated). Day-grain touches tolerate 5-min ticks.
 _SEQUENCE_SWEEP_INTERVAL_SECONDS = 300
+# Dispatches APPROVED work orders (the human-clicked approval cards) across all
+# tenants. Without this nothing in the deployed process ever executes an
+# approved order — the CLI --sweep is per-client and manual.
+_WORK_ORDER_EXECUTION_INTERVAL_SECONDS = 60
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -109,6 +113,7 @@ def _start_background_workers() -> None:
 	from src.tasks.speed_to_lead_sweep import run_sweep as speed_to_lead_sweep
 	from src.tasks.respond_sla_sweep import run_sweep as respond_sla_sweep
 	from src.tasks.sequence_sweep import run_sweep as sequence_sweep
+	from src.tasks.work_order_execution_sweep import run_sweep as work_order_execution_sweep
 	from src.agents.respond.worker import Worker as RespondWorker
 
 	workers = [
@@ -131,6 +136,9 @@ def _start_background_workers() -> None:
 		("respond_sla_sweep.run_sweep", _RESPOND_SLA_SWEEP_INTERVAL_SECONDS, respond_sla_sweep),
 		# Task 4.2.2 — surfaces STL cadence arm-checks + touch approval cards.
 		("sequence_sweep.run_sweep", _SEQUENCE_SWEEP_INTERVAL_SECONDS, sequence_sweep),
+		# Executes APPROVED work orders across all tenants (sends the touch
+		# emails a human approved). Without it approvals never dispatch.
+		("work_order_execution_sweep.run_sweep", _WORK_ORDER_EXECUTION_INTERVAL_SECONDS, work_order_execution_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)

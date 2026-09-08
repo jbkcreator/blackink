@@ -231,35 +231,47 @@ def dispatch_stl_cadence_touch(order) -> dict:
         if not prospect_email:
             logger.warning("[stl_cadence] touch %d: message_id=%s no email — skipping", touch_step, message_id_str)
             _claim_dispatch(session, message_id, touch_step, client_id, status="SENT")   # no send = treat as done
+            session.commit()
             return {"outcome": "NO_EMAIL", "message_id": message_id_str}
 
-        # ── At-most-once claim ─────────────────────────────────────────────────
-        # INSERT … ON CONFLICT DO NOTHING — if this touch was already sent
-        # (e.g. from a previous approved sweep tick that died after send),
-        # we skip it cleanly.
-        claimed = _claim_dispatch(session, message_id, touch_step, client_id, status="SENDING")
-        if not claimed:
-            logger.info("[stl_cadence] touch %d: message_id=%s already claimed — skip", touch_step, message_id_str)
-            return {"outcome": "ALREADY_CLAIMED", "message_id": message_id_str}
-
-        # ── Mailbox pick ───────────────────────────────────────────────────────
+        # ── Mailbox pick FIRST (before the at-most-once claim) ────────────────
+        # A capped/quarantined mailbox must DEFER and be retried later, so we
+        # pick the mailbox before writing any claim row. If we claimed first
+        # and then found no mailbox, the ON CONFLICT guard would make every
+        # retry return ALREADY_CLAIMED and the touch would never send.
         try:
             mailbox = get_active_mailbox_for_client(session, client_id)
         except (NoMailboxAvailable, AllMailboxesCapped) as exc:
             logger.warning("[stl_cadence] touch %d: no mailbox client=%s: %s", touch_step, client_id, exc)
-            # Undo the SENDING claim so cap / quarantine self-resolves naturally
-            _update_dispatch_status(session, message_id, touch_step, "FAILED")
+            session.rollback()   # drop the last_used bump; nothing to persist on a defer
             return {"outcome": "NO_MAILBOX", "message_id": message_id_str, "defer": True}
+
+        # ── At-most-once claim, COMMITTED BEFORE the SMTP send ────────────────
+        # INSERT … ON CONFLICT DO NOTHING. Committing the SENDING row (together
+        # with the mailbox last_used bump) BEFORE the network send is what makes
+        # the at-most-once guard durable: if a post-send write later fails and
+        # rolls its transaction back, this claim survives, so no retry can ever
+        # re-send the same touch (it would hit ON CONFLICT → ALREADY_CLAIMED).
+        claimed = _claim_dispatch(session, message_id, touch_step, client_id, status="SENDING")
+        if not claimed:
+            logger.info("[stl_cadence] touch %d: message_id=%s already claimed — skip", touch_step, message_id_str)
+            session.rollback()
+            return {"outcome": "ALREADY_CLAIMED", "message_id": message_id_str}
+        session.commit()
 
         # ── Build email ────────────────────────────────────────────────────────
         booking = resolve_owner_booking_link(session, client_id, name=prospect_name, email=prospect_email)
         booking_url = booking.url if booking else None
 
         unsub_url = unsubscribe_url(client_id, prospect_email)
-        html_body = _render_touch_html(body_template, prospect_name, booking_url)
+        # Pass unsub_url so the {{unsubscribe}} token renders a VISIBLE in-body
+        # link — CLAUDE.md requires both the List-Unsubscribe header (below) AND
+        # a visible body link on every outbound send.
+        html_body = _render_touch_html(body_template, prospect_name, booking_url, unsub_url)
         text_body = _html_to_text(html_body)
 
         sender = build_email_sender()
+        now = datetime.now(timezone.utc)
 
         # ── SMTP send ──────────────────────────────────────────────────────────
         sender.send(
@@ -271,19 +283,20 @@ def dispatch_stl_cadence_touch(order) -> dict:
             sending_domain=mailbox.sending_domain,
             list_unsubscribe_url=unsub_url,
         )
-        # SMTP succeeded — post-send writes below must never reset to SENDING.
+
+        # SMTP succeeded — post-send writes must never resend on failure. The
+        # claim is already durably SENDING (committed above); if these writes
+        # fail we flip that row to the terminal SENT_UNCONFIRMED in an
+        # independent transaction and raise _PostSendError for manual
+        # reconciliation — never a reset that would let the touch resend.
         try:
-            now = datetime.now(timezone.utc)
             _update_dispatch_status(session, message_id, touch_step, "SENT",
                                     mailbox_id=mailbox.mailbox_id, sent_at=now)
-
-            # After touch 5, mark cadence COMPLETED.
             if touch_step == 5:
                 session.execute(
                     text("UPDATE inbound_messages SET cadence_state = 'COMPLETED' WHERE id = :id"),
                     {"id": message_id},
                 )
-
             log_event(
                 client_id,
                 "outbound_touch_dispatched",
@@ -302,6 +315,8 @@ def dispatch_stl_cadence_touch(order) -> dict:
             )
             session.commit()
         except Exception as exc:
+            session.rollback()
+            _mark_sent_unconfirmed(client_id, message_id, touch_step, mailbox.mailbox_id, now)
             raise _PostSendError(str(exc)) from exc
 
     return {
@@ -310,6 +325,32 @@ def dispatch_stl_cadence_touch(order) -> dict:
         "touch_step": touch_step,
         "mailbox_id": mailbox.mailbox_id,
     }
+
+
+def _mark_sent_unconfirmed(
+    client_id: str,
+    message_id: int,
+    touch_step: int,
+    mailbox_id: int,
+    sent_at: datetime,
+) -> None:
+    """Flip a dispatch to the terminal SENT_UNCONFIRMED in its OWN transaction.
+
+    Called only after SMTP has already succeeded but a post-send write failed.
+    A separate get_db_context so this survives even when the caller's
+    transaction is poisoned/rolled back — the durable proof the touch was sent,
+    so no retry ever resends it."""
+    try:
+        with get_db_context(client_id=client_id) as session:
+            _update_dispatch_status(session, message_id, touch_step, "SENT_UNCONFIRMED",
+                                    mailbox_id=mailbox_id, sent_at=sent_at)
+            session.commit()
+    except Exception:
+        logger.exception(
+            "[stl_cadence] could not mark SENT_UNCONFIRMED message_id=%s touch=%s — "
+            "SENDING claim still blocks a resend, but reconcile manually",
+            message_id, touch_step,
+        )
 
 
 # ── Stop ─────────────────────────────────────────────────────────────────────
@@ -328,11 +369,13 @@ def stop_active_stl_cadences(
       - inbound_ingest (reply via Mailgun, if Reply-To is configured) (REPLY)
 
     Returns count of rows latched. No-op if no matching ARMED rows.
-    Uses a system session that bypasses RLS (message is already written
-    under the correct client_id so the WHERE client_id = :cid guard holds)."""
+    Runs on the caller's session (RLS app session from unsubscribe_router, or
+    the BYPASSRLS system session from inbound_ingest/booking_ingest); either
+    way the WHERE client_id = :cid guard scopes the batch to this client.
+    Does NOT commit — the caller owns the surrounding transaction."""
     if not email:
         return 0
-    result = session.execute(
+    rows = session.execute(
         text(
             "UPDATE inbound_messages "
             "SET cadence_state = 'STOPPED', "
@@ -341,17 +384,20 @@ def stop_active_stl_cadences(
             "WHERE client_id = :client_id "
             "  AND lower(sender_email) = lower(:email) "
             "  AND cadence_state = 'ARMED' "
+            "RETURNING id"
         ),
         {"client_id": client_id, "email": email, "reason": reason},
-    )
-    count = result.rowcount or 0
-    if count:
+    ).fetchall()
+    count = len(rows)
+    for r in rows:
+        message_id = r[0]
+        _cancel_queued_touch_orders(session, client_id, message_id)
         log_event(
             client_id,
             "speed_to_lead_opted_out" if reason == "OPT_OUT" else "stl_cadence_stopped",
             entity_type="inbound_message",
-            entity_id="*",   # batch stop — no single entity_id
-            payload={"email": email, "reason": reason, "count": count},
+            entity_id=str(message_id),
+            payload={"email": email, "reason": reason},
             session=session,
         )
     return count
@@ -437,16 +483,41 @@ def _update_dispatch_status(
 
 
 def _latch_stop(session: Session, message_id: int, reason: str) -> None:
-    session.execute(
+    row = session.execute(
         text(
             "UPDATE inbound_messages "
             "SET cadence_state = 'STOPPED', cadence_stopped_at = NOW(), "
             "    cadence_stop_reason = :reason "
-            "WHERE id = :id AND (cadence_state IS NULL OR cadence_state = 'ARMED')"
+            "WHERE id = :id AND (cadence_state IS NULL OR cadence_state = 'ARMED') "
+            "RETURNING client_id"
         ),
         {"id": message_id, "reason": reason},
-    )
+    ).fetchone()
+    if row is not None:
+        _cancel_queued_touch_orders(session, row[0], message_id)
     session.commit()
+
+
+def _cancel_queued_touch_orders(session: Session, client_id: str, message_id) -> None:
+    """Mark every still-QUEUED STL touch work order for this message SKIPPED.
+
+    On latching STOPPED we cancel outstanding touches eagerly rather than
+    relying only on the lazy stl_cadence_touch_still_ready gate at sweep time —
+    so a card never even surfaces after a reply/booking/opt-out. agent_work_orders
+    has no CANCELLED status, so SKIPPED is the terminal no-send state (winback
+    precedent). The status='QUEUED' guard keeps this idempotent."""
+    session.execute(
+        text(
+            "UPDATE agent_work_orders "
+            "SET status = 'SKIPPED', decided_by = 'stl_cadence:stop', "
+            "    decided_at = NOW(), updated_at = NOW() "
+            "WHERE client_id = :client_id "
+            "  AND action_class = :action "
+            "  AND entity_id = :entity_id "
+            "  AND status = 'QUEUED'"
+        ),
+        {"client_id": client_id, "action": _TOUCH_ACTION, "entity_id": str(message_id)},
+    )
 
 
 def _stop_reason_from_event(event_type: str) -> str:

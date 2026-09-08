@@ -77,13 +77,24 @@ def _resolve_client_daily_ceiling(session: Session, client_id: str) -> int:
 
 
 def _client_sends_last_24h(session: Session, client_id: str) -> int:
-    """Count the client's sends across all mailboxes in the rolling 24h window."""
+    """Count the client's sends across all mailboxes in the rolling 24h window.
+
+    Covers both cold-sequence touches and Speed-to-Lead cadence follow-ups
+    (Task 4.2.2) — an STL send is a real send against the client's daily volume,
+    so it must count toward the per-client ceiling too."""
     return session.execute(
         text(
-            "SELECT COUNT(*) FROM sequence_touch_dispatches "
-            "WHERE client_id = :client_id "
-            "  AND status IN ('SENDING', 'SENT') "
-            "  AND created_at >= NOW() - INTERVAL '24 hours'"
+            "SELECT ( "
+            "  SELECT COUNT(*) FROM sequence_touch_dispatches "
+            "  WHERE client_id = :client_id "
+            "    AND status IN ('SENDING', 'SENT') "
+            "    AND created_at >= NOW() - INTERVAL '24 hours' "
+            ") + ( "
+            "  SELECT COUNT(*) FROM stl_cadence_dispatches "
+            "  WHERE client_id = :client_id "
+            "    AND status IN ('SENDING', 'SENT', 'SENT_UNCONFIRMED') "
+            "    AND created_at >= NOW() - INTERVAL '24 hours' "
+            ")"
         ),
         {"client_id": client_id},
     ).scalar() or 0
@@ -181,6 +192,14 @@ def get_active_mailbox_for_client(
             "      WHERE im.mailbox_id = m.id "
             "        AND im.status = 'RESPONDED' "
             "        AND im.responded_at >= NOW() - INTERVAL '24 hours' "
+            "    ) + ( "
+            # Speed-to-Lead cadence follow-ups (Task 4.2.2) also consume this
+            # mailbox's rolling-24h capacity — without this a mailbox at cap
+            # could still send cadence touches and burn its warmed reputation.
+            "      SELECT COUNT(*) FROM stl_cadence_dispatches sd2 "
+            "      WHERE sd2.mailbox_id = m.id "
+            "        AND sd2.status IN ('SENDING', 'SENT', 'SENT_UNCONFIRMED') "
+            "        AND sd2.created_at >= NOW() - INTERVAL '24 hours' "
             "    ) "
             "  ) < :cap "
             "ORDER BY m.last_used_at ASC NULLS FIRST "
