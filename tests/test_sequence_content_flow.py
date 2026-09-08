@@ -16,6 +16,18 @@ from src.services import sequence_enrollment
 from src.services.sequence_content import render_touch, EMAIL_TOUCH_STEPS
 
 
+@pytest.fixture(autouse=True)
+def _stub_unsubscribe():
+    """Subtask 3.1.2's mandatory one-click unsubscribe footer/header is
+    computed unconditionally on every send path that reaches sender.send()
+    — stub it here since this suite never configures EMAIL_UNSUBSCRIBE_SECRET."""
+    with (
+        patch("src.services.sequence_orchestrator.unsubscribe_url", return_value="https://app.example.com/unsub?token=t"),
+        patch("src.services.sequence_orchestrator.append_unsubscribe_footer", side_effect=lambda body, url: body),
+    ):
+        yield
+
+
 def test_render_touch_has_real_non_placeholder_copy():
     for step in EMAIL_TOUCH_STEPS:
         subject, body, tv = render_touch(step, first_name="Dana", company_name="Acme PM")

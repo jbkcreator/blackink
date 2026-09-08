@@ -20,6 +20,7 @@ uvicorn src.api.main:app --reload --port 8000
 # Migrations (idempotent scripts, no Alembic) — run in this order:
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
+PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py   # Subtask 3.1.1 — Akrash staging feed, not tenant-bearing, any time after counties
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_relay_halts.py   # not tenant-bearing, any time after clients
@@ -61,6 +62,8 @@ PYTHONPATH=. python migrations/apply_settlement_ledger.py   # Subtask 1.2.2 — 
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
+PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
+PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2 — Three-Touch Win-Back Sequence (winback_touch_dispatches, stop columns, calendar_connections.is_default_owner_booking; after apply_winback_imports.py and apply_calendar_connections.py, before RLS)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -179,6 +182,11 @@ Manager-backed env vars, never baked into the image):
   would make every previously-encrypted token undecryptable).
 - `CALENDAR_OAUTH_STATE_SECRET` — any random secret string, signs
   connect-link/state JWTs.
+- `EMAIL_UNSUBSCRIBE_SECRET` — any random secret string, signs one-click
+  unsubscribe JWTs (`src/services/email_unsubscribe.py`). Its own
+  dedicated secret, never a reuse of `ADMIN_JWT_SECRET` — a missing value
+  means every outbound cold/win-back send fails loudly at dispatch time
+  rather than shipping without the mandatory unsubscribe mechanism.
 - `CALENDAR_WEBHOOK_BASE_URL` — the Cloud Run service's own public
   `https://...run.app` URL (or a mapped custom domain), used to build
   both the OAuth redirect URI and the webhook URLs handed to Google/
@@ -255,6 +263,31 @@ silently dropped: every row that doesn't promote carries a
   (`PASS/FAIL/ABSTAIN`, tri-state — `ABSTAIN` always blocks, no
   override). Both share the `DncProvider`/`EmailVerificationProvider`
   interfaces (no vendor contracted yet — stub implementations only).
+
+### Outbound email — mandatory one-click unsubscribe (non-negotiable)
+**Every cold/win-back outbound email MUST carry a working, self-service
+one-click unsubscribe — no exceptions, no sequence ships without it.** This
+is a client-stated hard requirement (confirmed 2026-09-07), ported from
+`ForcedAction-System/Forced-action-`'s pattern
+(`src/services/email_unsubscribe.py`, `src/api/email_unsubscribe_router.py`,
+`docs/adr/0028-cross-channel-suppression-block-all.md` in that repo): a
+stateless signed token (PyJWT — this repo's existing library, not
+`python-jose`), minted once per send, embedded as both a `List-Unsubscribe`
+/ `List-Unsubscribe-Post: List-Unsubscribe=One-Click` header pair (RFC 8058
+— also required by Gmail/Yahoo's 2024 bulk-sender rules) and a visible link
+in the email body, landing on a public unauthenticated endpoint
+(`src/api/unsubscribe_router.py`, `GET`/`POST /api/v1/public/unsubscribe`)
+that suppresses the recipient immediately and idempotently. The click sets
+`contacts.is_opted_out = TRUE` and/or `winback_rows.stopped_at`/
+`stop_reason = 'OPT_OUT'` depending which table the email matches for that
+`client_id` — both are already hard gates in `compliance_gate.py` and the
+win-back touch gate respectively, so no new send-blocking logic is needed
+once the column is set, only the mechanism to set it. `EmailSender.send()`
+takes this as a `list_unsubscribe_url` parameter so both the cold 5-touch
+sequence (`sequence_orchestrator.py`) and any future outbound sequence get
+it from the same shared sending layer — do not reimplement per-sequence.
+See `docs/plans/2026-09-07-subtask-3.1.2-three-touch-winback-sequence.md`
+§3.7 for the full design.
 
 ### Deliverability infrastructure
 DNS/SPF/DKIM/DMARC setup and mailbox warmup are a **manual runbook**, not

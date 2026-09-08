@@ -42,6 +42,8 @@ from src.api.payment_auth_router import router as payment_auth_router
 from src.api.public_landing_router import router as public_landing_router
 from src.api.settlement_router import router as settlement_router
 from src.api.stripe_webhook_router import router as stripe_webhook_router
+from src.api.winback_router import router as winback_router
+from src.api.unsubscribe_router import router as unsubscribe_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -200,6 +202,8 @@ app.include_router(public_landing_router)
 app.include_router(payment_auth_router)
 app.include_router(stripe_webhook_router)
 app.include_router(settlement_router)
+app.include_router(winback_router)
+app.include_router(unsubscribe_router)
 
 
 @app.get("/healthz")

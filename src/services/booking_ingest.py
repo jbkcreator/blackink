@@ -642,6 +642,15 @@ def _process_event(
 					),
 					{"ocid": owner_contact_id, "bid": result["booking_id"]},
 				)
+			# Subtask 3.1.2 — a win-back owner booking a meeting must stop
+			# their touch sequence, regardless of match_status: winback
+			# owners are deliberately never linked to owner_contacts (3.1.1's
+			# own decision), so this can never resolve to MATCHED above —
+			# this is a separate, additive lookup keyed purely on email, not
+			# a change to the owner-matching logic itself.
+			if event.owner_email:
+				from src.services.winback_sequencer import stop_active_winback_runs
+				stop_active_winback_runs(session, connection.client_id, event.owner_email, "MEETING_BOOKED")
 
 		eligible_for_confirmation = not is_baseline_suppressed
 		if eligible_for_confirmation:
