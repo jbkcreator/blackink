@@ -31,7 +31,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import text
 
-from src.core.database import get_system_db_context
+from src.core.database import get_owner_db_context, get_system_db_context
 from src.tasks.enrichment_verification import _claim_rows, _mark_claimed
 from tests.fixtures.synthetic_tenants import CANARY_A, canary_tenants  # noqa: F401
 
@@ -41,9 +41,28 @@ def synthetic_winback_row(canary_tenants):  # noqa: F811 — pytest fixture inje
 	"""Inserts one real winback_imports + winback_rows row under the
 	canary_tenants fixture's CANARY_A client (freshly seeded in every
 	environment, unlike a hand-picked sandbox client_id), yields its
-	winback_row_id, then deletes both rows — same safe pattern already used
-	to live-verify this subtask's migration (zero real client data
-	touched)."""
+	winback_row_id, then deletes both rows.
+
+	Teardown uses get_owner_db_context(), NOT get_system_db_context() —
+	confirmed the hard way in CI: blackink_system (what get_system_db_context
+	uses, and what _claim_rows/_mark_claimed correctly run as in production)
+	was never granted DELETE on winback_imports/winback_rows/
+	winback_gate_checks (migrations/apply_winback_imports.py,
+	apply_winback_touch_sequence.py — unlike clients/companies/contacts,
+	which DO grant blackink_system DELETE; nothing in production ever
+	deletes a winback row, so this gap never mattered until a TEST needed
+	to). A DELETE that fails with InsufficientPrivilege aborts the whole
+	teardown transaction before the later statements even run, leaving the
+	row behind — which then made canary_tenants' own teardown fail with a
+	winback_imports_client_id_fkey violation trying to delete the
+	now-orphaned _leakcanary_a client, cascading into every later test that
+	shares that fixture for the rest of the CI run. The owner role (same one
+	every migrations/apply_*.py script uses) has no such restriction and is
+	the correct tool for test-only cleanup that a normal app role can't do.
+	winback_gate_checks itself is never written here (only
+	evaluate_winback_touch_gate does that, which this test never calls) —
+	dropped that delete rather than fixing its privilege, since there is
+	nothing there to clean up."""
 	import_id = str(uuid.uuid4())
 	now = datetime.now(timezone.utc)
 	with get_system_db_context() as session:
@@ -69,8 +88,7 @@ def synthetic_winback_row(canary_tenants):  # noqa: F811 — pytest fixture inje
 
 	yield row_id
 
-	with get_system_db_context() as session:
-		session.execute(text("DELETE FROM winback_gate_checks WHERE winback_row_id = :id"), {"id": row_id})
+	with get_owner_db_context() as session:
 		session.execute(text("DELETE FROM winback_rows WHERE winback_row_id = :id"), {"id": row_id})
 		session.execute(text("DELETE FROM winback_imports WHERE import_id = :iid"), {"iid": import_id})
 		session.commit()
