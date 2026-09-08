@@ -188,6 +188,49 @@ def test_only_blackink_app_can_execute_non_poach_function():
 		assert allowed is True, "blackink_app should retain EXECUTE — the app is the only caller"
 
 
+def test_akrash_ingest_can_insert_but_not_select_raw_assessor_parcels():
+	"""PR review finding (Subtask 3.1.1): an earlier version of
+	apply_raw_assessor_parcels.py granted akrash_ingest access directly in
+	the table-creation migration — a grant that apply_akrash_grant.py's own
+	REVOKE ALL (run LAST, per CLAUDE.md's documented order) silently wiped
+	with no error raised anywhere, since by the time it runs there is
+	nothing "unexpected" left to warn about. The fix moved the grant into
+	apply_akrash_grant.py itself, alongside the two pre-existing staging
+	tables' grants. Checked via has_table_privilege() rather than a live
+	connection as akrash_ingest, same reasoning as
+	test_only_blackink_app_can_execute_non_poach_function above (pg_hba/
+	firewall restrictions may legitimately block that role from reaching
+	the DB from outside its ingest path)."""
+	db = Database()
+	with db.session_scope() as session:
+		can_insert = session.execute(
+			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'INSERT')")
+		).scalar()
+		assert can_insert is True, "akrash_ingest must be able to INSERT into raw_assessor_parcels"
+
+		can_select = session.execute(
+			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'SELECT')")
+		).scalar()
+		assert can_select is False, "akrash_ingest must NOT be able to SELECT raw_assessor_parcels"
+
+		can_update = session.execute(
+			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'UPDATE')")
+		).scalar()
+		assert can_update is False, "akrash_ingest must NOT be able to UPDATE raw_assessor_parcels"
+
+		can_delete = session.execute(
+			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'DELETE')")
+		).scalar()
+		assert can_delete is False, "akrash_ingest must NOT be able to DELETE raw_assessor_parcels"
+
+		# blackink_system is the one that reads this table back (the
+		# assessor lookup in winback_ingest.py runs BYPASSRLS).
+		system_can_select = session.execute(
+			text("SELECT has_table_privilege('blackink_system', 'raw_assessor_parcels', 'SELECT')")
+		).scalar()
+		assert system_can_select is True, "blackink_system should retain SELECT on raw_assessor_parcels"
+
+
 def test_non_poach_function_discloses_no_identity(canary_tenants):
 	"""is_claimed_by_other_client returns a boolean only — the requesting
 	client must never learn WHICH other client owns a claimed company."""
