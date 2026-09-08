@@ -86,6 +86,24 @@ class StubEmailVerificationProvider(EmailVerificationProvider):
 		return "unknown"
 
 
+# Deliberately no TracerfyDncProvider wired in here, even though Tracerfy is
+# the confirmed DNC vendor (see src/services/tracerfy_client.py) — a real
+# submit-batch/poll-queue round trip can take up to 10 minutes
+# (_POLL_MAX_ATTEMPTS x _POLL_INTERVAL_SEC in that module) and was designed
+# for src/tasks/dnc_refresh.py's async monthly batch, not a synchronous
+# per-contact check. evaluate_touch_gate/evaluate_enrollment_gate are called
+# from live/synchronous paths (sequence_orchestrator.py's touch gate,
+# sequence_enrollment.enroll_contact) — wiring a live single-phone Tracerfy
+# call in as their default would block those paths for minutes per
+# unchecked contact. Every actual live-Tracerfy call in this codebase is a
+# genuine batch (dnc_refresh.py's monthly sweep, winback_ingest.py's
+# post-disposition scrub) that calls tracerfy_client directly, bypassing
+# this per-contact interface entirely — see winback_ingest.py's own
+# docstring for why. This gate stays on StubDncProvider (ABSTAIN on an
+# unchecked contact) until the async monthly refresh has populated a real
+# dnc_clean/dnc_checked_at value for it to read.
+
+
 def _record(session: Session, contact_id: int, client_id: str, result: GateCheckResult) -> None:
 	session.execute(
 		text(

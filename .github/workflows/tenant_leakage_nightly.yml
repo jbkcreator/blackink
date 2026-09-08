@@ -51,6 +51,7 @@ jobs:
           echo "DATABASE_URL_APP=postgresql://blackink_app:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
           echo "DATABASE_URL_SYSTEM=postgresql://blackink_system:test_only_password@localhost:5432/blackink_test" >> $GITHUB_ENV
           PYTHONPATH=. python migrations/apply_counties.py
+          PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py
           PYTHONPATH=. python migrations/apply_area_code_timezones.py
           PYTHONPATH=. python migrations/apply_clients.py
           PYTHONPATH=. python migrations/apply_relay_halts.py
@@ -92,7 +93,10 @@ jobs:
           PYTHONPATH=. python migrations/apply_inbound_messages_sla.py
           PYTHONPATH=. python migrations/apply_respond_routing_gaps.py
           PYTHONPATH=. python migrations/apply_entitlements_billing.py
+          PYTHONPATH=. python migrations/apply_winback_imports.py
+          PYTHONPATH=. python migrations/apply_winback_touch_sequence.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
+          PYTHONPATH=. python migrations/apply_akrash_grant.py
       - name: Run tenant leakage suite
         run: PYTHONPATH=. pytest tests/test_tenant_isolation.py -v
       - name: Alert on failure

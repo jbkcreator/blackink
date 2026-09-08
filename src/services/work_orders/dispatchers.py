@@ -85,6 +85,53 @@ def dispatch_email_touch(order: WorkOrder) -> dict:
 	return receipt
 
 
+def dispatch_winback_touch(order: WorkOrder) -> dict:
+	"""DISPATCH_WINBACK_TOUCH — Subtask 3.1.2. Same shape as
+	dispatch_email_touch above, but against winback_rows/winback_sequencer
+	instead of contacts/sequence_orchestrator — winback owners are never
+	linked to contacts (see 3.1.1's own deliberate decision)."""
+	from sqlalchemy import text
+
+	from src.core.database import get_db_context
+	from src.services.winback_sequencer import dispatch_winback_touch as _dispatch
+
+	touch_step = int(order.payload.get("touch_step", 0))
+	winback_row_id = int(order.entity_id)
+	subject = order.payload.get("subject")
+	body = order.payload.get("body")
+	template_version = order.payload.get("template_version", "")
+
+	with get_db_context(client_id=order.client_id) as session:
+		row = session.execute(
+			text("SELECT * FROM winback_rows WHERE winback_row_id = :id"),
+			{"id": winback_row_id},
+		).fetchone()
+		if row is None:
+			logger.error("dispatch_winback_touch: winback_row_id=%s not found", winback_row_id)
+			return {"outcome": "WINBACK_ROW_NOT_FOUND", "winback_row_id": winback_row_id, "fail": True}
+
+		result = _dispatch(
+			session, row, order.client_id, touch_step=touch_step,
+			subject=subject, body=body, template_version=template_version,
+		)
+
+	logger.info(
+		"dispatch_winback_touch: action_id=%s winback_row_id=%s touch=%d outcome=%s",
+		order.action_id, winback_row_id, touch_step, result.outcome,
+	)
+	receipt = {
+		"outcome": result.outcome,
+		"winback_row_id": winback_row_id,
+		"touch_step": touch_step,
+		"message_id": result.message_id,
+	}
+	if result.outcome in _DEFER_OUTCOMES:
+		receipt["defer"] = True
+	elif result.outcome in _FAIL_OUTCOMES:
+		receipt["fail"] = True
+	return receipt
+
+
 def dispatch_manual_task(order: WorkOrder) -> dict:
 	"""DIAL_TASK / LINKEDIN_TASK — human-performed touches (phone, LinkedIn).
 
@@ -108,4 +155,5 @@ DISPATCHERS: Dict[str, Callable[[WorkOrder], dict]] = {
 	"noop": noop_dispatch,
 	"setter": dispatch_email_touch,
 	"manual": dispatch_manual_task,
+	"winback": dispatch_winback_touch,
 }

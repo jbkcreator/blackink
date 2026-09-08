@@ -103,6 +103,21 @@ TENANT_POLICIES = {
 	"client_entitlements": {"mode": "direct", "column": "client_id"},
 	"billing_credits": {"mode": "direct", "column": "client_id"},
 	"subscription_overrides": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Both carry their own client_id
+	# column (winback_rows.client_id is denormalized from winback_imports at
+	# insert time, same "direct mode needs its own column per table"
+	# reasoning as meeting_outcome_prompt_jobs above).
+	"winback_imports": {"mode": "direct", "column": "client_id"},
+	"winback_rows": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.2 — Three-Touch Win-Back Sequence. At-most-once dispatch
+	# claim table, mirrors sequence_touch_dispatches' own direct-mode entry
+	# above, keyed on winback_row_id instead of run_id.
+	"winback_touch_dispatches": {"mode": "direct", "column": "client_id"},
+	# Audit-trail counterpart to compliance_gate_checks (above), for the
+	# win-back touch gate — a separate table because compliance_gate_checks'
+	# contact_id column is a hard FK to contacts, which a winback_row_id can
+	# never satisfy correctly.
+	"winback_gate_checks": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

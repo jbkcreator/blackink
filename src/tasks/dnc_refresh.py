@@ -25,81 +25,20 @@ Usage:
   PYTHONPATH=. python -m src.tasks.dnc_refresh --days 45
 """
 
-import csv
-import io
 import logging
-import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import requests
 from sqlalchemy import text
 
 from config.settings import get_settings
 from src.core.database import get_system_db_context
 from src.services.email_suppression import _normalize_phone
+from src.services.tracerfy_client import BATCH_SIZE as _BATCH_SIZE
+from src.services.tracerfy_client import is_dnc_hit, poll_queue, submit_batch
 
 logger = logging.getLogger(__name__)
-
-_TRACERFY_BASE = "https://tracerfy.com/v1/api"
-_SCRUB_ENDPOINT = f"{_TRACERFY_BASE}/dnc/scrub/"
-_QUEUE_ENDPOINT = f"{_TRACERFY_BASE}/dnc/queue/"
-_BATCH_SIZE = 1000
-_POLL_INTERVAL_SEC = 5
-_POLL_MAX_ATTEMPTS = 120  # 10 minutes
-
-
-# ---------------------------------------------------------------------------
-# Tracerfy API helpers
-# ---------------------------------------------------------------------------
-
-def _headers(api_key: str) -> dict:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-
-
-def _submit_batch(phones: list[str], api_key: str) -> str:
-    resp = requests.post(
-        _SCRUB_ENDPOINT,
-        headers=_headers(api_key),
-        json={"phones": phones},
-        timeout=30,
-    )
-    if resp.status_code in (401, 403):
-        raise RuntimeError(f"Tracerfy DNC: invalid API key ({resp.status_code})")
-    if resp.status_code == 429:
-        raise RuntimeError("Tracerfy DNC: rate limited (429)")
-    if not resp.ok:
-        raise RuntimeError(f"Tracerfy DNC HTTP {resp.status_code}: {resp.text[:300]}")
-    data = resp.json()
-    queue_id = data.get("dnc_queue_id") or data.get("queue_id") or data.get("id")
-    if not queue_id:
-        raise RuntimeError(f"Tracerfy DNC: no queue_id in response: {data}")
-    return str(queue_id)
-
-
-def _poll_queue(queue_id: str, api_key: str) -> list[dict]:
-    url = f"{_QUEUE_ENDPOINT}{queue_id}"
-    for attempt in range(_POLL_MAX_ATTEMPTS):
-        resp = requests.get(url, headers=_headers(api_key), timeout=30)
-        if not resp.ok:
-            raise RuntimeError(f"Tracerfy queue poll HTTP {resp.status_code}: {resp.text[:200]}")
-        data = resp.json()
-        if not data.get("pending", True):
-            download_url = data.get("download_url", "")
-            if not download_url:
-                logger.warning("dnc_refresh: queue=%s complete but no download_url", queue_id)
-                return []
-            csv_resp = requests.get(download_url, timeout=60)
-            if not csv_resp.ok:
-                raise RuntimeError(f"Tracerfy CSV download HTTP {csv_resp.status_code}")
-            return list(csv.DictReader(io.StringIO(csv_resp.text)))
-        logger.info("dnc_refresh: queue=%s pending attempt=%d", queue_id, attempt + 1)
-        time.sleep(_POLL_INTERVAL_SEC)
-    raise RuntimeError(f"Tracerfy queue {queue_id} did not complete within 10 minutes")
 
 
 # ---------------------------------------------------------------------------
@@ -159,16 +98,10 @@ def _persist_results(
             logger.warning("dnc_refresh: CSV phone=%s not in submitted batch", phone)
             continue
 
-        national_dnc = str(row.get("national_dnc", "")).strip().upper() in ("Y", "YES", "TRUE", "1")
-        litigator = str(row.get("litigator", "")).strip().upper() in ("Y", "YES", "TRUE", "1")
-
-        if national_dnc or litigator:
+        if is_dnc_hit(row):
             flagged_ids.extend(contact_ids)
             stats["dnc_hits"] += 1
-            logger.info(
-                "dnc_refresh: national_dnc=%s litigator=%s phone=%s contact_ids=%s",
-                national_dnc, litigator, phone, contact_ids,
-            )
+            logger.info("dnc_refresh: DNC hit phone=%s contact_ids=%s", phone, contact_ids)
         else:
             clean_ids.extend(contact_ids)
             stats["clean"] += 1
@@ -243,8 +176,8 @@ def run_dnc_refresh(
         logger.info("dnc_refresh: batch %d — submitting %d phones", batch_num, len(batch))
 
         try:
-            queue_id = _submit_batch(batch, api_key)
-            csv_rows = _poll_queue(queue_id, api_key)
+            queue_id = submit_batch(batch, api_key)
+            csv_rows = poll_queue(queue_id, api_key)
         except Exception:
             logger.error("dnc_refresh: batch %d failed", batch_num, exc_info=True)
             stats["failed"] += len(batch)

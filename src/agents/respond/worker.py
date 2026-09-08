@@ -195,6 +195,17 @@ def _route(
     elif result.intent == Intent.HOT_LEAD:
         _halt_sequence(db, sender_email, client_id)
 
+    # Any reply from a winback owner — regardless of intent — means a human
+    # is now in the loop; Touch 2/3 must not auto-fire. winback_rows is a
+    # standalone table (never joined to contacts/sequence_runs, see
+    # winback_sequencer.py's docstring), so the suppress/halt calls above
+    # can't reach it. stop_active_winback_runs() is a no-op for a sender who
+    # isn't in winback_rows for this client, so this is safe to call for
+    # every reply, not just ones from known winback owners.
+    from src.services.winback_sequencer import stop_active_winback_runs
+    stop_reason = "OPT_OUT" if result.intent == Intent.UNSUBSCRIBE else "REPLY"
+    stop_active_winback_runs(db, client_id, sender_email, stop_reason)
+
     _write_result(db, db_id, result, final_status, sla_due_at=sla_due_at,
                   requires_human_review=requires_human_review)
     db.commit()
