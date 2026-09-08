@@ -168,13 +168,28 @@ def test_confirm_cancels_card_hold_when_ach_verification_is_invalid(monkeypatch,
 
 
 def test_status_rejects_invalid_token():
-	resp = client.get("/api/v1/onboarding/payment-auth/status", params={"onboarding_token": "garbage"})
+	resp = client.get(
+		"/api/v1/onboarding/payment-auth/status", headers={"Authorization": "Bearer garbage"}
+	)
 	assert resp.status_code == 401
+
+
+def test_status_rejects_query_string_token():
+	"""PR #36 review finding 2 — a query-string onboarding_token must never
+	be honored again, since query strings are routinely retained in browser
+	history / proxy / observability logs. Missing the header entirely (no
+	matter what's in the query string) must 422/401, never authenticate."""
+	resp = client.get(
+		"/api/v1/onboarding/payment-auth/status", params={"onboarding_token": _token()}
+	)
+	assert resp.status_code in (401, 422)
 
 
 def test_status_404_for_unknown_company(monkeypatch, _db_session):
 	_db_session.execute.return_value.first.return_value = None
-	resp = client.get("/api/v1/onboarding/payment-auth/status", params={"onboarding_token": _token()})
+	resp = client.get(
+		"/api/v1/onboarding/payment-auth/status", headers={"Authorization": f"Bearer {_token()}"}
+	)
 	assert resp.status_code == 404
 
 
@@ -184,7 +199,9 @@ def test_status_reports_completion_flags(monkeypatch, _db_session):
 		card_payment_method_id_encrypted="enc_card",
 		ach_payment_method_id_encrypted=None,
 	)
-	resp = client.get("/api/v1/onboarding/payment-auth/status", params={"onboarding_token": _token()})
+	resp = client.get(
+		"/api/v1/onboarding/payment-auth/status", headers={"Authorization": f"Bearer {_token()}"}
+	)
 	assert resp.status_code == 200
 	body = resp.json()
 	assert body["payment_auth_completed"] is True

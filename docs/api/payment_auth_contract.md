@@ -113,7 +113,12 @@ token · `402` card declined (Stripe error code in the body; also logged as
 customer on file yet (call endpoint 1 first) · `409` card SetupIntent not
 yet `succeeded` · `502` Stripe API error.
 
-### 3. `GET /api/v1/onboarding/payment-auth/status?onboarding_token=<jwt>`
+### 3. `GET /api/v1/onboarding/payment-auth/status`
+
+Header: `Authorization: Bearer <jwt>` — **not** a query parameter. A
+query-string token is routinely retained in browser history,
+reverse-proxy/access logs, and observability systems; the header keeps a
+live onboarding credential out of all of them (PR #36 review finding 2).
 
 Response `200`:
 ```json

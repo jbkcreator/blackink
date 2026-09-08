@@ -277,7 +277,10 @@ def charge_installment(
 		# Indeterminate — NEVER attempt the card fallback on an indeterminate
 		# ACH result, and never mark FAILED (that would allow a retry to
 		# double-charge if the first attempt actually succeeded at Stripe).
-		mark_installment(session, transaction_id, installment, "UNCERTAIN", error=outcome.error_message)
+		mark_installment(
+			session, transaction_id, installment, "UNCERTAIN",
+			error=outcome.error_message, stripe_invoice_id=invoice.stripe_invoice_id,
+		)
 		return ChargeOutcome(status="UNCERTAIN", reason=outcome.error_message)
 
 	if outcome.status == "processing":
@@ -306,7 +309,10 @@ def charge_installment(
 			)
 			return ChargeOutcome(status="CHARGED", rail="CARD", stripe_invoice_id=invoice.stripe_invoice_id)
 		if card_outcome.is_transport_error:
-			mark_installment(session, transaction_id, installment, "UNCERTAIN", error=card_outcome.error_message)
+			mark_installment(
+				session, transaction_id, installment, "UNCERTAIN",
+				error=card_outcome.error_message, stripe_invoice_id=invoice.stripe_invoice_id,
+			)
 			return ChargeOutcome(status="UNCERTAIN", reason=card_outcome.error_message)
 		outcome = card_outcome
 

@@ -286,7 +286,10 @@ def _handle_settlement_event(event: dict) -> dict:
 			charged_at = (
 				datetime.fromtimestamp(paid_at_raw, tz=timezone.utc) if paid_at_raw else datetime.now(timezone.utc)
 			)
-			mark_installment(session, transaction_id, installment, "CHARGED", charged_at=charged_at)
+			mark_installment(
+				session, transaction_id, installment, "CHARGED",
+				charged_at=charged_at, stripe_invoice_id=obj.get("id"),
+			)
 		elif event_type == "invoice.payment_failed":
 			last_error = (obj.get("last_finalization_error") or {}).get("message", "invoice.payment_failed")
 			mark_installment_failed(session, transaction_id, installment, attempts=0, error=last_error)
