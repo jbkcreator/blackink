@@ -31,9 +31,15 @@ import os
 
 os.environ.setdefault("EMAIL_SENDER_MODE", "stub")
 os.environ.setdefault("MAILGUN_WEBHOOK_SIGNING_KEY", "e2e-test-signing-key")
-# Force a dummy Slack token so the closer-alert card (best-effort) can never
-# post to a real channel during the test — no team-visible side effects.
-os.environ["SLACK_BOT_TOKEN"] = "xoxb-e2e-disabled"
+
+# Slack policy: only allow the closer-alert card to REALLY post when running
+# against the dedicated TEST workspace (ENV_FILE=.env.test). Then the card
+# lands in the test setter channel and we assert closer_alert_posted. Under
+# any other env (e.g. prod .env), force a dummy token via os.environ — which
+# overrides the .env file — so a real prod channel can never be hit.
+USE_TEST_SLACK = os.environ.get("ENV_FILE", ".env").endswith(".env.test")
+if not USE_TEST_SLACK:
+    os.environ["SLACK_BOT_TOKEN"] = "xoxb-e2e-disabled"
 
 import hashlib
 import hmac
@@ -191,6 +197,12 @@ def main() -> int:
         R.check("send_at computed", m.send_at is not None)
         R.check("lead_sla_due_at computed", m.lead_sla_due_at is not None)
     R.check("inbound_lead_received event logged", "inbound_lead_received" in event_types())
+    if USE_TEST_SLACK:
+        # Real card was posted to the TEST setter channel — verify the event.
+        R.check("closer_alert_posted event logged (test Slack)",
+                "closer_alert_posted" in event_types())
+    else:
+        print("  SKIP  closer_alert_posted (Slack disabled — run ENV_FILE=.env.test to verify)")
 
     # ── Path A: validation 422 (no email/phone) ──────────────────────────────
     print("\n[Path A] validation + auth")
