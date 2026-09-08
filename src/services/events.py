@@ -47,6 +47,33 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	# Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture.
+	"payment_auth_completed": frozenset({"stripe_customer_id", "offer_code"}),
+	"payment_auth_failed": frozenset({"error_code", "error_message", "offer_code"}),
+	# Subtask 1.2.2 — 50/50 Settlement Split Engine & 60-Day Clawback Monitor.
+	"door_signed": frozenset(
+		{"pms_agreement_id", "opportunity_id", "door_count", "agreement_source", "door_signed_at"}
+	),
+	"settlement_opened": frozenset(
+		{"transaction_id", "total_bounty_cents", "installment_1_cents",
+		 "installment_2_cents", "installment_2_scheduled_for"}
+	),
+	"settlement_installment_1_charged": frozenset(
+		{"transaction_id", "amount_cents", "rail", "stripe_invoice_id"}
+	),
+	"settlement_installment_2_charged": frozenset(
+		{"transaction_id", "amount_cents", "rail", "stripe_invoice_id"}
+	),
+	"settlement_charge_failed": frozenset(
+		{"transaction_id", "installment", "error_code", "error_message"}
+	),
+	# The blueprint's own event name (Tasks/…v2.md:604) — kept verbatim.
+	"settlement_clawback_executed": frozenset(
+		{"transaction_id", "installment_2_cents", "terminated_at", "days_since_signed"}
+	),
+	"evidence_packet_compiled": frozenset(
+		{"transaction_id", "sha256", "bytes", "sections_with_gaps"}
+	),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is

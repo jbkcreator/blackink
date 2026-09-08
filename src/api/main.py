@@ -31,7 +31,10 @@ from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
 from src.api.booking_webhook_router import router as booking_webhook_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
+from src.api.payment_auth_router import router as payment_auth_router
 from src.api.public_landing_router import router as public_landing_router
+from src.api.settlement_router import router as settlement_router
+from src.api.stripe_webhook_router import router as stripe_webhook_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -55,6 +58,12 @@ _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS = 60
 _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS = 30
 _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS = 60
+# Subtask 1.2.2 — settlement engine. "Nightly" per the blueprint, but
+# hourly is cheap and idempotent (StubPmsProvider returns None regardless).
+_SETTLEMENT_DOOR_SIGNED_SWEEP_INTERVAL_SECONDS = 3600
+_SETTLEMENT_INSTALLMENT_1_SWEEP_INTERVAL_SECONDS = 60
+# A 60-day deadline needs no sub-hour precision.
+_SETTLEMENT_INSTALLMENT_2_SWEEP_INTERVAL_SECONDS = 3600
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -75,6 +84,11 @@ def _start_background_workers() -> None:
 	from src.tasks.no_show_recovery_sender import run_sweep as no_show_recovery_sweep
 	from src.tasks.self_serve_audit_worker import run_sweep as self_serve_audit_sweep
 	from src.tasks.meeting_outcome_prompt_sender import run_sweep as meeting_outcome_prompt_sweep
+	from src.tasks.settlement_sweep import (
+		run_door_signed_sweep as settlement_door_signed_sweep,
+		run_installment_1_sweep as settlement_inst1_sweep,
+		run_installment_2_sweep as settlement_inst2_sweep,
+	)
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -89,6 +103,9 @@ def _start_background_workers() -> None:
 		("no_show_recovery_sender.run_sweep", _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS, no_show_recovery_sweep),
 		("self_serve_audit_worker.run_sweep", _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS, self_serve_audit_sweep),
 		("meeting_outcome_prompt_sender.run_sweep", _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS, meeting_outcome_prompt_sweep),
+		("settlement_sweep.run_door_signed_sweep", _SETTLEMENT_DOOR_SIGNED_SWEEP_INTERVAL_SECONDS, settlement_door_signed_sweep),
+		("settlement_sweep.run_installment_1_sweep", _SETTLEMENT_INSTALLMENT_1_SWEEP_INTERVAL_SECONDS, settlement_inst1_sweep),
+		("settlement_sweep.run_installment_2_sweep", _SETTLEMENT_INSTALLMENT_2_SWEEP_INTERVAL_SECONDS, settlement_inst2_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
@@ -150,6 +167,9 @@ app.include_router(akrash_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
 app.include_router(public_landing_router)
+app.include_router(payment_auth_router)
+app.include_router(stripe_webhook_router)
+app.include_router(settlement_router)
 
 
 @app.get("/healthz")
