@@ -15,26 +15,35 @@ Uses two independent DB sessions (get_system_db_context() twice — separate
 connections, separate transactions) to prove session B's claim genuinely
 excludes what session A already claimed and leased, not just that the two
 calls happen not to overlap by accident.
+
+Client scoping uses the repo's own canary-tenant fixture
+(tests/fixtures/synthetic_tenants.py), not a hand-picked client_id — an
+earlier draft hardcoded "DEMO_FRIDAY_SANDBOX", a client that only exists on
+the shared remote server this branch was manually smoke-tested against, not
+in CI's fresh database (confirmed the hard way: CI failed with a
+winback_imports_client_id_fkey violation). CANARY_A is freshly seeded by
+the canary_tenants fixture in every environment, CI included.
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import text
 
 from src.core.database import get_system_db_context
 from src.tasks.enrichment_verification import _claim_rows, _mark_claimed
-
-_TEST_CLIENT_ID = "DEMO_FRIDAY_SANDBOX"
+from tests.fixtures.synthetic_tenants import CANARY_A, canary_tenants  # noqa: F401
 
 
 @pytest.fixture
-def synthetic_winback_row():
+def synthetic_winback_row(canary_tenants):  # noqa: F811 — pytest fixture injection, not a redefinition
 	"""Inserts one real winback_imports + winback_rows row under the
-	existing DEMO_FRIDAY_SANDBOX sandbox client, yields its winback_row_id,
-	then deletes both rows — same safe pattern already used to live-verify
-	this subtask's migration (zero real client data touched)."""
+	canary_tenants fixture's CANARY_A client (freshly seeded in every
+	environment, unlike a hand-picked sandbox client_id), yields its
+	winback_row_id, then deletes both rows — same safe pattern already used
+	to live-verify this subtask's migration (zero real client data
+	touched)."""
 	import_id = str(uuid.uuid4())
 	now = datetime.now(timezone.utc)
 	with get_system_db_context() as session:
@@ -43,7 +52,7 @@ def synthetic_winback_row():
 				"INSERT INTO winback_imports (import_id, client_id, filename, uploaded_by, status, created_at) "
 				"VALUES (:iid, :cid, 'concurrency_test.csv', 'pytest', 'COMPLETED', :now)"
 			),
-			{"iid": import_id, "cid": _TEST_CLIENT_ID, "now": now},
+			{"iid": import_id, "cid": CANARY_A, "now": now},
 		)
 		row_id = session.execute(
 			text(
@@ -54,7 +63,7 @@ def synthetic_winback_row():
 				"NULL, NULL, 'concurrency-test@example.com', 'STILL_OWNS_STILL_RENTING', FALSE, FALSE, :now, :now) "
 				"RETURNING winback_row_id"
 			),
-			{"iid": import_id, "cid": _TEST_CLIENT_ID, "now": now},
+			{"iid": import_id, "cid": CANARY_A, "now": now},
 		).scalar_one()
 		session.commit()
 
@@ -76,7 +85,7 @@ def test_second_sweep_cannot_reclaim_a_row_the_first_sweep_already_leased(synthe
 	# before calling provider.submit()/collect(), i.e. before the up-to-
 	# 10-minute vendor round trip that this whole test exists to simulate.
 	with get_system_db_context() as session_a:
-		rows_a = _claim_rows(session_a, _TEST_CLIENT_ID, None, max_attempts=3, limit=10, now=now)
+		rows_a = _claim_rows(session_a, CANARY_A, None, max_attempts=3, limit=10, now=now)
 		assert row_id in [r.winback_row_id for r in rows_a], "session A must claim the row first"
 		_mark_claimed(session_a, [r.winback_row_id for r in rows_a], now)
 		session_a.commit()
@@ -87,7 +96,7 @@ def test_second_sweep_cannot_reclaim_a_row_the_first_sweep_already_leased(synthe
 	# enrichment_attempts under budget -- fully re-claimable here, which is
 	# exactly the duplicate-submission race the PR review caught.
 	with get_system_db_context() as session_b:
-		rows_b = _claim_rows(session_b, _TEST_CLIENT_ID, None, max_attempts=3, limit=10, now=now)
+		rows_b = _claim_rows(session_b, CANARY_A, None, max_attempts=3, limit=10, now=now)
 		assert row_id not in [r.winback_row_id for r in rows_b], (
 			"session B re-claimed a row session A already leased -- the concurrency fix regressed"
 		)
@@ -98,7 +107,7 @@ def test_row_becomes_reclaimable_again_once_the_lease_expires(synthetic_winback_
 	now = datetime.now(timezone.utc)
 
 	with get_system_db_context() as session_a:
-		rows_a = _claim_rows(session_a, _TEST_CLIENT_ID, None, max_attempts=3, limit=10, now=now)
+		rows_a = _claim_rows(session_a, CANARY_A, None, max_attempts=3, limit=10, now=now)
 		_mark_claimed(session_a, [r.winback_row_id for r in rows_a], now)
 		session_a.commit()
 
@@ -106,11 +115,9 @@ def test_row_becomes_reclaimable_again_once_the_lease_expires(synthetic_winback_
 	# already past the lease window to _claim_rows's own lease_cutoff
 	# computation, proving a genuinely abandoned lease does not strand the
 	# row forever.
-	from datetime import timedelta
-
 	future = now + timedelta(minutes=20)
 	with get_system_db_context() as session_b:
-		rows_b = _claim_rows(session_b, _TEST_CLIENT_ID, None, max_attempts=3, limit=10, now=future)
+		rows_b = _claim_rows(session_b, CANARY_A, None, max_attempts=3, limit=10, now=future)
 		assert row_id in [r.winback_row_id for r in rows_b], (
 			"a row whose lease has genuinely expired must become re-claimable — crash recovery would otherwise strand it forever"
 		)
