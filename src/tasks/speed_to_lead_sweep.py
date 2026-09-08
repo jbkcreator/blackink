@@ -124,8 +124,12 @@ def _send_response(row) -> None:
 
         now = datetime.now(timezone.utc)
         ack_latency = (now - row.received_at.replace(tzinfo=timezone.utc)).total_seconds()
-        _mark_responded(session, message_id, ack_latency)
 
+        # Emit the event BEFORE the status-update commit. _mark_responded()
+        # commits, which ends the transaction and clears SET LOCAL
+        # app.current_client_id — an events INSERT after that commit has no
+        # tenant context and RLS rejects it. Same transaction = one commit,
+        # tenant scope still active for both writes.
         log_event(
             client_id,
             "speed_to_lead_response_sent",
@@ -134,6 +138,7 @@ def _send_response(row) -> None:
             payload={"message_id": message_id, "ack_latency_seconds": ack_latency},
             session=session,
         )
+        _mark_responded(session, message_id, ack_latency)
 
 
 def _mark_responded(session: Session, message_id: str, ack_latency: Optional[float]) -> None:

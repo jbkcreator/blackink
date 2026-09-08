@@ -24,6 +24,7 @@ auto-response email for rows where send_at <= now() AND status=RECEIVED.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -36,6 +37,21 @@ from sqlalchemy.orm import Session
 from src.core.database import get_db_context
 from src.services.events import log_event
 from src.services.business_hours import compute_send_at
+
+
+def _run_coro(coro):
+    """Run a coroutine to completion from EITHER a sync caller (Path A's
+    threadpool background task) or an async caller (Path B's async webhook
+    handler). asyncio.run() raises if a loop is already running, so when one
+    is, run the coroutine in a fresh loop on a worker thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)  # no running loop — safe
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(1) as ex:
+        return ex.submit(lambda: asyncio.run(coro)).result()
 
 logger = logging.getLogger(__name__)
 
@@ -225,13 +241,13 @@ def _compute_sla_due(received_at: datetime) -> datetime:
 
 
 def _post_closer_alert(session: Session, lead: InboundLead, message_id: str, received_at: datetime) -> None:
-    """Post a Slack card to #blackink-setter with lead context."""
-    from src.services.slack.bolt_app import app as slack_app
-    from config.settings import get_settings
+    """Post a Slack card to the setter channel (#blackink-setter) with lead
+    context. Uses the shared async post_action_card helper; runs it to
+    completion from this sync context. No-ops (returns None) when Slack isn't
+    configured. Only logs closer_alert_posted when the post actually lands."""
+    from src.services.slack.post import post_action_card
 
-    settings = get_settings()
-    channel = getattr(settings, "slack_closer_alert_channel", "#blackink-setter")
-
+    channel_key = "setter"
     local_time = received_at.strftime("%Y-%m-%d %H:%M UTC")
     blocks = [
         {
@@ -241,21 +257,25 @@ def _post_closer_alert(session: Session, lead: InboundLead, message_id: str, rec
                 "text": (
                     f"*New Inbound Lead* — `{lead.source_channel}`\n"
                     f"*Name:* {lead.prospect_name or 'Unknown'}\n"
-                    f"*Email:* {lead.email or '—'}  |  *Phone:* {lead.phone or '—'}\n"
-                    f"*Property:* {lead.property_address or '—'}\n"
+                    f"*Email:* {lead.email or '-'}  |  *Phone:* {lead.phone or '-'}\n"
+                    f"*Property:* {lead.property_address or '-'}\n"
                     f"*Inquiry:* {(lead.inquiry_text or '')[:300]}\n"
                     f"*Client:* `{lead.client_id}`  |  *Received:* {local_time}"
                 ),
             },
         }
     ]
-    slack_app.client.chat_postMessage(channel=channel, blocks=blocks, text="New inbound lead")
+    result = _run_coro(
+        post_action_card(channel_key=channel_key, text="New inbound lead", blocks=blocks)
+    )
+    if result is None:
+        return  # Slack unconfigured or post failed — nothing to record.
 
     log_event(
         lead.client_id,
         "closer_alert_posted",
         entity_type="inbound_message",
         entity_id=message_id,
-        payload={"message_id": message_id, "slack_channel": channel},
+        payload={"message_id": message_id, "slack_channel": result["channel_id"]},
         session=session,
     )

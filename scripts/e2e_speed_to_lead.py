@@ -1,7 +1,7 @@
 """End-to-end integration test for Task 4.2.1 Speed-to-Lead ingest.
 
 Drives BOTH ingress paths against a live local Postgres, then the SLA sweep,
-asserting the full chain: HTTP → orchestrator → inbound_messages + events →
+asserting the full chain: HTTP -> orchestrator -> inbound_messages + events →
 auto-response dispatch. Uses FastAPI's TestClient, which runs the real routers
 (auth, HMAC, RLS-safe client resolution, dedupe) and executes the webhook's
 BackgroundTask synchronously — so there is no server to start and no async race.
@@ -31,14 +31,21 @@ import os
 
 os.environ.setdefault("EMAIL_SENDER_MODE", "stub")
 os.environ.setdefault("MAILGUN_WEBHOOK_SIGNING_KEY", "e2e-test-signing-key")
+# Force a dummy Slack token so the closer-alert card (best-effort) can never
+# post to a real channel during the test — no team-visible side effects.
+os.environ["SLACK_BOT_TOKEN"] = "xoxb-e2e-disabled"
 
 import hashlib
 import hmac
 import json
 import sys
-import uuid
 
 sys.path.insert(0, ".")
+# Windows consoles default to cp1252 and choke on non-ASCII in prints.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:  # noqa: BLE001
+    pass
 
 from sqlalchemy import text
 
@@ -206,7 +213,7 @@ def main() -> int:
         "client_secret": SECRET, "email": "jane@renterco.com",
         "inquiry_text": "dup", "source": "WEBSITE_FORM", "external_id": "e2e-lead-1",
     })
-    R.check("duplicate external_id → no new row", len(messages()) == before, f"{before}→{len(messages())}")
+    R.check("duplicate external_id -> no new row", len(messages()) == before, f"{before}→{len(messages())}")
 
     # ── Path A: deterministic fallback dedupe (no external_id) ────────────────
     payload_no_id = {
@@ -220,7 +227,7 @@ def main() -> int:
     same_key = r1.json().get("dedupe_key") == r2.json().get("dedupe_key")
     R.check("no-external_id retry reuses deterministic key", same_key,
             f"{r1.json().get('dedupe_key')} vs {r2.json().get('dedupe_key')}")
-    R.check("no-external_id retry → no duplicate row", n_after_first == n_after_second,
+    R.check("no-external_id retry -> no duplicate row", n_after_first == n_after_second,
             f"{n_after_first}→{n_after_second}")
 
     # ── Path B: bad signature 406 ─────────────────────────────────────────────
