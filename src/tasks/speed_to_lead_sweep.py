@@ -57,8 +57,8 @@ def _claim_due(session: Session, limit: int):
             "  ORDER BY send_at ASC LIMIT :limit "
             "  FOR UPDATE SKIP LOCKED"
             ") "
-            "RETURNING message_id, client_id, contact_id, source_channel, "
-            "          received_at, dedupe_key"
+            "RETURNING message_id, client_id, source_channel, "
+            "          prospect_name, prospect_email, received_at, dedupe_key"
         ),
         {"limit": limit},
     ).fetchall()
@@ -70,20 +70,17 @@ def _send_response(row) -> None:
     client_id = row.client_id
     message_id = str(row.message_id)
 
-    with get_db_context(client_id=client_id) as session:
-        # Resolve contact email
-        contact = session.execute(
-            text("SELECT first_name, email FROM contacts WHERE contact_id = :id"),
-            {"id": row.contact_id},
-        ).first() if row.contact_id else None
+    prospect_email = row.prospect_email
+    prospect_name = row.prospect_name
 
-        if not contact or not contact.email:
-            logger.warning("[stl-sweep] no contact email for message_id=%s — marking RESPONDED", message_id)
+    with get_db_context(client_id=client_id) as session:
+        if not prospect_email:
+            logger.warning("[stl-sweep] no prospect email for message_id=%s — marking RESPONDED", message_id)
             _mark_responded(session, message_id, ack_latency=None)
             return
 
         # Resolve booking link (best-effort; None → omit from email)
-        booking = resolve_booking_link(session, name=contact.first_name, email=contact.email)
+        booking = resolve_booking_link(session, name=prospect_name, email=prospect_email)
         booking_url = booking.url if booking else None
 
         # Resolve per-client template
@@ -98,7 +95,7 @@ def _send_response(row) -> None:
         subject = (template_row.stl_reply_subject if template_row else None) or "We received your inquiry"
         html_template = (template_row.stl_reply_html_template if template_row else None) or _default_template()
 
-        html_body = html_template.replace("{{name}}", contact.first_name or "there")
+        html_body = html_template.replace("{{name}}", prospect_name or "there")
         if booking_url:
             html_body = html_body.replace("{{booking_link}}", f'<a href="{booking_url}">Schedule a call</a>')
         else:
@@ -119,7 +116,7 @@ def _send_response(row) -> None:
         sender = build_email_sender()
         sender.send(
             from_address=mailbox.mailbox_address,
-            to_address=contact.email,
+            to_address=prospect_email,
             subject=subject,
             body=html_body,
             sending_domain=mailbox.sending_domain,

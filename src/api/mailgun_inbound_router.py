@@ -56,12 +56,14 @@ def _extract_subdomain(recipient: str) -> Optional[str]:
 
 
 def _resolve_client_id_from_slug(slug: str) -> Optional[str]:
+    """Resolve client_id from the subdomain slug. The clients table is
+    RLS-scoped, so a bare session sees zero rows — resolution goes through the
+    resolve_client_by_subdomain SECURITY DEFINER function
+    (apply_clients_stl_fields.py), same pre-tenant pattern as the booking
+    webhooks' resolve_calendar_connection."""
     with get_db_context() as session:
         row = session.execute(
-            text(
-                "SELECT client_id FROM clients "
-                "WHERE subdomain_slug = :slug AND is_active = TRUE LIMIT 1"
-            ),
+            text("SELECT client_id FROM resolve_client_by_subdomain(:slug)"),
             {"slug": slug},
         ).first()
     return row.client_id if row else None

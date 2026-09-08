@@ -39,6 +39,46 @@ DDL = [
     "ALTER TABLE clients ADD COLUMN IF NOT EXISTS stl_reply_html_template TEXT",
     # Unique index — two clients can't share the same subdomain slug
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_clients_subdomain_slug ON clients (subdomain_slug) WHERE subdomain_slug IS NOT NULL",
+    # ── Pre-tenant client resolution (SECURITY DEFINER) ──────────────────────
+    # The clients table is RLS-scoped (direct client_id). An inbound webhook
+    # has no tenant context yet — it must resolve client_id FROM the request
+    # before session_scope(client_id) can open. A bare app session sees zero
+    # clients rows under RLS, so these narrow SECURITY DEFINER functions do the
+    # lookup (same pattern as resolve_calendar_connection in
+    # apply_calendar_connections.py). They expose ONLY client_id, only for an
+    # exact secret-hash / slug match on an active client — never a table scan.
+    "DROP FUNCTION IF EXISTS resolve_client_by_webhook_secret(VARCHAR)",
+    """
+    CREATE OR REPLACE FUNCTION resolve_client_by_webhook_secret(p_secret_hash VARCHAR)
+    RETURNS TABLE(client_id VARCHAR)
+    SECURITY DEFINER
+    SET search_path = pg_catalog
+    LANGUAGE sql
+    AS $$
+        SELECT client_id FROM public.clients
+        WHERE inbound_webhook_secret_hash = p_secret_hash AND is_active = TRUE
+        LIMIT 1
+    $$
+    """,
+    "REVOKE EXECUTE ON FUNCTION resolve_client_by_webhook_secret(VARCHAR) FROM PUBLIC",
+    "GRANT EXECUTE ON FUNCTION resolve_client_by_webhook_secret(VARCHAR) TO blackink_app",
+    "ALTER FUNCTION resolve_client_by_webhook_secret(VARCHAR) OWNER TO CURRENT_USER",
+    "DROP FUNCTION IF EXISTS resolve_client_by_subdomain(VARCHAR)",
+    """
+    CREATE OR REPLACE FUNCTION resolve_client_by_subdomain(p_slug VARCHAR)
+    RETURNS TABLE(client_id VARCHAR)
+    SECURITY DEFINER
+    SET search_path = pg_catalog
+    LANGUAGE sql
+    AS $$
+        SELECT client_id FROM public.clients
+        WHERE subdomain_slug = p_slug AND is_active = TRUE
+        LIMIT 1
+    $$
+    """,
+    "REVOKE EXECUTE ON FUNCTION resolve_client_by_subdomain(VARCHAR) FROM PUBLIC",
+    "GRANT EXECUTE ON FUNCTION resolve_client_by_subdomain(VARCHAR) TO blackink_app",
+    "ALTER FUNCTION resolve_client_by_subdomain(VARCHAR) OWNER TO CURRENT_USER",
 ]
 
 

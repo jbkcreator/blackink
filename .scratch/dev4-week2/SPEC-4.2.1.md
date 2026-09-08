@@ -61,12 +61,27 @@ Both paths → one orchestrator → one `inbound_messages` write + `inbound_lead
 - `client_id` from subdomain slug → clients lookup (Q2). Reject if unresolved.
 - Budget: 5s. (Portal-specific parsers = 4.2.3, out of this subtask.)
 
+**Client resolution & RLS (PR-review fix):** `clients` is RLS-scoped, so an
+unscoped session sees zero rows. Both paths resolve `client_id` through a
+`SECURITY DEFINER` function (`resolve_client_by_webhook_secret` /
+`resolve_client_by_subdomain`, apply_clients_stl_fields.py) — same pre-tenant
+pattern as `resolve_calendar_connection`. Then open `session_scope(client_id)`.
+
+**Entity modeling (PR-review fix):** an inbound prospect is a renter/owner
+inquiring — NOT a PM-firm prospect — so nothing is written to
+`companies`/`contacts` (those require `domain` + `county_slug` and model
+outbound prospect firms). Prospect name/email/phone/address live directly on
+`inbound_messages`; `contact_id` stays NULL for inbound leads.
+
 **Shared pipeline (both paths):**
-1. Resolve `client_id` (reject if unresolved — Q2).
+1. Resolve `client_id` via SECURITY DEFINER fn (reject if unresolved — Q2).
 2. Dedupe on `dedupe_key` (Q5) — duplicate = no-op, no second response.
-3. Upsert `contacts` row, dedupe on email/phone per `client_id` (Q3a); set `contact_id`.
-4. Non-poach gate (Q4): `is_claimed_by_other_client` on resolvable company/domain → on match
-   write `non_poach_suppressed`, status=SUPPRESSED, **no response**. Nothing resolvable → proceed.
+   Path A fallback key is deterministic (hash of tenant+source+contact+content),
+   NOT a random UUID, so a source retry collapses onto the same row.
+3. Non-poach gate (Q4, advisory): look up an EXISTING company by sender email
+   domain; `is_claimed_by_other_client` → on match write `non_poach_suppressed`,
+   status=SUPPRESSED, **no response**. No existing company → proceed. Never
+   creates a company.
    *(Open: is inbound non-poach strict-block or advisory? confirm.)*
 5. Write `inbound_messages` + `inbound_lead_received` event (carries `source_channel`).
 6. Fire closer-alert Slack card to `#blackink-setter` **immediately** (Q12): prospect name,

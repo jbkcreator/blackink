@@ -5,12 +5,18 @@ through run_inbound_pipeline(). Nothing else in the codebase writes to
 inbound_messages directly; this is the single write path.
 
 Pipeline steps (SPEC-4.2.1.md §2):
-  1. Dedupe on (client_id, dedupe_key) — duplicate → no-op, returns None.
-  2. Upsert contacts row, deduped on email/phone per client_id.
-  3. Non-poach gate — on match → status=SUPPRESSED, event, return.
-  4. Write inbound_messages + inbound_lead_received event.
-  5. Post closer-alert card to #blackink-setter immediately.
-  6. Compute send_at (now if in business hours, else next business-open).
+  1. Dedupe on (client_id, dedupe_key) — duplicate → no-op, returns existing.
+  2. Non-poach gate (advisory) — look up an EXISTING company by sender email
+     domain; if claimed by another client → status=SUPPRESSED, event, return.
+  3. Write inbound_messages (prospect fields stored inline, contact_id NULL)
+     + inbound_lead_received event.
+  4. Post closer-alert card to #blackink-setter immediately.
+  5. Compute send_at (now if in business hours, else next business-open).
+
+Inbound prospects are renters/owners inquiring — NOT PM-firm prospects — so
+nothing is written to companies/contacts (those model outbound prospect firms
+and require domain + county_slug). Prospect name/email/phone live directly on
+inbound_messages.
 
 The SLA sweep (src/tasks/speed_to_lead_sweep.py) dispatches the actual
 auto-response email for rows where send_at <= now() AND status=RECEIVED.
@@ -48,7 +54,6 @@ class InboundLead:
     inquiry_text: Optional[str]
     raw_payload: Optional[str]
     utm: Optional[dict] = None
-    company_name: Optional[str] = None    # for non-poach gate if resolvable
 
 
 @dataclass
@@ -78,39 +83,34 @@ def _run(session: Session, lead: InboundLead) -> PipelineResult:
         logger.info("[inbound] duplicate dedupe_key=%s client=%s — no-op", lead.dedupe_key, lead.client_id)
         return PipelineResult(message_id=str(existing), outcome="duplicate")
 
-    # ── 2. Upsert contact ─────────────────────────────────────────────────
-    contact_id = _upsert_contact(session, lead)
-
-    # ── 3. Non-poach gate ─────────────────────────────────────────────────
+    # ── 2. Non-poach gate (advisory) ──────────────────────────────────────
     #
-    # Gate is advisory for inbound leads (no company_id resolution yet —
-    # inbound only has email/phone, not a property-management company).
-    # If a company_name is supplied we attempt a domain-based lookup; if
-    # company_id can't be resolved we skip the gate (never hard-block on
-    # unresolvable). The gate is strict-block only where company_id is
-    # positively known.
-    company_id = _resolve_company_id(session, lead)
-    if company_id:
-        suppressed = _check_non_poach(session, company_id)
-        if suppressed:
-            message_id = _write_message(session, lead, contact_id, status="SUPPRESSED", send_at=None)
-            log_event(
-                lead.client_id,
-                "non_poach_suppressed",
-                entity_type="inbound_message",
-                entity_id=message_id,
-                payload={"message_id": message_id, "source_channel": lead.source_channel, "company_id": company_id},
-                session=session,
-            )
-            return PipelineResult(message_id=message_id, outcome="suppressed")
+    # An inbound speed-to-lead prospect is a renter/owner inquiring — NOT a
+    # PM-firm prospect — so nothing is written to companies/contacts here
+    # (those model outbound prospect firms and require domain + county_slug).
+    # The gate is advisory: it only looks up an EXISTING company by the
+    # sender's email domain and suppresses if that company is claimed by
+    # another client. No match → proceed. contact_id stays NULL.
+    company_id = _resolve_existing_company_id(session, lead)
+    if company_id and _check_non_poach(session, company_id):
+        message_id = _write_message(session, lead, status="SUPPRESSED", send_at=None)
+        log_event(
+            lead.client_id,
+            "non_poach_suppressed",
+            entity_type="inbound_message",
+            entity_id=message_id,
+            payload={"message_id": message_id, "source_channel": lead.source_channel, "company_id": company_id},
+            session=session,
+        )
+        return PipelineResult(message_id=message_id, outcome="suppressed")
 
-    # ── 4. Write inbound_messages + event ─────────────────────────────────
+    # ── 3. Write inbound_messages + event ─────────────────────────────────
     now_utc = datetime.now(timezone.utc)
     send_at = compute_send_at(now_utc)
     sla_due_at = _compute_sla_due(now_utc)
 
     message_id = _write_message(
-        session, lead, contact_id,
+        session, lead,
         status="RECEIVED", send_at=send_at, lead_sla_due_at=sla_due_at,
     )
     log_event(
@@ -135,100 +135,19 @@ def _run(session: Session, lead: InboundLead) -> PipelineResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def _upsert_contact(session: Session, lead: InboundLead) -> Optional[int]:
-    """Upsert a contacts row keyed on (client_id's owning company OR email/phone).
-    Returns contact_id (int) or None if neither email nor phone supplied."""
-    if not lead.email and not lead.phone:
-        return None
-
-    # Try email match first, then phone — one lookup avoids a full upsert
-    # when the contact already exists under this client.
-    row = session.execute(
-        text(
-            "SELECT c.contact_id FROM contacts c "
-            "JOIN companies co ON co.company_id = c.company_id "
-            "WHERE co.owning_client_id = :client_id "
-            "AND (c.email = :email OR c.phone = :phone) "
-            "LIMIT 1"
-        ),
-        {"client_id": lead.client_id, "email": lead.email or "", "phone": lead.phone or ""},
-    ).first()
-    if row:
-        return row.contact_id
-
-    # New contact — we need a company shell to FK into. Use a "INBOUND" pseudo-company
-    # keyed by client_id + email domain (or phone hash) so repeated inbound
-    # from same prospect doesn't explode companies.
-    company_id = _ensure_inbound_company(session, lead)
-    if company_id is None:
-        return None
-
-    result = session.execute(
-        text(
-            "INSERT INTO contacts "
-            "(company_id, contact_role_type, first_name, email, phone, created_at) "
-            "VALUES (:company_id, 'OWNER_BROKER_MD', :first_name, :email, :phone, NOW()) "
-            "ON CONFLICT (company_id, contact_role_type) DO UPDATE "
-            "SET email = COALESCE(EXCLUDED.email, contacts.email), "
-            "    phone = COALESCE(EXCLUDED.phone, contacts.phone), "
-            "    first_name = COALESCE(EXCLUDED.first_name, contacts.first_name) "
-            "RETURNING contact_id"
-        ),
-        {
-            "company_id": company_id,
-            "first_name": lead.prospect_name or "",
-            "email": lead.email,
-            "phone": lead.phone,
-        },
-    ).scalar()
-    return result
-
-
-def _ensure_inbound_company(session: Session, lead: InboundLead) -> Optional[str]:
-    """Return or create a lightweight company shell for this inbound lead.
-    Returns the companies.company_id (VARCHAR SHA-256), not a serial int.
-    Uses SHA-256 of (client_id + email_domain_or_phone) as company_id,
-    consistent with BaseIngestLoader.compute_company_id convention."""
-    if lead.email and "@" in lead.email:
-        domain = lead.email.split("@", 1)[1].lower().strip()
-        raw_key = f"{lead.client_id}:inbound:{domain}"
-    elif lead.phone:
-        raw_key = f"{lead.client_id}:inbound:phone:{lead.phone}"
-    else:
-        return None
-
-    company_id = hashlib.sha256(raw_key.encode()).hexdigest()
-
-    exists = session.execute(
-        text("SELECT company_id FROM companies WHERE company_id = :company_id LIMIT 1"),
-        {"company_id": company_id},
-    ).scalar()
-    if exists:
-        return str(exists)
-
-    session.execute(
-        text(
-            "INSERT INTO companies (company_id, owning_client_id, company_name, created_at) "
-            "VALUES (:company_id, :client_id, :company_name, NOW()) "
-            "ON CONFLICT (company_id) DO NOTHING"
-        ),
-        {
-            "company_id": company_id,
-            "client_id": lead.client_id,
-            "company_name": lead.company_name or (f"Inbound:{domain}" if lead.email and "@" in lead.email else "Inbound"),
-        },
-    )
-    return company_id
-
-
-def _resolve_company_id(session: Session, lead: InboundLead) -> Optional[str]:
-    """Try to resolve a known company_id from email domain for the non-poach gate.
-    Returns None if unresolvable — gate is skipped, never blocks on unknown."""
+def _resolve_existing_company_id(session: Session, lead: InboundLead) -> Optional[str]:
+    """Advisory non-poach lookup: does an EXISTING companies row match the
+    sender's email domain? Returns its company_id, else None. Never creates a
+    company — inbound leads are not PM-firm prospects. `companies.domain` is
+    UNIQUE, so at most one row matches."""
     if not lead.email or "@" not in lead.email:
         return None
     domain = lead.email.split("@", 1)[1].lower().strip()
-    raw_key = f"{lead.client_id}:inbound:{domain}"
-    return hashlib.sha256(raw_key.encode()).hexdigest()
+    row = session.execute(
+        text("SELECT company_id FROM companies WHERE domain = :domain LIMIT 1"),
+        {"domain": domain},
+    ).scalar()
+    return str(row) if row else None
 
 
 def _check_non_poach(session: Session, company_id: str) -> bool:
@@ -248,7 +167,6 @@ def _check_non_poach(session: Session, company_id: str) -> bool:
 def _write_message(
     session: Session,
     lead: InboundLead,
-    contact_id: Optional[int],
     *,
     status: str,
     send_at: Optional[datetime],
@@ -259,18 +177,24 @@ def _write_message(
     session.execute(
         text(
             "INSERT INTO inbound_messages "
-            "(message_id, client_id, contact_id, channel, source_channel, raw_payload, "
+            "(message_id, client_id, channel, source_channel, raw_payload, cleaned_body, "
+            " prospect_name, prospect_email, prospect_phone, property_address, "
             " received_at, send_at, lead_sla_due_at, status, dedupe_key, utm) "
-            "VALUES (:message_id, :client_id, :contact_id, :channel, :source_channel, "
-            "        :raw_payload, NOW(), :send_at, :lead_sla_due_at, :status, :dedupe_key, :utm)"
+            "VALUES (:message_id, :client_id, :channel, :source_channel, :raw_payload, :cleaned_body, "
+            "        :prospect_name, :prospect_email, :prospect_phone, :property_address, "
+            "        NOW(), :send_at, :lead_sla_due_at, :status, :dedupe_key, :utm)"
         ),
         {
             "message_id": message_id,
             "client_id": lead.client_id,
-            "contact_id": contact_id,
             "channel": lead.channel,
             "source_channel": lead.source_channel,
             "raw_payload": lead.raw_payload,
+            "cleaned_body": lead.inquiry_text,
+            "prospect_name": lead.prospect_name,
+            "prospect_email": lead.email,
+            "prospect_phone": lead.phone,
+            "property_address": lead.property_address,
             "send_at": send_at,
             "lead_sla_due_at": lead_sla_due_at,
             "status": status,

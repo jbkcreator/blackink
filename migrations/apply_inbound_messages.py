@@ -56,6 +56,16 @@ DDL = [
         source_channel          VARCHAR(40)     NOT NULL,
         raw_payload             TEXT,
         cleaned_body            TEXT,
+        -- Prospect contact info lives here directly. An inbound speed-to-lead
+        -- prospect (renter/owner inquiring) is NOT a PM-firm prospect and does
+        -- NOT belong in companies/contacts (those require domain + county_slug
+        -- and model outbound prospect firms). contact_id stays NULL for
+        -- inbound leads; it exists only for Dev 2 triage of replies that DO
+        -- resolve to an existing prospected contact.
+        prospect_name           VARCHAR(200),
+        prospect_email          VARCHAR(255),
+        prospect_phone          VARCHAR(40),
+        property_address        TEXT,
         received_at             TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
         send_at                 TIMESTAMPTZ,
         lead_sla_due_at         TIMESTAMPTZ,

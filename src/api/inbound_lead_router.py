@@ -51,17 +51,35 @@ class InboundLeadPayload(BaseModel):
 
 
 def _resolve_client_id(client_secret: str) -> Optional[str]:
-    """Look up client_id from a hashed shared secret stored in the clients table."""
+    """Resolve client_id from a hashed shared secret. The clients table is
+    RLS-scoped, so a bare (unscoped) session sees zero rows — resolution goes
+    through the resolve_client_by_webhook_secret SECURITY DEFINER function
+    (apply_clients_stl_fields.py), the same pre-tenant lookup pattern the
+    booking webhooks use with resolve_calendar_connection."""
     secret_hash = hashlib.sha256(client_secret.encode()).hexdigest()
     with get_db_context() as session:
         row = session.execute(
-            text(
-                "SELECT client_id FROM clients "
-                "WHERE inbound_webhook_secret_hash = :h AND is_active = TRUE LIMIT 1"
-            ),
+            text("SELECT client_id FROM resolve_client_by_webhook_secret(:h)"),
             {"h": secret_hash},
         ).first()
     return row.client_id if row else None
+
+
+def _fallback_dedupe_key(client_id: str, payload: "InboundLeadPayload") -> str:
+    """Deterministic dedupe key when the caller omits external_id. A random
+    UUID would let a source retry (after a lost 202) create a duplicate lead
+    and a duplicate response, since each retry would carry a new key. Deriving
+    the key from the stable payload content makes an identical retry collapse
+    onto the existing row via the UNIQUE (client_id, dedupe_key) constraint."""
+    canonical = "|".join([
+        client_id,
+        (payload.source or "").strip().lower(),
+        (payload.email or "").strip().lower(),
+        (payload.phone or "").strip(),
+        (payload.inquiry_text or "").strip(),
+        (payload.property_address or "").strip().lower(),
+    ])
+    return "auto-" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
 @router.post("/inbound-lead", status_code=202)
@@ -73,8 +91,7 @@ def receive_inbound_lead(
     if not client_id:
         raise HTTPException(status_code=401, detail="invalid client_secret")
 
-    import uuid as _uuid
-    dedupe_key = payload.external_id or _uuid.uuid4().hex
+    dedupe_key = payload.external_id or _fallback_dedupe_key(client_id, payload)
 
     lead = InboundLead(
         client_id=client_id,
