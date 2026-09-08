@@ -43,31 +43,9 @@ DDL = [
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS sendspark_video_id      VARCHAR(255)",
     "ALTER TABLE contacts ADD COLUMN IF NOT EXISTS sendspark_landing_url   VARCHAR(2048)",
 
-    # ── pm_profiles — metro benchmark data for PDF Page 2 comparison table ───
-    # Populated by a seed script / nightly sync, not by Ghost Shopper itself.
-    # average_speed_to_lead_seconds: metro-wide average used in the comparison
-    # top10_speed_to_lead_seconds:   top-10% peer speed in the same metro
-    """
-    CREATE TABLE IF NOT EXISTS pm_profiles (
-        profile_id                      BIGSERIAL       PRIMARY KEY,
-        company_id                      VARCHAR(64)     NOT NULL UNIQUE
-                                            REFERENCES companies(company_id)
-                                            ON DELETE CASCADE,
-        market_metro                    VARCHAR(100),
-        average_speed_to_lead_seconds   INTEGER,
-        top10_speed_to_lead_seconds     INTEGER,
-        specialty_tags                  VARCHAR(500),
-        languages_supported             VARCHAR(500),
-        asset_class_strengths           VARCHAR(500),
-        historical_close_rate           NUMERIC(5,2),
-        show_rate_percentage            NUMERIC(5,2),
-        created_at                      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
-        updated_at                      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
-    )
-    """,
-
-    # ADD COLUMN IF NOT EXISTS guards for each pm_profiles column — handles the
-    # case where the table already exists from a prior run with a different schema.
+    # ── pm_profiles — ADD COLUMN guards for ghost-shopper columns ───────────────
+    # Table is created by apply_pm_profiles.py. These guards add any columns
+    # that were missing from the original schema.
     "ALTER TABLE pm_profiles ADD COLUMN IF NOT EXISTS market_metro                  VARCHAR(100)",
     "ALTER TABLE pm_profiles ADD COLUMN IF NOT EXISTS average_speed_to_lead_seconds INTEGER",
     "ALTER TABLE pm_profiles ADD COLUMN IF NOT EXISTS top10_speed_to_lead_seconds   INTEGER",

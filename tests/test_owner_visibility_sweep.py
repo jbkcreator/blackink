@@ -67,7 +67,8 @@ class TestRunSweep:
         with patch("src.tasks.owner_visibility_sweep.get_system_db_context", return_value=fake_db), \
              patch("src.tasks.owner_visibility_sweep.WebsiteSignalProvider") as MockWebsite, \
              patch("src.tasks.owner_visibility_sweep.DbprLicenceSignalProvider") as MockDbpr, \
-             patch("src.tasks.owner_visibility_sweep.build_google_places_provider") as MockGoogle:
+             patch("src.tasks.owner_visibility_sweep.build_google_places_provider") as MockGoogle, \
+             patch("src.tasks.owner_visibility_sweep._update_county_ranks"):
 
             MockWebsite.return_value.collect.return_value = stub_signals[:4]
             MockDbpr.return_value.collect.return_value = [stub_signals[4]]
