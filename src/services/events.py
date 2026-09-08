@@ -74,6 +74,11 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"evidence_packet_compiled": frozenset(
 		{"transaction_id", "sha256", "bytes", "sections_with_gaps"}
 	),
+	# Task 4.2.1 — Speed-to-Lead ingest events
+	"inbound_lead_received": frozenset({"source_channel", "channel", "message_id"}),
+	"non_poach_suppressed": frozenset({"message_id", "source_channel"}),
+	"speed_to_lead_response_sent": frozenset({"message_id", "ack_latency_seconds"}),
+	"closer_alert_posted": frozenset({"message_id", "slack_channel"}),
 	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
 	# Subtask 1.2.3 — Six Billing Rules. "Proof ledger" (named repeatedly in
 	# the Sept-04 client docs but never defined or backed by a table anywhere)

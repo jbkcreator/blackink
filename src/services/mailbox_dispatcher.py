@@ -47,6 +47,11 @@ class AllMailboxesCapped(NoMailboxAvailable):
 
 
 DEFAULT_DAILY_SEND_CAP = 50
+# Hard platform ceiling per mailbox per rolling 24h — the blueprint's
+# deliverability limit (30–50/mailbox). A per-client daily_send_ceiling may
+# lower this but never raise it; a misconfigured high value can't burn a
+# mailbox's reputation.
+MAX_DAILY_SEND_CAP = 50
 
 
 @dataclass(frozen=True)
@@ -58,10 +63,36 @@ class MailboxAssignment:
     sending_domain: str  # domain of the associated sending_domains row
 
 
+def _resolve_client_daily_ceiling(session: Session, client_id: str) -> int:
+    """Per-CLIENT total daily send ceiling across ALL of the client's mailboxes,
+    from clients.daily_send_ceiling (PR #35 review — enforced by client_id total,
+    not per mailbox). 0/NULL means "no aggregate cap": only the per-mailbox cap
+    (MAX_DAILY_SEND_CAP, the blueprint's 30–50/mailbox deliverability limit)
+    applies. A positive value caps the client's combined daily volume."""
+    ceiling = session.execute(
+        text("SELECT daily_send_ceiling FROM clients WHERE client_id = :client_id"),
+        {"client_id": client_id},
+    ).scalar()
+    return int(ceiling) if ceiling and ceiling > 0 else 0
+
+
+def _client_sends_last_24h(session: Session, client_id: str) -> int:
+    """Count the client's sends across all mailboxes in the rolling 24h window."""
+    return session.execute(
+        text(
+            "SELECT COUNT(*) FROM sequence_touch_dispatches "
+            "WHERE client_id = :client_id "
+            "  AND status IN ('SENDING', 'SENT') "
+            "  AND created_at >= NOW() - INTERVAL '24 hours'"
+        ),
+        {"client_id": client_id},
+    ).scalar() or 0
+
+
 def get_active_mailbox_for_client(
     session: Session,
     client_id: str,
-    daily_send_cap: int = DEFAULT_DAILY_SEND_CAP,
+    daily_send_cap: Optional[int] = None,
 ) -> MailboxAssignment:
     """Pick the least-recently-used warmed+active+under-cap mailbox for this client.
 
@@ -69,20 +100,52 @@ def get_active_mailbox_for_client(
     quarantines sending_domains rows, not mailboxes rows directly, so checking
     only mailboxes.quarantine_state misses a quarantined domain entirely.
 
-    The rolling-24h send cap is enforced HERE, inside the picker, so a capped
-    mailbox is never handed out and last_used_at is never bumped for a mailbox
-    that can't send (wayfinder ticket 08). Sends are counted against
-    sequence_touch_dispatches (SENDING + SENT rows in the last 24h).
+    TWO limits are enforced here (PR #35 review):
+      - Per-mailbox: MAX_DAILY_SEND_CAP (the blueprint's 30–50/mailbox
+        deliverability limit) — no single mailbox is handed out past it, and
+        last_used_at is never bumped for a capped mailbox (wayfinder ticket 08).
+        `daily_send_cap` overrides this per-mailbox value (tests/callers).
+      - Per-client: clients.daily_send_ceiling, counted as the client's TOTAL
+        sends across ALL its mailboxes in the last 24h. 0/NULL = no aggregate
+        cap. Without this, N mailboxes each under the per-mailbox cap could
+        together exceed the client's configured daily volume.
+
+    Per-client serialization: a pg advisory xact lock keyed on client_id is
+    taken first, so two concurrent workers for the same client can't both pass
+    the ceiling check and overshoot the remaining capacity. The lock releases at
+    transaction end.
 
     Uses SELECT FOR UPDATE SKIP LOCKED so concurrent dispatch workers never
     double-pick the same mailbox. Updates last_used_at in the same transaction.
 
     Raises:
-        AllMailboxesCapped: warmed, un-quarantined mailboxes exist but all are at cap.
+        AllMailboxesCapped: the per-client daily ceiling is reached, OR warmed
+            un-quarantined mailboxes exist but all are at the per-mailbox cap.
         AllMailboxesQuarantined: warmed mailboxes exist but all domains are quarantined.
         NoWarmedMailbox: no mailbox has completed warmup yet.
         NoMailboxAvailable: no mailboxes provisioned at all.
     """
+    per_mailbox_cap = daily_send_cap if daily_send_cap is not None else MAX_DAILY_SEND_CAP
+
+    # Serialize per client so concurrent workers can't both read a below-ceiling
+    # count and each claim a send, overshooting the client's daily total.
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:client_id))"),
+        {"client_id": client_id},
+    )
+
+    # Per-client aggregate ceiling — checked before any mailbox is handed out.
+    client_ceiling = _resolve_client_daily_ceiling(session, client_id)
+    if client_ceiling > 0 and _client_sends_last_24h(session, client_id) >= client_ceiling:
+        logger.warning(
+            "mailbox_dispatcher: client_id=%s reached per-client daily ceiling of %d — deferring",
+            client_id, client_ceiling,
+        )
+        raise AllMailboxesCapped(
+            f"client_id={client_id} reached its per-client daily send ceiling of "
+            f"{client_ceiling}. Defer the touch."
+        )
+
     # Check whether any warmed mailbox exists at all (ignoring domain state),
     # so we can raise a specific cause when domain quarantine is the blocker.
     warmed_count = session.execute(
@@ -105,16 +168,26 @@ def get_active_mailbox_for_client(
             "  AND m.warmup_status = 'warmed' "
             "  AND sd.quarantine_state = 'active' "
             "  AND ( "
-            "    SELECT COUNT(*) FROM sequence_touch_dispatches d "
-            "    WHERE d.mailbox_id = m.id "
-            "      AND d.status IN ('SENDING', 'SENT') "
-            "      AND d.created_at >= NOW() - INTERVAL '24 hours' "
+            "    ( "
+            "      SELECT COUNT(*) FROM sequence_touch_dispatches d "
+            "      WHERE d.mailbox_id = m.id "
+            "        AND d.status IN ('SENDING', 'SENT') "
+            "        AND d.created_at >= NOW() - INTERVAL '24 hours' "
+            "    ) + ( "
+            # Speed-to-Lead auto-responses (Task 4.2.1) also consume this
+            # mailbox's rolling-24h capacity — count them here, or repeated
+            # inbound responses could blow past the cap while every check passes.
+            "      SELECT COUNT(*) FROM inbound_messages im "
+            "      WHERE im.mailbox_id = m.id "
+            "        AND im.status = 'RESPONDED' "
+            "        AND im.responded_at >= NOW() - INTERVAL '24 hours' "
+            "    ) "
             "  ) < :cap "
             "ORDER BY m.last_used_at ASC NULLS FIRST "
             "LIMIT 1 "
             "FOR UPDATE OF m SKIP LOCKED"
         ),
-        {"client_id": client_id, "cap": daily_send_cap},
+        {"client_id": client_id, "cap": per_mailbox_cap},
     ).fetchone()
 
     if row is None:
@@ -133,12 +206,12 @@ def get_active_mailbox_for_client(
         ).scalar() or 0
         if warmed_active_count > 0:
             logger.warning(
-                "mailbox_dispatcher: %d warmed/active mailbox(es) for client_id=%s but all at 24h cap=%d",
-                warmed_active_count, client_id, daily_send_cap,
+                "mailbox_dispatcher: %d warmed/active mailbox(es) for client_id=%s but all at per-mailbox 24h cap=%d",
+                warmed_active_count, client_id, per_mailbox_cap,
             )
             raise AllMailboxesCapped(
                 f"{warmed_active_count} warmed/active mailbox(es) for client_id={client_id} "
-                f"but all have hit the rolling-24h send cap of {daily_send_cap}. Defer the touch."
+                f"but all have hit the per-mailbox rolling-24h cap of {per_mailbox_cap}. Defer the touch."
             )
         if warmed_count > 0:
             logger.error(
