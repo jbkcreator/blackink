@@ -48,6 +48,20 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
 	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
+	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Per-disposition-bucket counts,
+	# not just a total, so the proof-ledger-style visibility the spec asks
+	# for ("winback_import_completed event written with row counts for each
+	# disposition bucket") is enforced at write time, not left to convention.
+	"winback_import_completed": frozenset(
+		{
+			"total_rows",
+			"still_owns_still_renting_count",
+			"still_owns_not_renting_count",
+			"sold_count",
+			"unknown_count",
+			"suppressed_count",
+		}
+	),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is
@@ -188,13 +202,22 @@ def log_touch_dispatched(
 	sending_domain: str,
 	template_version: str,
 	recipient_email: str,
+	campaign_type: str = "COLD_OUTBOUND",
 ) -> None:
 	"""Log an outbound_touch_dispatched event via log_event() — the single
 	write path (see module docstring). entity is the contact
 	(entity_type='contact', entity_id=contact_id) and actor is
 	'cold_outbound_sequencer' per wayfinder ticket 03. dispatch_id rides
 	along in the payload as a non-required extra field for traceability
-	back to the sequence_touch_dispatches row that produced this event."""
+	back to the sequence_touch_dispatches row that produced this event.
+
+	campaign_type (Subtask 3.1.2): an optional payload field, not a new
+	REQUIRED_PAYLOAD_FIELDS entry — existing cold-sequence callers need no
+	change. src/services/winback_sequencer.py passes campaign_type='WIN_BACK'
+	and contact_id=winback_row_id (there is no `contacts` row for a win-back
+	owner; entity_type stays 'contact' as a loose "id of the thing this
+	touch was sent to" label, matching the existing shape rather than adding
+	a second entity_type this payload's own consumers don't expect)."""
 	payload = {
 		"touch_step": touch_step,
 		"channel": "email",
@@ -203,6 +226,7 @@ def log_touch_dispatched(
 		"mailbox_id": mailbox_id,
 		"sending_domain": sending_domain,
 		"template_version": template_version,
+		"campaign_type": campaign_type,
 	}
 	log_event(
 		client_id,
@@ -214,6 +238,6 @@ def log_touch_dispatched(
 		session=session,
 	)
 	logger.info(
-		"events: outbound_touch_dispatched client=%s contact=%s touch=%d dispatch=%s",
-		client_id, contact_id, touch_step, dispatch_id,
+		"events: outbound_touch_dispatched client=%s contact=%s touch=%d dispatch=%s campaign_type=%s",
+		client_id, contact_id, touch_step, dispatch_id, campaign_type,
 	)

@@ -48,12 +48,15 @@ _ACTION_CHANNEL = {
     "DISPATCH_EMAIL_TOUCH": "setter",
     "DIAL_TASK": "dial",
     "LINKEDIN_TASK": "setter",
+    "DISPATCH_WINBACK_TOUCH": "setter",   # Subtask 3.1.2
 }
+
+_WINBACK_ACTION = "DISPATCH_WINBACK_TOUCH"
 
 # Action classes the sweep actually surfaces. DIAL_TASK is excluded on purpose
 # (event-driven on Touch 1 approval, ADR 0001) — it is in _ACTION_CHANNEL only
 # for channel resolution, never swept.
-_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION)
+_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION)
 
 
 async def _post_due_card(order, channel_key: str) -> bool:
@@ -199,6 +202,41 @@ def alert_stuck_dispatches(older_than_minutes: int = 30) -> int:
     return len(stuck)
 
 
+def _winback_touch_still_ready(order) -> bool:
+    """Re-check evaluate_winback_touch_gate BEFORE posting a Win-Back
+    approval card — dispatch-time gating alone (winback_sequencer's own
+    gate, run when a human clicks Approve) isn't enough: a reply/opt-out/
+    booking landing between Touch 1 and Touch 2's due_at would otherwise
+    still surface a stale card in #blackink-setter. Marks the order SKIPPED
+    (not just silently un-posted) so due_batch never re-selects it and the
+    decision is visible in the row's own history."""
+    from sqlalchemy import text
+
+    from src.core.database import get_db_context
+    from src.services.winback_sequencer import evaluate_winback_touch_gate
+
+    winback_row_id = int(order.payload.get("winback_row_id", order.entity_id))
+    with get_db_context(client_id=order.client_id) as session:
+        row = session.execute(
+            text("SELECT * FROM winback_rows WHERE winback_row_id = :id"),
+            {"id": winback_row_id},
+        ).fetchone()
+        if row is None:
+            logger.error("sequence_sweep: winback_row_id=%s not found — skipping card", winback_row_id)
+            wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="system:winback_gate")
+            return False
+        gate = evaluate_winback_touch_gate(session, row, order.client_id)
+
+    if not gate.ready:
+        wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="system:winback_gate")
+        logger.info(
+            "sequence_sweep: SKIPPED winback touch action_id=%s winback_row_id=%s reasons=%s",
+            order.action_id, winback_row_id, gate.blocked_reasons,
+        )
+        return False
+    return True
+
+
 def run_sweep(client_id=None, limit: int = 100) -> int:
     """Fetch due QUEUED orders and post their approval cards. Returns cards posted.
 
@@ -220,6 +258,11 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         if order.slack_message_ts:
             # Card already posted — skip to avoid duplicate cards.
             logger.debug("sequence_sweep: action_id=%s already has a card, skipping", order.action_id)
+            continue
+        if order.action_class == _WINBACK_ACTION and not _winback_touch_still_ready(order):
+            # DoD requires the card never be QUEUED after a stop — not just
+            # blocked when someone later clicks Approve. Skip posting and
+            # mark the order terminal so due_batch never re-selects it.
             continue
         # LINKEDIN_TASK is posted through its own poster, which re-checks the
         # per-touch compliance gate before showing the card and logs a

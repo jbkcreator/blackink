@@ -79,8 +79,32 @@ TENANT_POLICIES = {
 	# "Log Outcome" trigger card. Carries its own
 	# client_id column (copied from bookings.client_id at schedule time).
 	"meeting_outcome_prompt_jobs": {"mode": "direct", "column": "client_id"},
+	# Subtask 1.1.1 — Appointment operations. The blueprint's printed
+	# `client_id UUID REFERENCES companies` is adapted to this repo's real
+	# tenant boundary: a VARCHAR(40) client_id added directly to all four
+	# appointment tables (see apply_appointment_ops.py), so each is scoped at
+	# the row it is written on rather than through a parent join.
+	"appointments": {"mode": "direct", "column": "client_id"},
+	"confirmation_logs": {"mode": "direct", "column": "client_id"},
+	"appointment_dispositions": {"mode": "direct", "column": "client_id"},
+	"appointment_disputes": {"mode": "direct", "column": "client_id"},
 	# Reply Triage Agent inbound email intake.
 	"inbound_messages": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Both carry their own client_id
+	# column (winback_rows.client_id is denormalized from winback_imports at
+	# insert time, same "direct mode needs its own column per table"
+	# reasoning as meeting_outcome_prompt_jobs above).
+	"winback_imports": {"mode": "direct", "column": "client_id"},
+	"winback_rows": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.2 — Three-Touch Win-Back Sequence. At-most-once dispatch
+	# claim table, mirrors sequence_touch_dispatches' own direct-mode entry
+	# above, keyed on winback_row_id instead of run_id.
+	"winback_touch_dispatches": {"mode": "direct", "column": "client_id"},
+	# Audit-trail counterpart to compliance_gate_checks (above), for the
+	# win-back touch gate — a separate table because compliance_gate_checks'
+	# contact_id column is a hard FK to contacts, which a winback_row_id can
+	# never satisfy correctly.
+	"winback_gate_checks": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
