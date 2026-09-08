@@ -10,10 +10,9 @@ business-open (08:00 ET next weekday).
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-import pytz
-
-_ET = pytz.timezone("America/New_York")
+_ET = ZoneInfo("America/New_York")
 _BH_START = time(8, 0)
 _BH_END = time(18, 0)
 _BUSINESS_DAYS = {0, 1, 2, 3, 4}   # Mon–Fri
@@ -42,5 +41,6 @@ def compute_send_at(received_at_utc: datetime) -> datetime:
     dt_et = received_at_utc.astimezone(_ET)
     if _is_business_hours(dt_et):
         return received_at_utc
-    next_open_et = _next_business_open(dt_et)
-    return _ET.localize(next_open_et.replace(tzinfo=None)).astimezone(timezone.utc)
+    # zoneinfo handles wall-clock → aware directly (no pytz .localize needed);
+    # _next_business_open already returns a tz-aware ET datetime.
+    return _next_business_open(dt_et).astimezone(timezone.utc)
