@@ -96,6 +96,13 @@ TENANT_POLICIES = {
 	"settlement_transactions": {"mode": "direct", "column": "client_id"},
 	# Reply Triage Agent inbound email intake.
 	"inbound_messages": {"mode": "direct", "column": "client_id"},
+	# Subtask 1.2.3 — Six Billing Rules. entitlement_offers is deliberately
+	# NOT registered here — global reference config, same class as
+	# settlement_offer_config / payment_auth_offer_config (see the "not
+	# tenant-scoped" block below).
+	"client_entitlements": {"mode": "direct", "column": "client_id"},
+	"billing_credits": {"mode": "direct", "column": "client_id"},
+	"subscription_overrides": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
@@ -108,3 +115,6 @@ TENANT_POLICIES = {
 #     public landing-page staging data, same posture as raw_prospect_*;
 #     ownership is assigned only once the worker resolves/creates a
 #     companies row, never at submission time.
+#   entitlement_offers, settlement_offer_config, payment_auth_offer_config —
+#     global commercial-terms config rows, not tenant data. An operator flips
+#     one per confirmed offer; none carries a client_id of its own.

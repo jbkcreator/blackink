@@ -75,6 +75,15 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 		{"transaction_id", "sha256", "bytes", "sections_with_gaps"}
 	),
 	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
+	# Subtask 1.2.3 — Six Billing Rules. "Proof ledger" (named repeatedly in
+	# the Sept-04 client docs but never defined or backed by a table anywhere)
+	# is interpreted as this events stream — see
+	# migrations/apply_entitlements_billing.py's module docstring.
+	"respond_ack_missed": frozenset({"inbound_message_id", "ack_latency_seconds", "channel"}),
+	"billing_credit_issued": frozenset({"credit_id", "credit_type", "amount_cents", "billing_period"}),
+	"first_sit_consumed": frozenset({"client_id", "appointment_id", "offer_code"}),
+	"sixty_day_guarantee_applied": frozenset({"client_id", "attended_sit_count", "billing_period"}),
+	"rate_migration_applied": frozenset({"offer_code", "new_price_cents", "clients_updated", "founding_skipped"}),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is
