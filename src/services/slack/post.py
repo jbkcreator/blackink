@@ -152,11 +152,15 @@ async def post_notice(
 	channel_key: str,
 	text: str,
 	blocks: Optional[Sequence[dict]] = None,
+	attachments: Optional[Sequence[dict]] = None,
 	thread_ts: Optional[str] = None,
 ) -> Optional[str]:
 	"""Non-interactive, fire-and-forget posts — #blackink-qa health alerts,
-	#blackink-economics rollups. Returns the message ts on success, else
-	None. Never raises.
+	#blackink-economics rollups, #sales-replies cards. Returns the message ts
+	on success, else None. Never raises.
+
+	`attachments` enables a colored side bar (e.g. green attributed / amber
+	unattributed reply cards).
 
 	thread_ts (optional) replies in an existing message's thread instead of
 	posting to the channel top level — used by the "Log Outcome" card's
@@ -179,6 +183,7 @@ async def post_notice(
 			channel=channel_id,
 			text=text,
 			blocks=list(blocks) if blocks else None,
+			attachments=list(attachments) if attachments else None,
 			thread_ts=thread_ts,
 		)
 		return response["ts"]

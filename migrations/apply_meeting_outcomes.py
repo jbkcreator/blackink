@@ -50,6 +50,7 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_meeting_outcomes_client ON meeting_outcomes (client_id)",
 	"CREATE INDEX IF NOT EXISTS ix_meeting_outcomes_contact ON meeting_outcomes (contact_id)",
 	"GRANT SELECT, INSERT, UPDATE ON meeting_outcomes TO blackink_app",
+	"GRANT SELECT ON meeting_outcomes TO blackink_system",
 	"GRANT USAGE ON SEQUENCE meeting_outcomes_id_seq TO blackink_app",
 ]
 

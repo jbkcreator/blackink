@@ -43,6 +43,8 @@ PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py  # Dev 3 — a
 PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # adds google_place_id to companies
 PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
 PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # OVS engine scoring table
+PYTHONPATH=. python migrations/apply_ovs_audit_requests.py         # self-serve OVS audit intake; not tenant-bearing, no RLS
+PYTHONPATH=. python migrations/apply_admin_users.py                # internal dashboard admin accounts; not tenant-bearing, no RLS
 PYTHONPATH=. python migrations/apply_mailbox_smtp_credentials.py
 PYTHONPATH=. python migrations/apply_owner_contacts.py
 PYTHONPATH=. python migrations/apply_calendar_connections.py
@@ -56,6 +58,9 @@ PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — ap
 PYTHONPATH=. python migrations/apply_payment_auth_capture.py   # Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture columns + config/webhook-idempotency tables (needs companies; before RLS)
 PYTHONPATH=. python migrations/apply_pms_agreements.py      # Subtask 1.2.2 — door_signed data source (needs clients+companies+owner_contacts; before RLS)
 PYTHONPATH=. python migrations/apply_settlement_ledger.py   # Subtask 1.2.2 — 50/50 settlement split + 60-day clawback ledger (needs pms_agreements+companies; before RLS)
+PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
+PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
+PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -73,6 +78,8 @@ python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
+python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
+python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
