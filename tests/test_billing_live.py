@@ -22,6 +22,7 @@ from src.services.billing.guarantee import evaluate_sixty_day_guarantee
 from src.services.billing.miss_credit import claim_missed_acks, process_missed_ack
 from src.services.billing.offers import apply_rate_migration, create_client_entitlement, load_offer
 from src.services.billing.sit_billing import resolve_sit_charge
+from src.services.clients import provision_client
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
 
 
@@ -121,6 +122,37 @@ def test_miss_credit_fires_at_90s_ack_latency_and_not_at_45s(billing_tenant):
 			{"cid": client_id, "sid": str(fast.id)},
 		).first()
 		assert no_credit is None
+
+
+def test_miss_credit_exact_60s_boundary_not_claimed_61s_claimed(billing_tenant):
+	"""PR #37 review — required exact-boundary test: ack_latency_seconds > 60
+	is the actual predicate, so exactly 60s must NOT be claimed and 61s MUST
+	be."""
+	client_id = billing_tenant["client_id"]
+	as_of = datetime.now(timezone.utc)
+	with get_system_db_context() as s:
+		exactly_60 = s.execute(
+			text(
+				"INSERT INTO inbound_messages (client_id, idempotency_key, destination_address, sender_email, "
+				" received_at, acked_at, channel) "
+				"VALUES (:cid, :key, 'test@example.com', 'owner@example.com', :received, :acked, 'EMAIL') "
+				"RETURNING id"
+			),
+			{"cid": client_id, "key": f"miss-60-{uuid.uuid4()}", "received": as_of, "acked": as_of + timedelta(seconds=60)},
+		).one()
+		exactly_61 = s.execute(
+			text(
+				"INSERT INTO inbound_messages (client_id, idempotency_key, destination_address, sender_email, "
+				" received_at, acked_at, channel) "
+				"VALUES (:cid, :key, 'test@example.com', 'owner@example.com', :received, :acked, 'EMAIL') "
+				"RETURNING id"
+			),
+			{"cid": client_id, "key": f"miss-61-{uuid.uuid4()}", "received": as_of, "acked": as_of + timedelta(seconds=61)},
+		).one()
+
+		claimed_ids = {m["id"] for m in claim_missed_acks(s, claim_time=as_of)}
+		assert exactly_60.id not in claimed_ids
+		assert exactly_61.id in claimed_ids
 
 
 def test_never_acked_message_is_claimed_as_a_miss(billing_tenant):
@@ -395,6 +427,56 @@ def test_disputed_free_first_sit_produces_no_credit(billing_tenant):
 		assert status.credit_status == "CREDITED"
 
 
+# ── PR #37 review: concurrent first-sit requests ────────────────────────
+
+def test_concurrent_first_sit_requests_grant_the_free_sit_exactly_once(billing_tenant):
+	"""PR #37 review's required concurrency test — two DIFFERENT appointments
+	for the same client, both racing to consume the free first sit, must
+	result in EXACTLY ONE free ($0) sit and the other billed at the standard
+	$99 rate. This exercises the real begin_nested() compare-and-swap
+	(`UPDATE ... WHERE first_sit_consumed = FALSE`) under actual overlapping
+	transactions, not just sequential calls."""
+	import threading
+
+	client_id = billing_tenant["client_id"]
+	company_id = billing_tenant["company_id"]
+	contact_id = billing_tenant["contact_id"]
+	as_of = datetime.now(timezone.utc)
+	now_iso = as_of.isoformat()
+
+	with get_system_db_context() as s:
+		_entitle(s, client_id, "owner_growth")
+		appt_a = _insert_appointment(
+			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=now_iso, c3=now_iso,
+		)
+		appt_b = _insert_appointment(
+			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=now_iso, c3=now_iso,
+		)
+
+	results: dict[str, str] = {}
+	barrier = threading.Barrier(2)
+
+	def _resolve(name, appointment_id):
+		barrier.wait(timeout=5)
+		with get_system_db_context() as s:
+			charge = resolve_sit_charge(s, client_id=client_id, appointment_id=str(appointment_id), as_of=as_of)
+			results[name] = charge.offer_code
+
+	t1 = threading.Thread(target=_resolve, args=("a", appt_a.appointment_id))
+	t2 = threading.Thread(target=_resolve, args=("b", appt_b.appointment_id))
+	t1.start()
+	t2.start()
+	t1.join(timeout=10)
+	t2.join(timeout=10)
+
+	offer_codes = sorted(results.values())
+	assert offer_codes == ["appt_first", "appt_standard"], (
+		f"expected exactly one free sit and one standard sit, got: {results}"
+	)
+
+
 # ── DoD 5: no monthly ceiling ────────────────────────────────────────────
 
 def test_monthly_cap_is_null_and_fifty_sits_all_bill(billing_tenant):
@@ -422,6 +504,26 @@ def test_monthly_cap_is_null_and_fifty_sits_all_bill(billing_tenant):
 		assert len(charged_offer_codes) == 50
 		assert charged_offer_codes[0] == "appt_first"
 		assert all(code == "appt_standard" for code in charged_offer_codes[1:])
+
+
+# ── PR #37 review: founding set at ACTUAL account creation ─────────────
+
+def test_provision_client_sets_founding_at_account_creation():
+	"""PR #37 review finding — a test that only manually UPDATEs the
+	founding column does not prove account creation sets it. This test goes
+	through provision_client() (the one write path for creating a clients
+	row) itself, with founding=True passed explicitly at creation time."""
+	client_id = f"test_founding_{uuid.uuid4().hex[:12]}"
+	try:
+		with get_owner_db_context() as s:
+			provision_client(s, client_id=client_id, display_name="Test Founding Co", founding=True)
+			row = s.execute(
+				text("SELECT founding FROM clients WHERE client_id = :c"), {"c": client_id}
+			).one()
+			assert row.founding is True
+	finally:
+		with get_owner_db_context() as s:
+			s.execute(text("DELETE FROM clients WHERE client_id = :c"), {"c": client_id})
 
 
 # ── DoD 6: founding flag protects price from a rate migration ──────────

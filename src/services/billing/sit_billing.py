@@ -61,13 +61,31 @@ def resolve_sit_charge(session: Session, *, client_id: str, appointment_id: str,
 	twice. Otherwise returns the flat appt_standard charge with no cap check
 	of any kind, however many sits the client has already been charged for
 	this month. Every return path stamps appointments.billed_offer_code/
-	billed_amount_cents so a later dispute credit reads the real charge."""
+	billed_amount_cents so a later dispute credit reads the real charge.
+
+	IDEMPOTENT per appointment (PR #37 review finding): once
+	appointments.billed_offer_code is already set, this function returns
+	THAT recorded charge unconditionally on every subsequent call — it never
+	re-evaluates first_sit_consumed or re-derives a price. Without this, a
+	retried call for the SAME appointment (a sweep re-claiming a row after a
+	crash mid-invoice, or any other caller re-invoking this function) could
+	observe first_sit_consumed already flipped TRUE by its own prior call and
+	silently rebill the client's free first sit as a $99 standard sit."""
 	appointment = session.execute(
-		text("SELECT is_billable FROM appointments WHERE client_id = :client_id AND appointment_id = :appointment_id"),
+		text(
+			"SELECT is_billable, billed_offer_code, billed_amount_cents FROM appointments "
+			"WHERE client_id = :client_id AND appointment_id = :appointment_id"
+		),
 		{"client_id": client_id, "appointment_id": appointment_id},
 	).first()
 	if appointment is None:
 		raise ValueError(f"no such appointment {appointment_id!r} for client {client_id!r}")
+	if appointment.billed_offer_code is not None:
+		return SitCharge(
+			offer_code=appointment.billed_offer_code,
+			amount_cents=appointment.billed_amount_cents,
+			first_sit=appointment.billed_offer_code == APPT_FIRST_OFFER_CODE,
+		)
 	if not appointment.is_billable:
 		raise ValueError(f"appointment {appointment_id!r} is not billable — cannot resolve a sit charge")
 

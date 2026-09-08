@@ -108,6 +108,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_inbound_messages_sla.py
           PYTHONPATH=. python migrations/apply_respond_routing_gaps.py
           PYTHONPATH=. python migrations/apply_entitlements_billing.py
+          PYTHONPATH=. python migrations/apply_client_billing_account.py
           PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py
           PYTHONPATH=. python migrations/apply_winback_imports.py
           PYTHONPATH=. python migrations/apply_winback_touch_sequence.py

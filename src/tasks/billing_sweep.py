@@ -14,15 +14,35 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
+from config.settings import get_settings
 from src.core.database import get_system_db_context
-from src.services.billing.dispute_credit import DisputeWindowExpiredError, credit_dispute_on_flag
+from src.services.billing.dispute_credit import (
+	DisputeWindowExpiredError,
+	MissingBilledAmountError,
+	credit_dispute_on_flag,
+)
 from src.services.billing.guarantee import evaluate_sixty_day_guarantee
 from src.services.billing.miss_credit import claim_missed_acks, process_missed_ack
+from src.services.billing.sit_invoice import charge_sit_for_appointment
 
 logger = logging.getLogger(__name__)
 
 
 def run_miss_credit_sweep(limit: int = 100, *, claim_time: datetime | None = None) -> int:
+	"""PR #37 review finding — fails CLOSED (returns 0, does nothing) unless
+	settings.billing_miss_credit_sweep_enabled is explicitly True. Nothing in
+	this codebase yet writes inbound_messages.acked_at (that's the automated
+	first-response sender's job, not built here), so until that sender is
+	live and verified, EVERY unclassified email older than 60 seconds looks
+	identical to a genuine miss — running this sweep unconditionally would
+	credit $50 for every slow-classified message, not just real misses."""
+	if not get_settings().billing_miss_credit_sweep_enabled:
+		logger.warning(
+			"billing_sweep.miss_credit: disabled (BILLING_MISS_CREDIT_SWEEP_ENABLED is not set) — "
+			"acked_at is not yet written by any automated-ack sender, so this sweep would treat "
+			"every unclassified message as a miss. Skipping."
+		)
+		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	credited = 0
 	claimed_count = 0
@@ -73,6 +93,11 @@ def run_dispute_credit_sweep(limit: int = 100, *, claim_time: datetime | None = 
 					credited += 1
 			except DisputeWindowExpiredError:
 				logger.warning("billing_sweep.dispute_credit: dispute %s outside 48h window — not credited", row.dispute_id)
+			except MissingBilledAmountError:
+				logger.error(
+					"billing_sweep.dispute_credit: dispute %s has no billed_amount_cents on its "
+					"appointment — marked BLOCKED, needs manual investigation", row.dispute_id,
+				)
 	logger.info("billing_sweep.dispute_credit: credited %d dispute(s)", credited)
 	return credited
 
@@ -98,8 +123,39 @@ def run_guarantee_sweep(limit: int = 100, *, claim_time: datetime | None = None)
 	return applied
 
 
+def run_sit_invoice_sweep(limit: int = 100, *, claim_time: datetime | None = None) -> int:
+	"""Rules 2/5 wired to a real Stripe invoice, and rules 1/4's credits
+	actually reaching one (PR #37 review — blocking findings 1 and 2). Claims
+	ATTENDED, billable, not-yet-billed, not-blocked appointments and turns
+	each into a real invoice via charge_sit_for_appointment(). A row already
+	BLOCKED (no stripe_customer_id) is excluded by the claim query itself,
+	never re-attempted every tick."""
+	claim_time = claim_time or datetime.now(timezone.utc)
+	invoiced = 0
+	with get_system_db_context() as session:
+		rows = session.execute(
+			text(
+				"SELECT client_id, appointment_id FROM appointments "
+				"WHERE state = 'ATTENDED' AND is_billable "
+				"  AND billed_offer_code IS NULL AND billing_blocked_reason IS NULL "
+				"ORDER BY scheduled_for LIMIT :limit FOR UPDATE SKIP LOCKED"
+			),
+			{"limit": limit},
+		).all()
+		for row in rows:
+			with session.begin_nested():
+				outcome = charge_sit_for_appointment(
+					session, client_id=row.client_id, appointment_id=row.appointment_id, as_of=claim_time,
+				)
+				if outcome.status == "INVOICED":
+					invoiced += 1
+	logger.info("billing_sweep.sit_invoice: invoiced %d appointment(s)", invoiced)
+	return invoiced
+
+
 if __name__ == "__main__":
 	logging.basicConfig(level=logging.INFO)
 	run_miss_credit_sweep()
 	run_dispute_credit_sweep()
 	run_guarantee_sweep()
+	run_sit_invoice_sweep()

@@ -14,6 +14,7 @@ later ticket, stated plainly in CLAUDE.md.
 """
 from __future__ import annotations
 
+import calendar
 import logging
 from datetime import date, datetime, timedelta
 
@@ -35,13 +36,19 @@ def evaluate_sixty_day_guarantee(session: Session, *, client_id: str, as_of: dat
 	one not on an eligible offer, or not yet at day 60, is a no-op — never an
 	exception, since the sweep re-evaluates every eligible row on every tick
 	until the flag flips."""
+	# FOR UPDATE — locks this entitlement row for the rest of the
+	# transaction, so a second concurrent sweep tick (or a second sweep
+	# process entirely) evaluating the SAME client blocks here rather than
+	# racing the guarantee_applied UPDATE below (PR #37 review finding: row
+	# locking/idempotency for the guarantee sweep).
 	entitlement = session.execute(
 		text(
 			"SELECT entitlement_id, offer_code, activated_at, guarantee_applied "
 			"FROM client_entitlements "
 			"WHERE client_id = :client_id AND status = 'ACTIVE' "
 			"  AND offer_code = ANY(:eligible_offers) "
-			"ORDER BY activated_at LIMIT 1"
+			"ORDER BY activated_at LIMIT 1 "
+			"FOR UPDATE"
 		),
 		{"client_id": client_id, "eligible_offers": list(_ELIGIBLE_OFFER_CODES)},
 	).first()
@@ -64,13 +71,20 @@ def evaluate_sixty_day_guarantee(session: Session, *, client_id: str, as_of: dat
 	).one()
 
 	with session.begin_nested():
-		session.execute(
+		updated = session.execute(
 			text(
 				"UPDATE client_entitlements SET guarantee_applied = TRUE, guarantee_checked_at = :as_of, "
 				"updated_at = :as_of WHERE entitlement_id = :entitlement_id AND guarantee_applied = FALSE"
 			),
 			{"as_of": as_of, "entitlement_id": entitlement.entitlement_id},
 		)
+		if updated.rowcount == 0:
+			# Lost a race against a concurrent evaluation of this SAME
+			# entitlement (should be rare given the FOR UPDATE lock above, but
+			# is still a real possibility across two sessions serialized one
+			# after another) — the other evaluation already decided this
+			# guarantee; never re-decide or re-log it here.
+			return False
 
 		if qualifying_sits.n >= _MIN_QUALIFYING_SITS:
 			logger.info(
@@ -79,7 +93,7 @@ def evaluate_sixty_day_guarantee(session: Session, *, client_id: str, as_of: dat
 			)
 			return False
 
-		next_period = _next_billing_period(as_of)
+		next_period = _next_billing_period(as_of, cycle_anchor_day=entitlement.activated_at.day)
 		session.execute(
 			text(
 				"INSERT INTO subscription_overrides (client_id, billing_period, override_price_cents, reason) "
@@ -101,7 +115,22 @@ def evaluate_sixty_day_guarantee(session: Session, *, client_id: str, as_of: dat
 	return True
 
 
-def _next_billing_period(as_of: datetime) -> date:
-	if as_of.month == 12:
-		return date(as_of.year + 1, 1, 1)
-	return date(as_of.year, as_of.month + 1, 1)
+def _next_billing_period(as_of: datetime, *, cycle_anchor_day: int) -> date:
+	"""The client's next billing-cycle date, NOT the 1st of the next
+	calendar month (PR #37 review finding — a Stripe subscription bills on
+	an anniversary of its own creation date, which rarely falls on the 1st).
+	Anchored on the day-of-month the entitlement was activated
+	(client_entitlements.activated_at.day), clamped to the shorter month
+	when the anchor day doesn't exist there (e.g. activated on the 31st,
+	next cycle in February -> the 28th/29th)."""
+	year, month = as_of.year, as_of.month
+	day = min(cycle_anchor_day, calendar.monthrange(year, month)[1])
+	this_cycle = date(year, month, day)
+	if as_of.date() < this_cycle:
+		return this_cycle
+	if month == 12:
+		year, month = year + 1, 1
+	else:
+		month += 1
+	day = min(cycle_anchor_day, calendar.monthrange(year, month)[1])
+	return date(year, month, day)

@@ -41,6 +41,16 @@ class DisputeWindowExpiredError(RuntimeError):
 	scheduled_for — rejected, not silently accepted."""
 
 
+class MissingBilledAmountError(RuntimeError):
+	"""The disputed appointment has no appointments.billed_amount_cents
+	recorded — there is no reliable way to know what this sit actually cost
+	(guessing appt_standard's CURRENT price was a real bug: it silently
+	overcredited a disputed FREE first sit, since first_sit_consumed may have
+	already flipped for an unrelated LATER appointment by dispute time).
+	Raised instead of guessing — a caller must investigate and backfill
+	billed_amount_cents (or alert) before this dispute can be credited."""
+
+
 def credit_dispute_on_flag(session: Session, *, dispute_id: str, as_of: datetime) -> bool:
 	"""Validates the 48-hour window against appointments.scheduled_for, then
 	issues (or no-ops on a duplicate) a DISPUTE_CREDIT for the sit's own
@@ -71,9 +81,16 @@ def credit_dispute_on_flag(session: Session, *, dispute_id: str, as_of: datetime
 			f"{DISPUTE_WINDOW_HOURS}h window from scheduled_for={row.scheduled_for.isoformat()}"
 		)
 
-	credit_amount_cents = _resolve_disputed_sit_amount_cents(
-		session, client_id=row.client_id, appointment_id=row.appointment_id, billed_amount_cents=row.billed_amount_cents,
-	)
+	try:
+		credit_amount_cents = _resolve_disputed_sit_amount_cents(
+			session, client_id=row.client_id, appointment_id=row.appointment_id, billed_amount_cents=row.billed_amount_cents,
+		)
+	except MissingBilledAmountError:
+		session.execute(
+			text("UPDATE appointment_disputes SET credit_status = 'BLOCKED' WHERE dispute_id = :dispute_id"),
+			{"dispute_id": dispute_id},
+		)
+		raise
 	if credit_amount_cents <= 0:
 		# A disputed FREE first sit (billed $0) has nothing to credit —
 		# billing_credits.amount_cents is CHECK > 0, so there is no row to
@@ -109,17 +126,20 @@ def credit_dispute_on_flag(session: Session, *, dispute_id: str, as_of: datetime
 def _resolve_disputed_sit_amount_cents(session: Session, *, client_id: str, appointment_id: str, billed_amount_cents) -> int:
 	"""The disputed sit's credit amount is what it was ACTUALLY billed —
 	appointments.billed_amount_cents, stamped at charge time by
-	sit_billing.resolve_sit_charge(). Falls back to appt_standard's current
-	price only for a legacy row that predates that column being stamped (should
-	not happen for any appointment billed after this fix landed) — logged as a
-	warning since it's a real gap, not a silent default."""
+	sit_billing.resolve_sit_charge(). Raises MissingBilledAmountError rather
+	than guessing when it's absent (PR #37 review finding): an earlier
+	version of this function fell back to appt_standard's CURRENT price,
+	which silently overcredited a disputed FREE first sit as if it were a
+	$99 standard sit — there is no reliable way to reconstruct the real
+	historical charge after the fact, so a missing value must block and
+	alert, never be estimated."""
 	if billed_amount_cents is not None:
 		return billed_amount_cents
-	logger.warning(
+	logger.error(
 		"billing.dispute_credit: appointment %s has no billed_amount_cents recorded — "
-		"falling back to appt_standard's current price (client=%s)", appointment_id, client_id,
+		"cannot determine the real charge; refusing to guess (client=%s)", appointment_id, client_id,
 	)
-	offer = session.execute(
-		text("SELECT price_cents FROM entitlement_offers WHERE offer_code = 'appt_standard'"),
-	).one()
-	return offer.price_cents
+	raise MissingBilledAmountError(
+		f"appointment {appointment_id!r} (client={client_id!r}) has no billed_amount_cents recorded — "
+		"cannot credit this dispute without guessing"
+	)

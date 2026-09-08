@@ -12,7 +12,6 @@ import logging
 from datetime import date, datetime
 
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from src.services.events import log_event
@@ -32,32 +31,34 @@ def issue_credit(
 	billing_period: date,
 ) -> bool:
 	"""Inserts one billing_credits row and logs billing_credit_issued in the
-	SAME transaction. Returns False (and logs, no exception) on a duplicate
-	(client_id, credit_type, source_table, source_id) — a caller retrying the
-	same miss/dispute must never write a second credit line."""
-	try:
-		with session.begin_nested():
-			row = session.execute(
-				text(
-					"INSERT INTO billing_credits "
-					"(client_id, credit_type, amount_cents, source_table, source_id, issued_at, billing_period) "
-					"VALUES (:client_id, :credit_type, :amount_cents, :source_table, :source_id, :issued_at, :billing_period) "
-					"RETURNING credit_id"
-				),
-				{
-					"client_id": client_id,
-					"credit_type": credit_type,
-					"amount_cents": amount_cents,
-					"source_table": source_table,
-					"source_id": str(source_id),
-					"issued_at": issued_at,
-					"billing_period": billing_period,
-				},
-			).one()
-	except IntegrityError:
-		# SAVEPOINT rollback via begin_nested(), not session.rollback() — see
-		# settlement/ledger.py's record_door_signed() for why a bare
-		# session.rollback() here would discard the caller's whole transaction.
+	SAME transaction. Returns False (no exception) ONLY on a genuine
+	duplicate (client_id, credit_type, source_table, source_id) — detected via
+	`ON CONFLICT ... DO NOTHING RETURNING`, never by catching every
+	IntegrityError. A bare `except IntegrityError` would also swallow a
+	foreign-key violation, a CHECK failure, or any other constraint error —
+	those must fail loudly and be retried, not be silently mistaken for "already
+	credited" and marked done. Deliberately NOT wrapped in session.begin_nested()
+	— ON CONFLICT DO NOTHING never raises, so there is nothing here for a
+	savepoint to roll back."""
+	row = session.execute(
+		text(
+			"INSERT INTO billing_credits "
+			"(client_id, credit_type, amount_cents, source_table, source_id, issued_at, billing_period) "
+			"VALUES (:client_id, :credit_type, :amount_cents, :source_table, :source_id, :issued_at, :billing_period) "
+			"ON CONFLICT (client_id, credit_type, source_table, source_id) DO NOTHING "
+			"RETURNING credit_id"
+		),
+		{
+			"client_id": client_id,
+			"credit_type": credit_type,
+			"amount_cents": amount_cents,
+			"source_table": source_table,
+			"source_id": str(source_id),
+			"issued_at": issued_at,
+			"billing_period": billing_period,
+		},
+	).first()
+	if row is None:
 		logger.info(
 			"billing.issue_credit: duplicate (client=%s type=%s source=%s:%s) — no-op",
 			client_id, credit_type, source_table, source_id,

@@ -8,6 +8,7 @@ import pytest
 from src.services.billing.dispute_credit import (
 	DISPUTE_WINDOW_HOURS,
 	DisputeWindowExpiredError,
+	MissingBilledAmountError,
 	credit_dispute_on_flag,
 )
 
@@ -95,3 +96,20 @@ def test_dispute_outside_48h_window_is_rejected():
 
 def test_window_constant_is_48_hours():
 	assert DISPUTE_WINDOW_HOURS == 48
+
+
+def test_dispute_with_no_billed_amount_blocks_instead_of_guessing():
+	"""PR #37 review finding — a disputed appointment with no
+	billed_amount_cents recorded must raise and mark the row BLOCKED, never
+	fall back to appt_standard's current price (that fallback previously
+	overcredited a disputed FREE first sit as a $99 standard sit)."""
+	scheduled_for = datetime(2026, 1, 1, tzinfo=timezone.utc)
+	flagged_at = scheduled_for + timedelta(hours=1)
+	session = _make_session(scheduled_for, flagged_at, billed_amount_cents=None)
+	with pytest.raises(MissingBilledAmountError):
+		credit_dispute_on_flag(session, dispute_id="dispute-1", as_of=flagged_at)
+	blocked_updates = [
+		params for sql, params in session.executed
+		if params and params.get("dispute_id") == "dispute-1" and "credit_status = 'BLOCKED'" in sql
+	]
+	assert len(blocked_updates) == 1

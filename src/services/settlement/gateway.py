@@ -35,15 +35,25 @@ class PayOutcome:
 class StripeGateway(ABC):
 	@abstractmethod
 	def create_invoice(
-		self, *, stripe_customer_id: str, default_payment_method_id: str,
+		self, *, stripe_customer_id: str, default_payment_method_id: Optional[str],
 		metadata: dict, idempotency_key: str,
-	) -> InvoiceHandle: ...
+	) -> InvoiceHandle:
+		"""default_payment_method_id=None means the customer has no payment
+		method on file for this invoice — the implementation must fall back
+		to Stripe's own send_invoice collection (Stripe emails/hosts the
+		invoice for manual payment) rather than charge_automatically, which
+		would otherwise fail with no payment method to charge."""
 
 	@abstractmethod
 	def add_invoice_item(
 		self, *, stripe_invoice_id: str, stripe_customer_id: str, amount_cents: int,
 		description: str, idempotency_key: str,
-	) -> None: ...
+	) -> str:
+		"""Returns the created invoice item's own Stripe id (invoice_items.id),
+		not the parent invoice id — a caller that needs to look up or dispute
+		THIS specific line item (e.g. billing_credits.stripe_invoice_item_id)
+		cannot do so from the invoice id alone once an invoice carries more
+		than one item."""
 
 	@abstractmethod
 	def update_invoice_metadata(self, *, stripe_invoice_id: str, metadata: dict) -> None: ...
@@ -73,21 +83,28 @@ class LiveStripeGateway(StripeGateway):
 		self._client = _stripe_client()
 
 	def create_invoice(self, *, stripe_customer_id, default_payment_method_id, metadata, idempotency_key):
+		params = {
+			"customer": stripe_customer_id,
+			"auto_advance": False,
+			"pending_invoice_items_behavior": "exclude",
+			"metadata": metadata,
+		}
+		if default_payment_method_id:
+			params["collection_method"] = "charge_automatically"
+			params["default_payment_method"] = default_payment_method_id
+		else:
+			# No payment method on file — Stripe emails/hosts the invoice for
+			# the customer to pay manually, instead of a charge attempt that
+			# would fail outright with nothing to charge.
+			params["collection_method"] = "send_invoice"
+			params["days_until_due"] = 14
 		invoice = self._client.invoices.create(
-			params={
-				"customer": stripe_customer_id,
-				"collection_method": "charge_automatically",
-				"default_payment_method": default_payment_method_id,
-				"auto_advance": False,
-				"pending_invoice_items_behavior": "exclude",
-				"metadata": metadata,
-			},
-			options={"idempotency_key": idempotency_key},
+			params=params, options={"idempotency_key": idempotency_key},
 		)
 		return InvoiceHandle(stripe_invoice_id=invoice.id, status=invoice.status)
 
 	def add_invoice_item(self, *, stripe_invoice_id, stripe_customer_id, amount_cents, description, idempotency_key):
-		self._client.invoice_items.create(
+		item = self._client.invoice_items.create(
 			params={
 				"customer": stripe_customer_id,
 				"invoice": stripe_invoice_id,
@@ -97,6 +114,7 @@ class LiveStripeGateway(StripeGateway):
 			},
 			options={"idempotency_key": idempotency_key},
 		)
+		return item.id
 
 	def update_invoice_metadata(self, *, stripe_invoice_id, metadata):
 		self._client.invoices.update(stripe_invoice_id, params={"metadata": metadata})

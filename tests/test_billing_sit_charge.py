@@ -30,7 +30,7 @@ class _FakeSession:
 	def execute(self, stmt, params=None):
 		sql = str(stmt)
 		if "FROM appointments" in sql:
-			return _FakeResult(_Row(is_billable=True))
+			return _FakeResult(_Row(is_billable=True, billed_offer_code=None, billed_amount_cents=None))
 		if "FROM client_entitlements" in sql:
 			return _FakeResult(_Row(entitlement_id=1, first_sit_consumed=self.first_sit_consumed))
 		if "FROM entitlement_offers" in sql:
@@ -66,3 +66,23 @@ def test_second_sit_charges_standard_price():
 	assert charge.offer_code == "appt_standard"
 	assert charge.amount_cents == 9900
 	assert charge.first_sit is False
+
+
+def test_retrying_an_already_billed_appointment_returns_the_recorded_charge():
+	"""PR #37 review finding — calling resolve_sit_charge() a second time for
+	the SAME appointment must return the charge it already recorded, never
+	re-evaluate first_sit_consumed (which a first call may have already
+	flipped, silently rebilling a free first sit as a $99 standard sit)."""
+
+	class _AlreadyBilledSession(_FakeSession):
+		def execute(self, stmt, params=None):
+			sql = str(stmt)
+			if "FROM appointments" in sql:
+				return _FakeResult(_Row(is_billable=True, billed_offer_code="appt_first", billed_amount_cents=0))
+			raise AssertionError(f"should not query further once already billed: {sql}")
+
+	session = _AlreadyBilledSession(first_sit_consumed=True)
+	charge = resolve_sit_charge(session, client_id="acme_pm", appointment_id="appt-1", as_of=None)
+	assert charge.offer_code == "appt_first"
+	assert charge.amount_cents == 0
+	assert charge.first_sit is True

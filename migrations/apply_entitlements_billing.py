@@ -358,9 +358,15 @@ DDL = [
         NOT NULL DEFAULT 'PENDING'
     """,
     "ALTER TABLE appointment_disputes DROP CONSTRAINT IF EXISTS ck_appointment_disputes_credit_status",
+    # BLOCKED added later (PR #37 review) — a dispute whose appointment has no
+    # billed_amount_cents recorded must stop being reselected every tick
+    # (same reasoning as EXPIRED), never guess the credit amount from the
+    # current appt_standard price. Not auto-retried by the claim query; an
+    # operator must backfill billed_amount_cents (or otherwise resolve it)
+    # before moving the row back to PENDING.
     """
     ALTER TABLE appointment_disputes ADD CONSTRAINT ck_appointment_disputes_credit_status
-        CHECK (credit_status IN ('PENDING', 'CREDITED', 'EXPIRED'))
+        CHECK (credit_status IN ('PENDING', 'CREDITED', 'EXPIRED', 'BLOCKED'))
     """,
     """
     CREATE INDEX IF NOT EXISTS ix_appointment_disputes_credit_pending

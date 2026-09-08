@@ -11,7 +11,7 @@ caller.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import text
@@ -26,6 +26,7 @@ def apply_pending_credits_to_invoice(
 	session: Session,
 	*,
 	client_id: str,
+	billing_period: date,
 	stripe_invoice_id: str,
 	stripe_customer_id: str,
 	as_of: datetime,
@@ -38,41 +39,49 @@ def apply_pending_credits_to_invoice(
 	re-derives the same key rather than creating a second Stripe object,
 	same convention as settlement/charge.py.
 
+	billing_period is REQUIRED (PR #37 review finding): without it, EVERY
+	still-PENDING credit for this client — including one issued for a
+	future or a past billing period — would land on whatever invoice happens
+	to be open right now. Only credits whose own billing_period matches the
+	invoice being built are eligible.
+
 	Returns the number of credits applied. A credit already APPLIED/VOIDED is
 	never re-applied (the WHERE clause below only ever selects PENDING rows)."""
 	gw = gateway or LiveStripeGateway()
 	credits = session.execute(
 		text(
 			"SELECT credit_id, credit_type, amount_cents FROM billing_credits "
-			"WHERE client_id = :client_id AND status = 'PENDING' "
+			"WHERE client_id = :client_id AND status = 'PENDING' AND billing_period = :billing_period "
 			"ORDER BY credit_id FOR UPDATE SKIP LOCKED"
 		),
-		{"client_id": client_id},
+		{"client_id": client_id, "billing_period": billing_period},
 	).all()
 
 	applied = 0
 	for credit in credits:
 		idempotency_key = f"billing-credit|{credit.credit_id}"
-		gw.add_invoice_item(
+		invoice_item_id = gw.add_invoice_item(
 			stripe_invoice_id=stripe_invoice_id,
 			stripe_customer_id=stripe_customer_id,
 			amount_cents=-credit.amount_cents,
 			description=f"Blackink {credit.credit_type.replace('_', ' ').title()} — credit {credit.credit_id}",
 			idempotency_key=idempotency_key,
 		)
-		# StripeGateway.add_invoice_item() returns None (the ABC exposes no
-		# item-id lookup) — stripe_invoice_item_id stores the parent invoice id
-		# instead, which is still enough to find the credit line on the Stripe
-		# dashboard/invoice.
+		# Stores the invoice ITEM's own id (PR #37 review finding — the
+		# parent invoice id alone can't identify this specific line once the
+		# invoice carries more than one item).
 		session.execute(
 			text(
 				"UPDATE billing_credits SET status = 'APPLIED', "
-				"stripe_invoice_item_id = :stripe_invoice_id, applied_at = :as_of "
+				"stripe_invoice_item_id = :invoice_item_id, applied_at = :as_of "
 				"WHERE credit_id = :credit_id"
 			),
-			{"stripe_invoice_id": stripe_invoice_id, "as_of": as_of, "credit_id": credit.credit_id},
+			{"invoice_item_id": invoice_item_id, "as_of": as_of, "credit_id": credit.credit_id},
 		)
 		applied += 1
 
-	logger.info("billing.invoice_apply: applied %d credit(s) to invoice=%s (client=%s)", applied, stripe_invoice_id, client_id)
+	logger.info(
+		"billing.invoice_apply: applied %d credit(s) for billing_period=%s to invoice=%s (client=%s)",
+		applied, billing_period, stripe_invoice_id, client_id,
+	)
 	return applied

@@ -2,7 +2,7 @@
 3 qualifying sits -> override; 4 -> none; 5 -> none. No DB — a fake Session
 standing in for the entitlement/count/update/insert statements."""
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from src.services.billing.guarantee import evaluate_sixty_day_guarantee
 
@@ -13,8 +13,9 @@ class _Row:
 
 
 class _FakeResult:
-	def __init__(self, row):
+	def __init__(self, row, rowcount=1):
 		self._row = row
+		self.rowcount = rowcount
 
 	def first(self):
 		return self._row
@@ -91,6 +92,51 @@ def test_five_qualifying_sits_applies_no_override(monkeypatch):
 	result = evaluate_sixty_day_guarantee(session, client_id="acme_pm", as_of=as_of)
 	assert result is False
 	assert session.inserted_overrides == []
+
+
+def test_lost_race_on_guarantee_applied_update_is_a_no_op(monkeypatch):
+	"""PR #37 review finding — row locking/idempotency: if the
+	guarantee_applied UPDATE affects zero rows (a concurrent evaluation of
+	this SAME entitlement already claimed it), this call must return False
+	and must NOT insert a second override or re-log the event."""
+	activated_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+	as_of = activated_at + timedelta(days=61)
+	session = _FakeSession(_entitlement(activated_at), qualifying_count=3)
+
+	orig_execute = session.execute
+
+	def _execute(stmt, params=None):
+		sql = str(stmt)
+		if "UPDATE client_entitlements" in sql:
+			return _FakeResult(None, rowcount=0)
+		return orig_execute(stmt, params)
+
+	session.execute = _execute
+
+	import src.services.billing.guarantee as mod
+
+	monkeypatch.setattr(mod, "log_event", lambda *a, **kw: None)
+	result = evaluate_sixty_day_guarantee(session, client_id="acme_pm", as_of=as_of)
+	assert result is False
+	assert session.inserted_overrides == []
+
+
+def test_next_billing_period_uses_activation_day_anchor_not_calendar_month():
+	"""PR #37 review finding — the guarantee override's billing_period must
+	anchor on the entitlement's own activation day (a Stripe subscription's
+	real billing anniversary), not unconditionally the 1st of next month."""
+	from src.services.billing.guarantee import _next_billing_period
+
+	# Activated on the 15th; evaluated well past this month's 15th cycle —
+	# next cycle is the 15th of the FOLLOWING month, not the 1st.
+	as_of = datetime(2026, 3, 20, tzinfo=timezone.utc)
+	assert _next_billing_period(as_of, cycle_anchor_day=15) == date(2026, 4, 15)
+
+	# Activated on the 31st; evaluated AFTER this month's 31st has passed —
+	# next cycle rolls into February and clamps to the 28th (2026 is not a
+	# leap year).
+	as_of = datetime(2026, 2, 5, tzinfo=timezone.utc)
+	assert _next_billing_period(as_of, cycle_anchor_day=31) == date(2026, 2, 28)
 
 
 def test_before_day_sixty_is_a_no_op(monkeypatch):

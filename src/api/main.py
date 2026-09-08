@@ -82,6 +82,7 @@ _RESPOND_SLA_SWEEP_INTERVAL_SECONDS = 60
 _BILLING_MISS_CREDIT_SWEEP_INTERVAL_SECONDS = 60
 _BILLING_DISPUTE_CREDIT_SWEEP_INTERVAL_SECONDS = 60
 _BILLING_GUARANTEE_SWEEP_INTERVAL_SECONDS = 3600
+_BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS = 300
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -114,6 +115,7 @@ def _start_background_workers() -> None:
 		run_dispute_credit_sweep as billing_dispute_credit_sweep,
 		run_guarantee_sweep as billing_guarantee_sweep,
 		run_miss_credit_sweep as billing_miss_credit_sweep,
+		run_sit_invoice_sweep as billing_sit_invoice_sweep,
 	)
 
 	workers = [
@@ -137,6 +139,7 @@ def _start_background_workers() -> None:
 		("billing_sweep.run_miss_credit_sweep", _BILLING_MISS_CREDIT_SWEEP_INTERVAL_SECONDS, billing_miss_credit_sweep),
 		("billing_sweep.run_dispute_credit_sweep", _BILLING_DISPUTE_CREDIT_SWEEP_INTERVAL_SECONDS, billing_dispute_credit_sweep),
 		("billing_sweep.run_guarantee_sweep", _BILLING_GUARANTEE_SWEEP_INTERVAL_SECONDS, billing_guarantee_sweep),
+		("billing_sweep.run_sit_invoice_sweep", _BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS, billing_sit_invoice_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
