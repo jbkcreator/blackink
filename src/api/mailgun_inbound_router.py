@@ -126,7 +126,11 @@ async def mailgun_inbound(request: Request) -> dict:
         idempotency_key=idempotency_key,
         destination_address=recipient,
         prospect_name=parsed.prospect_name,
-        email=parsed.email or email,
+        # For a review-required row, never fall back to the From-header email:
+        # on a portal notification that is the portal's own address, and using
+        # it would make the STL sweep auto-reply to the portal. Human review
+        # supplies the real owner email instead.
+        email=parsed.email if parsed.requires_human_review else (parsed.email or email),
         phone=parsed.phone,
         property_address=parsed.property_address,
         inquiry_text=(parsed.inquiry_text or body_plain)[:2000],

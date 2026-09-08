@@ -113,3 +113,18 @@ def test_send_success_marks_responded():
     mark_resp.assert_called_once()
     mark_unconf.assert_not_called()
     reset.assert_not_called()
+
+
+def test_claim_due_excludes_human_review_rows():
+    """PR finding: _claim_due must never claim requires_human_review rows, so
+    an unparsed/ambiguous notification is never auto-responded (which could
+    reply to the portal). Assert the guard is in the claim SQL."""
+    session = MagicMock()
+    result = MagicMock()
+    result.fetchall.return_value = []
+    session.execute.return_value = result
+
+    sweep._claim_due(session, limit=10)
+
+    sql = str(session.execute.call_args.args[0])
+    assert "requires_human_review = FALSE" in sql

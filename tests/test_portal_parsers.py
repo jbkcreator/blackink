@@ -154,14 +154,18 @@ class TestClassifyAndParse:
         assert result.source_channel == UNCLASSIFIED
         assert result.requires_human_review is True
 
-    def test_unclassified_carries_fallback_email(self):
+    def test_unclassified_does_not_carry_fallback_email(self):
+        """PR finding: an unmatched notification must NOT adopt the From-header
+        address as the prospect email — for a portal that is the portal itself.
+        The row stays review-required and the human supplies the real email."""
         result = classify_and_parse(_parts(
             sender="other@portal.io",
             body="lead body",
-            fallback_email="prospect@email.com",
+            fallback_email="notifications@portal.io",
         ))
         assert result.source_channel == UNCLASSIFIED
-        assert result.email == "prospect@email.com"
+        assert result.requires_human_review is True
+        assert result.email is None
 
     def test_unclassified_not_dropped(self):
         # Must return a ParsedLead, never raise
@@ -207,3 +211,59 @@ class TestClassifyAndParse:
             fallback_email="from_header@example.com",
         ))
         assert result.email == "from_header@example.com"
+
+
+# ── PR finding: HTML-only notifications + no portal-sender email fallback ─────
+
+APM_HTML_ONLY = (
+    "<html><body>"
+    "<p>Owner Name: Jane Smith</p>"
+    "<p>Email: jane@ownermail.com</p>"
+    "<p>Phone: (813) 555-0100</p>"
+    "<p>Property Address: 12 Bay St, Tampa FL 33602</p>"
+    "<p>Message: I own several units and need management.</p>"
+    "</body></html>"
+)
+
+
+class TestHtmlOnlyAndEmailFallback:
+    def test_html_only_apm_is_parsed_not_lost_to_review(self):
+        """An HTML-only APM notification (blank body_plain) must still extract
+        the owner's labelled details rather than degrade to human review."""
+        result = classify_and_parse(_parts(
+            sender="APM Leads <leads@allpropertymanagement.com>",
+            subject="New lead from All Property Management",
+            body="",                      # no text/plain part
+            html=APM_HTML_ONLY,
+        ))
+        assert result.source_channel == "APM"
+        assert result.prospect_name == "Jane Smith"
+        assert result.email == "jane@ownermail.com"
+        assert result.phone == "(813) 555-0100"
+        assert result.requires_human_review is False
+
+    def test_unclassified_does_not_seed_email_from_portal_sender(self):
+        """An unmatched notification must NOT carry the From-header address as
+        the prospect email — for a portal that is the portal's own address."""
+        result = classify_and_parse(_parts(
+            sender="notifications@someportal.com",
+            subject="You have a new lead",
+            body="opaque body with no labels",
+            fallback_email="notifications@someportal.com",
+        ))
+        assert result.source_channel == UNCLASSIFIED
+        assert result.requires_human_review is True
+        assert result.email is None
+
+    def test_review_required_parse_does_not_backfill_portal_email(self):
+        """A matched-but-unparseable APM email (no owner fields) stays review-
+        required and must not adopt the From-header (portal) address."""
+        result = classify_and_parse(_parts(
+            sender="leads@allpropertymanagement.com",
+            subject="New lead",
+            body="(nothing parseable here)",
+            fallback_email="leads@allpropertymanagement.com",
+        ))
+        assert result.source_channel == "APM"
+        assert result.requires_human_review is True
+        assert result.email is None

@@ -42,6 +42,7 @@ real-format drift degrades to a reviewable row rather than a wrong extraction.
 
 from __future__ import annotations
 
+import html as _html
 import logging
 import re
 from dataclasses import dataclass, field
@@ -50,6 +51,27 @@ from typing import Callable, List, Optional
 logger = logging.getLogger(__name__)
 
 UNCLASSIFIED = "UNCLASSIFIED"
+
+
+def _html_to_text(raw: Optional[str]) -> str:
+    """Flatten an HTML email body to labelled-line text the parsers can read.
+
+    Portal notifications are frequently HTML-only (no text/plain part). Without
+    this, an HTML-only APM/MMP/Thumbtack email parsed to nothing and the lead
+    was lost to human review. Block/line tags become newlines so ``_labeled``'s
+    per-line ``Label: value`` matching still works; script/style contents are
+    dropped; entities are unescaped. Stdlib only — no bs4 dependency."""
+    if not raw:
+        return ""
+    t = re.sub(r"(?is)<\s*(script|style)[^>]*>.*?<\s*/\s*\1\s*>", " ", raw)
+    t = re.sub(r"(?i)<\s*br\s*/?>", "\n", t)
+    t = re.sub(r"(?i)</\s*(p|div|tr|li|h[1-6]|table|thead|tbody)\s*>", "\n", t)
+    t = re.sub(r"<[^>]+>", " ", t)          # strip remaining tags
+    t = _html.unescape(t)
+    t = re.sub(r"[ \t\r\f]+", " ", t)        # collapse inline whitespace, keep \n
+    t = re.sub(r"\n[ \t]*", "\n", t)         # trim leading space on each line
+    t = re.sub(r"\n{2,}", "\n", t)           # collapse blank lines
+    return t.strip()
 
 
 @dataclass
@@ -83,6 +105,14 @@ class EmailParts:
     # Email already teased out of the raw From header by the router, if any —
     # used as a fallback contact when the body carries no explicit email.
     fallback_email: Optional[str] = None
+
+    def text_body(self) -> str:
+        """Body the parsers read: the text/plain part when present, else the
+        HTML part flattened to text. Guarantees an HTML-only notification is
+        still parsed rather than silently yielding an empty body."""
+        if self.body_plain and self.body_plain.strip():
+            return self.body_plain
+        return _html_to_text(self.body_html)
 
 
 @dataclass
@@ -191,7 +221,7 @@ def _finalize(
 
 def parse_apm(parts: EmailParts) -> ParsedLead:
     """All Property Management — labelled 'Name/Email/Phone/Property/Message' block."""
-    body = parts.body_plain or ""
+    body = parts.text_body()
     name = _labeled(body, "Owner Name", "Name", "Contact", "Lead Name")
     email = _first_email(_labeled(body, "Email", "Email Address"))
     phone = _first_phone(_labeled(body, "Phone", "Phone Number", "Telephone"))
@@ -205,7 +235,7 @@ def parse_apm(parts: EmailParts) -> ParsedLead:
 
 def parse_manage_my_property(parts: EmailParts) -> ParsedLead:
     """Manage My Property — similar labelled layout, different label wording."""
-    body = parts.body_plain or ""
+    body = parts.text_body()
     name = _labeled(body, "Owner", "Owner Name", "Full Name", "Name", "From")
     email = _first_email(_labeled(body, "Email", "E-mail", "Email Address")) or _first_email(body)
     phone = _first_phone(_labeled(body, "Phone", "Phone Number", "Best Contact Number")) or _first_phone(body)
@@ -224,7 +254,7 @@ def parse_thumbtack(parts: EmailParts) -> ParsedLead:
     description + budget into inquiry_text so downstream (Respond queue, closer
     card) sees the full context, since inbound_messages has no dedicated budget
     column."""
-    body = parts.body_plain or ""
+    body = parts.text_body()
     name = _labeled(body, "Name", "Customer", "Requested by", "From")
     email = _first_email(_labeled(body, "Email")) or _first_email(body)
     phone = _first_phone(_labeled(body, "Phone", "Phone Number")) or _first_phone(body)
@@ -296,8 +326,16 @@ def classify_and_parse(parts: EmailParts) -> ParsedLead:
             if config.matches(parts):
                 result = config.parser(parts)
                 # Defensive: if a parser handed back an email of None but the
-                # router already derived one from the From header, keep it.
-                if result.email is None and parts.fallback_email:
+                # router already derived one from the From header, keep it —
+                # but ONLY for a usable (non-review) lead. For portal
+                # notifications the From address is the PORTAL, not the owner;
+                # backfilling it onto a review-required row would make the
+                # portal look like the prospect and (pre-fix) get auto-replied.
+                if (
+                    result.email is None
+                    and parts.fallback_email
+                    and not result.requires_human_review
+                ):
                     result.email = parts.fallback_email
                 return result
         except Exception:  # noqa: BLE001 — resilience is the whole point here
@@ -307,12 +345,17 @@ def classify_and_parse(parts: EmailParts) -> ParsedLead:
             )
             break
 
+    # No portal matched. Do NOT seed the prospect email from the From header:
+    # for a portal notification that address is the portal, not the owner. The
+    # row is review-required and carries the raw body for a human; the sender
+    # is still available on the stored message for context, but it must never
+    # be treated as a sendable prospect address.
     return ParsedLead(
         source_channel=UNCLASSIFIED,
         prospect_name=None,
-        email=parts.fallback_email,
+        email=None,
         phone=None,
         property_address=None,
-        inquiry_text=(parts.body_plain or None),
+        inquiry_text=(parts.text_body() or None),
         requires_human_review=True,
     )
