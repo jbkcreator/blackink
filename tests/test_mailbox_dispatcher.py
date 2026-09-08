@@ -254,6 +254,22 @@ def test_zero_ceiling_falls_back_to_default_cap():
     assert session.execute.call_args_list[2][0][1]["cap"] == DEFAULT_DAILY_SEND_CAP
 
 
+def test_ceiling_above_platform_max_is_capped():
+    """A daily_send_ceiling above MAX_DAILY_SEND_CAP is clamped down — a
+    misconfigured 100 can never raise a mailbox past the platform max of 50."""
+    from src.services.mailbox_dispatcher import MAX_DAILY_SEND_CAP
+    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=100)
+    get_active_mailbox_for_client(session, "client_a")
+    assert session.execute.call_args_list[2][0][1]["cap"] == MAX_DAILY_SEND_CAP
+
+
+def test_ceiling_below_platform_max_is_honored():
+    """A ceiling below the platform max lowers the cap as-is."""
+    session = _session_with_mailbox(client_id="client_a", daily_send_ceiling=30)
+    get_active_mailbox_for_client(session, "client_a")
+    assert session.execute.call_args_list[2][0][1]["cap"] == 30
+
+
 def test_explicit_cap_argument_skips_client_lookup():
     """An explicit daily_send_cap wins and does not query clients at all."""
     session = MagicMock()

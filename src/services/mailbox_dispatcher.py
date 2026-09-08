@@ -47,6 +47,11 @@ class AllMailboxesCapped(NoMailboxAvailable):
 
 
 DEFAULT_DAILY_SEND_CAP = 50
+# Hard platform ceiling per mailbox per rolling 24h — the blueprint's
+# deliverability limit (30–50/mailbox). A per-client daily_send_ceiling may
+# lower this but never raise it; a misconfigured high value can't burn a
+# mailbox's reputation.
+MAX_DAILY_SEND_CAP = 50
 
 
 @dataclass(frozen=True)
@@ -64,7 +69,9 @@ def _resolve_daily_send_cap(session: Session, client_id: str) -> int:
     clients.daily_send_ceiling is the source of truth (per mailbox). It defaults
     to 0, which we treat as "unset" and fall back to DEFAULT_DAILY_SEND_CAP so a
     freshly-provisioned client is never accidentally floored to zero sends. A
-    positive ceiling overrides the default.
+    positive ceiling lowers the cap, but is bounded above by MAX_DAILY_SEND_CAP —
+    a ceiling of 100 can't raise the per-mailbox limit past the platform max and
+    burn its warmed reputation.
     """
     ceiling = session.execute(
         text("SELECT daily_send_ceiling FROM clients WHERE client_id = :client_id"),
@@ -72,7 +79,7 @@ def _resolve_daily_send_cap(session: Session, client_id: str) -> int:
     ).scalar()
     if ceiling is None or ceiling <= 0:
         return DEFAULT_DAILY_SEND_CAP
-    return int(ceiling)
+    return min(int(ceiling), MAX_DAILY_SEND_CAP)
 
 
 def get_active_mailbox_for_client(
