@@ -41,7 +41,6 @@ PYTHONPATH=. python migrations/apply_meeting_outcomes.py    # adds meeting_outco
 PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
 PYTHONPATH=. python migrations/apply_sequence_runs.py       # Dev 3 — after agent_work_orders
 PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py  # Dev 3 — after sequence_runs
-PYTHONPATH=. python migrations/apply_inbound_messages.py    # Dev 3 — after sequence_runs, before RLS
 PYTHONPATH=. python migrations/apply_companies_google_place_id.py  # adds google_place_id to companies
 PYTHONPATH=. python migrations/apply_ghost_shopper_cleanup.py      # removes deferred ghost-shopper columns; renames audit_pdf_url -> ovs_pdf_url
 PYTHONPATH=. python migrations/apply_owner_visibility_scores.py    # OVS engine scoring table
@@ -57,6 +56,9 @@ PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2
 PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
 PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — appointments/confirmation_logs/dispositions/disputes + state enum (needs clients+companies+contacts; before RLS)
+PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
+PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
+PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
 PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
@@ -75,6 +77,8 @@ python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
+python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
+python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
 
@@ -604,60 +608,6 @@ Slack workspace over Socket Mode. Note that **Interactivity must be toggled
 on** in the Slack app config even under Socket Mode — Socket Mode only
 replaces the Request URL; it does not enable interactivity, and a card's
 button renders with a warning until it is on.
-
-### Appointment operations & the billing gate (Subtask 1.1.1)
-
-`migrations/apply_appointment_ops.py` deploys the settlement-billing
-substrate: the `appointment_state_enum` (nine states) and four tables —
-`appointments`, `confirmation_logs`, `appointment_dispositions`,
-`appointment_disputes`. This is schema + state machine only; the full
-4-rule ownership/intent/ICP/duration qualification bar lands Week 4.
-
-**Deliberate adaptation of the blueprint DDL** (Source D p5's
-`009_appointment_ops.sql`): the printed DDL types `company_id`/`contact_id`
-as UUIDs and declares `client_id UUID REFERENCES companies(company_id)` —
-none of which is true in this repo (`companies.company_id` is a VARCHAR(64)
-sha256, `contacts.contact_id` is BIGSERIAL, and `client_id` is the
-VARCHAR(40) paying-tenant key that is the RLS boundary). Source D's own
-caveats flag exactly this ("Printed DDL is not a complete application
-schema"). The conflated `client_id → companies` is split into two real
-columns: **`client_id VARCHAR(40) → clients`** (the tenant / RLS boundary)
-and **`company_id VARCHAR(64) → companies`** (the company the appointment is
-with), plus **`contact_id BIGINT → contacts`**. `opportunity_id UUID` is
-preserved across reschedules exactly as the blueprint intends.
-
-All four tables carry their own `client_id` and are registered in
-`config/tenant_policies.py` as `{"mode": "direct", "column": "client_id"}`
-(child tables scoped directly, not via a parent join — a mis-scoped INSERT
-is rejected at the row it is written on). DELETE is REVOKEd from **both**
-runtime roles: an appointment / audit row is status-transitioned, never
-removed at runtime — so tests clean up via the table-owner role, not
-`blackink_system`.
-
-`appointments.is_billable` is a **STORED generated column** — `TRUE` only
-when `state = 'ATTENDED' AND confirmed_24h_timestamp IS NOT NULL AND
-confirmed_3h_timestamp IS NOT NULL`. It is the schema-level slice of the
-gate, **not** the sole billing truth (it recomputes to `false` the moment
-state leaves ATTENDED, e.g. → DISPOSITIONED). `idx_opportunity_dedupe` is a
-**non-unique** index on purpose: one `opportunity_id` legitimately spans
-many appointment rows across reschedule / no-show-recovery / rebook chains;
-exactly-once billing idempotency is enforced at settlement, not by this
-index. The nine-state transition rules — reschedule capped at 2 (the third
-forces `LOST`), `opportunity_id` retained across reschedule and no-show
-recovery — are pure functions in `src/services/appointment_state.py` (a
-generated column can express a value but not a transition guard), applied by
-the single production write path `src/services/appointments.py`
-(`reschedule_appointment()` / `begin_no_show_recovery_for_appointment()`) —
-every reschedule MUST go through it, or a real third reschedule only hits the
-migration trigger's `reschedule_count > 2` backstop and errors instead of
-landing in `LOST`. The trigger's INSERT-time company/contact
-ownership check is a one-time creation snapshot, never re-validated on
-UPDATE — `county_allocation_reassessment.py` reassigns
-`companies.owning_client_id` as normal operation, so a live re-check would
-permanently block the original tenant from updating its own pre-existing
-appointment rows after a routine reassignment. `client_id`/`company_id`/
-`contact_id` are immutable once set instead, closing the same tenant-hop
-without that live re-check.
 
 ## Tooling Rules
 
