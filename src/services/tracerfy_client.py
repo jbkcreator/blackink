@@ -18,6 +18,17 @@ API shape (Tracerfy /v1/api/):
   CSV columns: phone, national_dnc (Y/N), litigator (Y/N)
 
 Cost: 1 Tracerfy credit (~$0.02) per phone checked.
+
+Skip-trace (Subtask 3.2.1 — owner name/address -> phone/email) is the SAME
+Tracerfy account (client decision, 2026-09-08 — one vendor for both DNC and
+skip-trace) but a DIFFERENT product, with its own endpoint/request/response
+contract that is NOT YET CONFIRMED against Tracerfy's real API docs — see
+submit_skiptrace_batch()'s own docstring. Do not remove that function's
+NotImplementedError without first confirming the real contract; see
+docs/plans/2026-09-08-subtask-3.2.1-enrichment-pipeline-wiring-verification.md
+§5.1 for why guessing here is the single worst failure mode this subtask has
+(a wrong guess parses to an empty result for every row, which looks like a
+plausible "nobody was found" outcome rather than a loud error).
 """
 
 import csv
@@ -128,3 +139,57 @@ def scrub_phones(phones: list[str], api_key: str) -> dict[str, bool]:
             continue
         result[phone] = not is_dnc_hit(row)
     return result
+
+
+# ============================================================================
+# Skip-trace (Subtask 3.2.1) -- owner name/address -> phone/email
+# ============================================================================
+#
+# UNCONFIRMED VENDOR CONTRACT. Everything above this line (_TRACERFY_BASE,
+# headers(), poll_queue(), BATCH_SIZE, the 401/403/429/timeout handling) is
+# real, in production, and safe to reuse -- that transport layer is identical
+# for any Tracerfy product on this account. What is NOT known is specific to
+# skip-trace: its endpoint path, its request body shape, and its result-CSV
+# column names. None of the three appears in this repo or in any spec
+# document (see the plan doc's Section 5.1). submit_skiptrace_batch() therefore
+# raises rather than guesses -- see its own docstring for why a guess here is
+# worse than a crash.
+
+
+def submit_skiptrace_batch(inputs: list[dict], api_key: str) -> str:
+    """Would submit a skip-trace batch (owner_name + property_address per row,
+    keyed by winback_row_id) the same submit-then-poll way submit_batch()
+    submits phones for DNC scrubbing, returning a queue_id to hand to
+    poll_queue().
+
+    Deliberately NOT implemented against a guessed endpoint/payload shape.
+    Read the real Tracerfy skip-trace API documentation (or a captured live
+    response) and fill in the actual endpoint path and request body before
+    removing this NotImplementedError -- see owner_enrichment.py's
+    TracerfyEnrichmentProvider, the only caller, and the plan doc's Section
+    5.1 box: a wrong guess here would parse to an empty result for every row,
+    which looks exactly like "no owners were found" rather than a loud,
+    obvious failure. That is why this raises instead of shipping a
+    best-guess implementation.
+
+    `inputs`: list of {"winback_row_id": int, "owner_name": str,
+    "property_address": str, "county_slug": str | None} -- the same shape
+    owner_enrichment.EnrichmentInput carries, flattened to plain dicts so
+    this module has no dependency on that dataclass.
+    """
+    raise NotImplementedError(
+        "Tracerfy skip-trace endpoint/request contract not yet confirmed -- "
+        "see tracerfy_client.py's module docstring and "
+        "docs/plans/2026-09-08-subtask-3.2.1-enrichment-pipeline-wiring-verification.md "
+        "Section 5.1 before implementing this against Tracerfy's real API docs."
+    )
+
+
+
+# NOTE: deliberately no combined submit+poll "skiptrace_batch()" convenience
+# function here (unlike scrub_phones() for DNC) -- owner_enrichment.py's
+# TracerfyEnrichmentProvider needs submit_skiptrace_batch() and poll_queue()
+# as two SEPARATE calls with a commit in between (the enrichment_attempts
+# bump happens between them), for the crash-safety reasons documented on
+# OwnerEnrichmentProvider's submit()/collect() split. A combined function
+# would hide that boundary and invite exactly the bug this design avoids.

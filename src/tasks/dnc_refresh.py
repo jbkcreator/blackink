@@ -140,11 +140,11 @@ def run_dnc_refresh(
     """
     settings = get_settings()
 
-    if not settings.dnc_vendor_api_key:
-        logger.warning("dnc_refresh: DNC_VENDOR_API_KEY not set — skipped")
-        return {"skipped": True, "reason": "DNC_VENDOR_API_KEY not configured"}
+    if not settings.tracerfy_api_key:
+        logger.warning("dnc_refresh: TRACERFY_API_KEY not set — skipped")
+        return {"skipped": True, "reason": "TRACERFY_API_KEY not configured"}
 
-    api_key = settings.dnc_vendor_api_key.get_secret_value()
+    api_key = settings.tracerfy_api_key.get_secret_value()
     recheck_days = days if days is not None else settings.dnc_recheck_days
     cutoff = datetime.now(timezone.utc) - timedelta(days=recheck_days)
 

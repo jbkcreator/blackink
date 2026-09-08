@@ -72,12 +72,27 @@ class AppSettings(BaseSettings):
 	redis_url: Optional[str] = Field(default=None, env="REDIS_URL")
 
 	# ── Compliance gate ──────────────────────────────────────────────────────
-	dnc_vendor_api_key: Optional[SecretStr] = Field(default=None, env="DNC_VENDOR_API_KEY")
+	# Tracerfy account key — serves BOTH the DNC scrub (src/tasks/dnc_refresh.py,
+	# src/services/winback_ingest.py) and skip-trace owner enrichment
+	# (src/services/owner_enrichment.py, Subtask 3.2.1) — one Tracerfy account,
+	# both products (client decision 2026-09-08). Renamed from
+	# DNC_VENDOR_API_KEY, which described only the first use; kept as one
+	# credential rather than two so there is exactly one place to rotate it.
+	tracerfy_api_key: Optional[SecretStr] = Field(default=None, env="TRACERFY_API_KEY")
 	# Max age before a cached dnc_clean value is treated as ABSTAIN (stale), not trusted.
 	dnc_recheck_days: int = Field(default=30, env="DNC_RECHECK_DAYS")
 	email_verification_vendor_api_key: Optional[SecretStr] = Field(
 		default=None, env="EMAIL_VERIFICATION_VENDOR_API_KEY"
 	)
+	# ── Owner enrichment (Subtask 3.2.1) ────────────────────────────────────
+	# Hard bound on per-run vendor spend — src/tasks/enrichment_verification.py's
+	# claim query LIMITs to this by default.
+	owner_enrichment_max_per_run: int = Field(default=500, env="OWNER_ENRICHMENT_MAX_PER_RUN")
+	# A row whose enrichment never gets an answer (vendor outage, poll timeout)
+	# is retried up to this many sweep runs before the self-heal step
+	# terminally marks it requires_enrichment_review=TRUE — same bounded-retry
+	# idiom as src/tasks/self_serve_audit_worker.py's own attempt cap.
+	owner_enrichment_max_attempts: int = Field(default=3, env="OWNER_ENRICHMENT_MAX_ATTEMPTS")
 	# Non-poach lock (client_pm_books-based) is permanent per design decision —
 	# this flag exists only as an emergency override switch, default must stay True.
 	non_poach_lock_permanent: bool = Field(default=True, env="NON_POACH_LOCK_PERMANENT")

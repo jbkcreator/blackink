@@ -121,7 +121,7 @@ def evaluate_winback_touch_gate(session: Session, row, client_id: str) -> Winbac
 		_check_disposition(row),
 		_check_not_suppressed(row),
 		_check_not_stopped(row),
-		_check_has_email(row),
+		_check_enrichment(row),
 	)
 	for check in checks:
 		_record_gate_check(session, row.winback_row_id, client_id, check)
@@ -146,10 +146,31 @@ def _check_not_stopped(row) -> GateCheckResult:
 	return GateCheckResult("not_stopped", PASS, "stopped_at=null")
 
 
-def _check_has_email(row) -> GateCheckResult:
+def _check_enrichment(row) -> GateCheckResult:
+	"""Subtask 3.2.1 — replaces the old bare _check_has_email. Enrichment
+	must have RUN, not merely have failed to object: requires_enrichment_review
+	is NOT NULL DEFAULT FALSE, so a row that was never enriched at all is
+	indistinguishable from "was enriched, and enrichment was happy" unless
+	enrichment_timestamp is checked first. Without this branch, an operator
+	who arms an import right after upload (no ordering constraint stops
+	that) would send the entire batch un-enriched with every check green —
+	this is the same failure mode _flag_unscrubbed's own docstring warns
+	about (requires_human_review alone is NOT enough — nothing downstream
+	inspects that column), recurring here under requires_enrichment_review.
+
+	Cannot deadlock: the stub provider (owner_enrichment.StubOwnerEnrichmentProvider)
+	still runs and still sets enrichment_timestamp, and
+	src/tasks/enrichment_verification.py's self-heal step terminally stamps
+	enrichment_timestamp even for a row whose vendor calls never succeeded
+	(attempts exhausted) — so this branch requires enrichment to have
+	*happened*, never that it *succeeded*."""
+	if row.enrichment_timestamp is None:
+		return GateCheckResult("enrichment_verified", "FAIL", "enrichment has not run for this row")
+	if row.requires_enrichment_review:
+		return GateCheckResult("enrichment_verified", "FAIL", "requires_enrichment_review=true")
 	if not row.email:
-		return GateCheckResult("has_email", "FAIL", "email is null")
-	return GateCheckResult("has_email", PASS, "email present")
+		return GateCheckResult("enrichment_verified", "FAIL", "no email after enrichment (phone-only)")
+	return GateCheckResult("enrichment_verified", PASS, f"email present, status={row.email_status}")
 
 
 def stop_active_winback_runs(session: Session, client_id: str, email: str, reason: str) -> int:
@@ -164,10 +185,18 @@ def stop_active_winback_runs(session: Session, client_id: str, email: str, reaso
 	is a normal, expected no-op, not an error)."""
 	if reason not in _STOP_REASONS:
 		raise ValueError(f"stop_active_winback_runs: {reason!r} is not a recognized stop_reason")
+	# Matches lower(email) OR lower(email_previous) — Subtask 3.2.1's owner
+	# enrichment can overwrite `email` with a fresher provider-found address,
+	# and `email_previous` preserves what it superseded (src/services/
+	# owner_enrichment.py::apply_result). Without this OR, a reply arriving
+	# from the address the CSV/prospect actually used — but no longer on the
+	# row after an overwrite — would silently fail to stop the sequence, the
+	# exact compliance defect this stop rule exists to prevent.
 	result = session.execute(
 		text(
 			"UPDATE winback_rows SET stopped_at = NOW(), stop_reason = :reason, updated_at = NOW() "
-			"WHERE client_id = :client_id AND lower(email) = lower(:email) AND stopped_at IS NULL"
+			"WHERE client_id = :client_id AND stopped_at IS NULL "
+			"  AND (lower(email) = lower(:email) OR lower(email_previous) = lower(:email))"
 		),
 		{"client_id": client_id, "email": email, "reason": reason},
 	)
@@ -211,6 +240,18 @@ def arm_winback_run(
 			"arm_winback_run: winback_row_id=%s disposition=%s is not armable — skipped",
 			row.winback_row_id, row.disposition,
 		)
+		return []
+	# Subtask 3.2.1 defense in depth, same reasoning as the suppression_state/
+	# stopped_at re-checks below: the /arm endpoint's own SQL already filters
+	# on enrichment_timestamp/requires_enrichment_review, but a future caller
+	# (or a re-arm after a row's enrichment state changed between the
+	# endpoint's SELECT and this call) must never enqueue touches for a row
+	# enrichment never ran for, or one it could not rescue.
+	if row.enrichment_timestamp is None:
+		logger.warning("arm_winback_run: winback_row_id=%s enrichment has not run — skipped", row.winback_row_id)
+		return []
+	if row.requires_enrichment_review:
+		logger.warning("arm_winback_run: winback_row_id=%s requires_enrichment_review=true — skipped", row.winback_row_id)
 		return []
 	if not row.email:
 		logger.warning("arm_winback_run: winback_row_id=%s has no email — skipped", row.winback_row_id)
