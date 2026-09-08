@@ -27,6 +27,21 @@ Adds:
     pending-enrichment predicate — no separate status column.
   - winback_rows.enrichment_attempts — bounded-retry counter, same idiom as
     src/tasks/self_serve_audit_worker.py's own attempt-bounded retry.
+  - winback_rows.enrichment_claimed_at — a lease timestamp (PR review
+    finding, confirmed real): the row-lock from _claim_rows's
+    FOR UPDATE SKIP LOCKED is released by the commit right after the
+    enrichment_attempts bump, but enrichment_timestamp stays NULL until
+    apply_result runs — which can be up to ~10 minutes later for a real
+    Tracerfy poll. Without a separate lease, a concurrent sweep run could
+    re-claim and re-submit the same rows during that window. Same
+    _CLAIM_LEASE_MINUTES pattern as self_serve_audit_worker.py's own
+    claimed_at lease.
+  - winback_rows.enrichment_queue_id — the vendor's queue_id, stored for
+    operational visibility only (checking Tracerfy's own dashboard for a
+    stuck batch) — NOT used to resume an abandoned poll; a lease that
+    expires without the row completing is re-claimed and freshly
+    re-submitted, not resumed (a deliberate scope decision — see
+    src/tasks/enrichment_verification.py's own docstring).
 
 winback_rows is already registered in config/tenant_policies.py (direct
 client_id) and its RLS policy is column-agnostic, so this migration needs
@@ -58,6 +73,8 @@ DDL = [
 	"ALTER TABLE winback_rows ADD COLUMN IF NOT EXISTS enrichment_provider VARCHAR(40)",
 	"ALTER TABLE winback_rows ADD COLUMN IF NOT EXISTS enrichment_timestamp TIMESTAMPTZ",
 	"ALTER TABLE winback_rows ADD COLUMN IF NOT EXISTS enrichment_attempts SMALLINT NOT NULL DEFAULT 0",
+	"ALTER TABLE winback_rows ADD COLUMN IF NOT EXISTS enrichment_claimed_at TIMESTAMPTZ",
+	"ALTER TABLE winback_rows ADD COLUMN IF NOT EXISTS enrichment_queue_id VARCHAR(60)",
 	# ADD CONSTRAINT has no IF NOT EXISTS in Postgres — wrap in a DO block so
 	# re-running this migration against an already-migrated DB is a no-op
 	# instead of an error, same idempotency posture as
@@ -90,7 +107,8 @@ def main() -> int:
 				"WHERE table_name = 'winback_rows' AND column_name IN ("
 				"  'email_status', 'email_previous', 'phone_verified', "
 				"  'requires_enrichment_review', 'enrichment_provider', "
-				"  'enrichment_timestamp', 'enrichment_attempts'"
+				"  'enrichment_timestamp', 'enrichment_attempts', "
+				"  'enrichment_claimed_at', 'enrichment_queue_id'"
 				") ORDER BY ordinal_position"
 			)
 		).fetchall()

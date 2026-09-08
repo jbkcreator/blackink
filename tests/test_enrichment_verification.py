@@ -7,6 +7,7 @@ from src.services.owner_enrichment import StubOwnerEnrichmentProvider, TracerfyE
 from src.tasks.enrichment_verification import (
 	_bump_attempts,
 	_count_pending_backlog,
+	_mark_claimed,
 	_provider_name,
 	_self_heal_exhausted_rows,
 )
@@ -71,8 +72,10 @@ def test_self_heal_returns_count_of_exhausted_rows():
 class _BumpFakeSession:
 	def __init__(self):
 		self.params = None
+		self.sql = ""
 
 	def execute(self, stmt, params=None):
+		self.sql = str(stmt)
 		self.params = params
 		return None
 
@@ -81,6 +84,29 @@ def test_bump_attempts_targets_exact_row_ids():
 	session = _BumpFakeSession()
 	_bump_attempts(session, [1, 2, 3], _NOW)
 	assert session.params["ids"] == [1, 2, 3]
+
+
+def test_bump_attempts_stores_queue_id_when_given():
+	session = _BumpFakeSession()
+	_bump_attempts(session, [1], _NOW, queue_id="tracerfy-queue-456")
+	assert session.params["queue_id"] == "tracerfy-queue-456"
+
+
+def test_bump_attempts_coalesces_when_no_queue_id():
+	# A stub-provider chunk (or a not-found/no-op path) has no real queue_id
+	# -- must not overwrite a previously-stored one with NULL.
+	session = _BumpFakeSession()
+	_bump_attempts(session, [1], _NOW)
+	assert session.params["queue_id"] is None
+	assert "COALESCE" in session.sql
+
+
+def test_mark_claimed_stamps_the_exact_row_ids():
+	session = _BumpFakeSession()
+	_mark_claimed(session, [4, 5, 6], _NOW)
+	assert session.params["ids"] == [4, 5, 6]
+	assert session.params["now"] == _NOW
+	assert "enrichment_claimed_at" in session.sql
 
 
 class _CountFakeSession:

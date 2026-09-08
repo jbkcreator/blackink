@@ -22,12 +22,19 @@ meeting_outcome_prompt_sender.py already uses:
      row genuinely tried three times. See src/services/winback_sequencer.py's
      _check_enrichment for the gate side of this.
   2. Claim: outreach-eligible, not suppressed, not stopped, not yet
-     enriched, attempts under budget. Ordered disposition-first (3.1.2's
-     STILL_OWNS_STILL_RENTING priority), then audit_loss_dollars_est DESC
-     NULLS LAST — a proxy for the Unified System Specification's "targeting
-     top-tier scores" (that line's own "scores" is the deed engine's Owner
-     Score, which winback_rows doesn't carry; this is the closest available
-     stand-in, not a literal implementation of that line).
+     enriched, attempts under budget, not currently leased by another sweep
+     (see _CLAIM_LEASE_MINUTES — PR review finding, confirmed real: the
+     FOR UPDATE row lock alone does not survive the up-to-10-minute
+     submit+poll window, so a durable lease is what actually prevents a
+     concurrent sweep from re-claiming and re-submitting the same rows).
+     Ordered disposition-first (3.1.2's STILL_OWNS_STILL_RENTING priority),
+     then audit_loss_dollars_est DESC NULLS LAST — a proxy for the Unified
+     System Specification's "targeting top-tier scores" (that line's own
+     "scores" is the deed engine's Owner Score, which winback_rows doesn't
+     carry; this is the closest available stand-in, not a literal
+     implementation of that line). The lease itself is stamped and
+     committed immediately after claiming, before any vendor call, closing
+     the window completely.
   3. Enrich, one vendor-batch-sized chunk at a time (see
      src/services/owner_enrichment.py's OwnerEnrichmentProvider.submit()/
      collect() split for why chunking-with-a-commit-in-between is required,
@@ -53,7 +60,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import text
@@ -67,6 +74,20 @@ from src.services.slack.post import post_notice
 from src.services.winback_ingest import dnc_scrub_rows
 
 logger = logging.getLogger(__name__)
+
+# How long a row stays excluded from re-claim after this sweep claims it,
+# before its own enrichment_timestamp is set — comfortably over Tracerfy's
+# ~10-minute poll budget (tracerfy_client._TRACE_MAX_POLL_ATTEMPTS *
+# _TRACE_POLL_INTERVAL_SEC), same naming convention as
+# self_serve_audit_worker.py's own _CLAIM_LEASE_MINUTES. A row whose lease
+# expires without completing (a genuine crash mid-poll, not ordinary
+# concurrent execution) is re-claimed and freshly re-submitted — not
+# resumed via its stored enrichment_queue_id. Deliberate scope decision:
+# resuming an abandoned poll needs reconstructing a submit handle and
+# re-deriving match keys, real added complexity for a case already bounded
+# by this timeout to a rare, occasional duplicate submission on crash —
+# the same tradeoff self_serve_audit_worker.py's own lease already accepts.
+_CLAIM_LEASE_MINUTES = 15
 
 
 def _self_heal_exhausted_rows(session: Session, client_id: str, max_attempts: int, now: datetime) -> int:
@@ -107,12 +128,22 @@ def _self_heal_exhausted_rows(session: Session, client_id: str, max_attempts: in
     return len(rows)
 
 
-def _claim_rows(session: Session, client_id: str, import_id: Optional[str], max_attempts: int, limit: int) -> list:
+def _claim_rows(session: Session, client_id: str, import_id: Optional[str], max_attempts: int, limit: int, now: datetime) -> list:
     """FOR UPDATE SKIP LOCKED — same convention as every other job sweep in
     this repo (show_rate_reminders.py, calendar_confirmation.py). The
     disposition filter bounds vendor spend the same way winback_ingest.py's
     DNC branch does: a SOLD/UNKNOWN row can never be sequenced, so
-    skip-tracing it burns money for nothing."""
+    skip-tracing it burns money for nothing.
+
+    The enrichment_claimed_at lease exclusion (PR review finding, confirmed
+    real) is what actually prevents a concurrent sweep from re-claiming a
+    row this same query already claimed: the FOR UPDATE row lock is
+    released as soon as run_sweep() commits the lease stamp (see there) —
+    without a durable lease, the row would still be enrichment_timestamp IS
+    NULL and enrichment_attempts under budget for the entire submit+poll
+    duration (up to ~10 minutes for a real Tracerfy call), fully re-claimable
+    by another sweep instance the moment the lock is gone."""
+    lease_cutoff = now - timedelta(minutes=_CLAIM_LEASE_MINUTES)
     import_filter = "AND import_id = :import_id " if import_id else ""
     rows = session.execute(
         text(
@@ -123,13 +154,26 @@ def _claim_rows(session: Session, client_id: str, import_id: Optional[str], max_
             + "  AND disposition IN ('STILL_OWNS_STILL_RENTING', 'STILL_OWNS_NOT_RENTING') "
             "  AND suppression_state = FALSE AND stopped_at IS NULL "
             "  AND enrichment_timestamp IS NULL AND enrichment_attempts < :max_attempts "
+            "  AND (enrichment_claimed_at IS NULL OR enrichment_claimed_at < :lease_cutoff) "
             "ORDER BY CASE disposition WHEN 'STILL_OWNS_STILL_RENTING' THEN 0 ELSE 1 END, "
             "         audit_loss_dollars_est DESC NULLS LAST, winback_row_id "
             "LIMIT :limit FOR UPDATE SKIP LOCKED"
         ),
-        {"client_id": client_id, "import_id": import_id, "max_attempts": max_attempts, "limit": limit},
+        {"client_id": client_id, "import_id": import_id, "max_attempts": max_attempts, "limit": limit, "lease_cutoff": lease_cutoff},
     ).fetchall()
     return list(rows)
+
+
+def _mark_claimed(session: Session, winback_row_ids: list[int], now: datetime) -> None:
+    """Stamps the lease on a just-claimed batch, in the SAME transaction
+    that still holds _claim_rows's FOR UPDATE SKIP LOCKED row lock — commit
+    this before doing anything else (submitting to the vendor, polling) so
+    there is no window where a row is both unlocked and unleased. See
+    _claim_rows's own docstring for the failure this closes."""
+    session.execute(
+        text("UPDATE winback_rows SET enrichment_claimed_at = :now WHERE winback_row_id = ANY(:ids)"),
+        {"ids": winback_row_ids, "now": now},
+    )
 
 
 def _count_pending_backlog(session: Session, client_id: str, import_id: Optional[str], max_attempts: int) -> int:
@@ -155,13 +199,20 @@ def _count_pending_backlog(session: Session, client_id: str, import_id: Optional
     return int(count)
 
 
-def _bump_attempts(session: Session, winback_row_ids: list[int], now: datetime) -> None:
+def _bump_attempts(session: Session, winback_row_ids: list[int], now: datetime, queue_id: Optional[str] = None) -> None:
+    """queue_id is stored for operational visibility only (checking the
+    vendor's own dashboard for a stuck batch) — nothing in this codebase
+    resumes an abandoned poll from it; see _CLAIM_LEASE_MINUTES's own
+    comment for that scope decision. Stub/not-submitted chunks pass None,
+    leaving the column untouched via COALESCE rather than overwriting a
+    prior value with NULL."""
     session.execute(
         text(
-            "UPDATE winback_rows SET enrichment_attempts = enrichment_attempts + 1, updated_at = :now "
+            "UPDATE winback_rows SET enrichment_attempts = enrichment_attempts + 1, "
+            "enrichment_queue_id = COALESCE(:queue_id, enrichment_queue_id), updated_at = :now "
             "WHERE winback_row_id = ANY(:ids)"
         ),
-        {"ids": winback_row_ids, "now": now},
+        {"ids": winback_row_ids, "now": now, "queue_id": queue_id},
     )
 
 
@@ -224,8 +275,14 @@ def _enrich_claimed_rows(
             counts["submit_failures"] = counts.get("submit_failures", 0) + 1
             continue
 
+        # getattr, not an OwnerEnrichmentProvider ABC method — queue_id is
+        # Tracerfy-specific diagnostic data (StubOwnerEnrichmentProvider's
+        # handle is just a plain list, with no such attribute), and this
+        # avoids adding an abstract method to the interface for one
+        # optional piece of operational metadata.
+        queue_id = getattr(handle, "queue_id", None) or None
         with session.begin_nested():
-            _bump_attempts(session, chunk_ids, now)
+            _bump_attempts(session, chunk_ids, now, queue_id=queue_id)
         session.commit()
 
         try:
@@ -307,8 +364,15 @@ def run_sweep(client_id: str, import_id: Optional[str] = None, limit: Optional[i
         counts["attempts_exhausted"] = _self_heal_exhausted_rows(session, client_id, max_attempts, now)
         session.commit()
 
-        rows = _claim_rows(session, client_id, import_id, max_attempts, limit)
+        rows = _claim_rows(session, client_id, import_id, max_attempts, limit, now)
         if rows:
+            # Stamp the lease and commit BEFORE any vendor call — this is
+            # what closes the concurrency gap (PR review finding): it keeps
+            # the row lease durable across the very moment the original
+            # FOR UPDATE row lock is released, so no window exists where a
+            # row is both unlocked and unleased for a second sweep to claim.
+            _mark_claimed(session, [r.winback_row_id for r in rows], now)
+            session.commit()
             _enrich_claimed_rows(session, client_id, rows, provider, settings, counts)
 
         # Homestead-drop / same-owner hook (client comments:28-29) — no-op

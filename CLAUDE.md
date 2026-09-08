@@ -663,19 +663,46 @@ an `OwnerEnrichmentProvider` ABC (mirroring `compliance_gate.py`'s
 `DncProvider`/`EmailVerificationProvider` pattern) split into `submit()`/
 `collect()` rather than one call — **forced by the chosen vendor, not a
 style choice**. Skip-trace and DNC are both Tracerfy, same account
-(`TRACERFY_API_KEY`, renamed from `DNC_VENDOR_API_KEY` since it is now
-dual-purpose), and Tracerfy's API is submit-then-poll (up to 10 minutes —
-see `src/services/tracerfy_client.py`). The submit/collect split is what
-lets the caller (`src/tasks/enrichment_verification.py`) commit each
-chunk's `enrichment_attempts` bump *between* the two calls: a submit-stage
-failure (bad key, rate limit) means nothing was queued or billed, so it
-costs zero retry budget; a collect-stage (poll) failure happens after the
-vendor may already be processing, so the bump must already be committed to
-survive a crash without risking a silent re-charge on the next sweep.
+(`TRACERFY_API_KEY`, preferred; `DNC_VENDOR_API_KEY` is read as a
+deprecated fallback by the same settings property — a PR-review finding,
+confirmed real, that a hard rename with no fallback would silently disable
+DNC/skip-trace on any deployment this codebase doesn't control that still
+only sets the old name; **note `Field(env=...)` alone does NOT implement
+this kind of fallback** — pydantic-settings 2.x silently ignores that
+pydantic-v1-only kwarg, matching the env var by Python field name instead,
+so the fallback field uses `validation_alias=` — see `config/settings.py`'s
+own comment, caught by writing a test that actually set the two env vars
+rather than trusting the field declaration), and Tracerfy's API is
+submit-then-poll (up to 10 minutes — see `src/services/tracerfy_client.py`).
+The submit/collect split is what lets the caller
+(`src/tasks/enrichment_verification.py`) commit each chunk's
+`enrichment_attempts` bump *between* the two calls: a submit-stage failure
+(bad key, rate limit) means nothing was queued or billed, so it costs zero
+retry budget; a collect-stage (poll) failure happens after the vendor may
+already be processing, so the bump must already be committed to survive a
+crash without risking a silent re-charge on the next sweep.
 `StubOwnerEnrichmentProvider` is the no-key fallback — it passes a row's
 CSV-supplied `phone`/`email` through unchanged, so a row that already has
 one keeps exactly the sequenceability it has today (the Win-Back gate below
 cannot regress the moment it lands).
+
+**Claim lease (`enrichment_claimed_at`, `_CLAIM_LEASE_MINUTES=15`) —
+another PR-review finding, confirmed real by tracing the code.** The
+`FOR UPDATE SKIP LOCKED` row lock from the claim query is released the
+moment `run_sweep()` commits the `enrichment_attempts` bump — well before
+`enrichment_timestamp` is ever set (that happens only after
+`provider.collect()` returns, up to ~10 minutes later for a real poll), so
+without a durable lease a second, concurrent sweep could re-claim and
+re-submit the same rows. The lease is stamped and committed immediately
+after claiming, in the same transaction that still holds the row lock, so
+there is no gap. A lease that genuinely expires (a crash mid-poll, not
+ordinary concurrent execution) makes the row re-claimable again — freshly
+**re-submitted**, not resumed from its stored `enrichment_queue_id` (kept
+only for operational visibility, checking Tracerfy's own dashboard for a
+stuck batch) — a deliberate scope decision matching
+`self_serve_audit_worker.py`'s own lease pattern, which accepts the same
+bounded-duplicate-on-crash tradeoff rather than building full
+resume-an-abandoned-poll machinery.
 
 **`TracerfyEnrichmentProvider` is fully implemented** (2026-09-08),
 cross-checked against Tracerfy's own API docs and the working, production

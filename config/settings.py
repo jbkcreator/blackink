@@ -75,10 +75,38 @@ class AppSettings(BaseSettings):
 	# Tracerfy account key — serves BOTH the DNC scrub (src/tasks/dnc_refresh.py,
 	# src/services/winback_ingest.py) and skip-trace owner enrichment
 	# (src/services/owner_enrichment.py, Subtask 3.2.1) — one Tracerfy account,
-	# both products (client decision 2026-09-08). Renamed from
-	# DNC_VENDOR_API_KEY, which described only the first use; kept as one
-	# credential rather than two so there is exactly one place to rotate it.
-	tracerfy_api_key: Optional[SecretStr] = Field(default=None, env="TRACERFY_API_KEY")
+	# both products (client decision 2026-09-08).
+	#
+	# Two real Fields (both read directly from their own env vars), combined
+	# by the tracerfy_api_key property below rather than one Field renamed
+	# outright — a deployment this codebase doesn't control (a Cloud Run
+	# secret, a teammate's local .env.local, CI) may still only set the OLD
+	# name, DNC_VENDOR_API_KEY. A hard rename with no fallback would silently
+	# turn a working credential into "unset" there: DNC scrub goes
+	# fail-closed (DNC_UNVERIFIED) and dnc_refresh.py's monthly sweep skips
+	# entirely (PR review finding, confirmed real — not hypothetical, since
+	# this repo's own settings.py has no visibility into every deployment
+	# target). Remove _dnc_vendor_api_key_legacy and the property once every
+	# deployment is confirmed migrated to TRACERFY_API_KEY.
+	# validation_alias, NOT env= — confirmed the hard way while writing this
+	# fallback: Field(env=...) is a pydantic-v1-only kwarg that
+	# pydantic-settings 2.x silently ignores, falling back to matching the
+	# env var by the Python field name itself. Every OTHER env= field in
+	# this file happens to have a field name that matches its env var 1:1
+	# case-insensitively, so this was never noticed until these two fields
+	# (whose names deliberately differ from their env vars) needed it to
+	# actually work.
+	tracerfy_api_key_current: Optional[SecretStr] = Field(default=None, validation_alias="TRACERFY_API_KEY")
+	dnc_vendor_api_key_legacy: Optional[SecretStr] = Field(default=None, validation_alias="DNC_VENDOR_API_KEY")
+
+	@property
+	def tracerfy_api_key(self) -> Optional[SecretStr]:
+		"""Prefers TRACERFY_API_KEY; falls back to the deprecated
+		DNC_VENDOR_API_KEY name if only that is set — see the field comment
+		above for why the fallback exists. Every caller in this codebase
+		(dnc_refresh.py, winback_ingest.py, enrichment_verification.py)
+		reads settings.tracerfy_api_key, never the two Fields directly."""
+		return self.tracerfy_api_key_current or self.dnc_vendor_api_key_legacy
 	# Max age before a cached dnc_clean value is treated as ABSTAIN (stale), not trusted.
 	dnc_recheck_days: int = Field(default=30, env="DNC_RECHECK_DAYS")
 	email_verification_vendor_api_key: Optional[SecretStr] = Field(
