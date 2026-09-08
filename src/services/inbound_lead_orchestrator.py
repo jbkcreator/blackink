@@ -165,8 +165,13 @@ def _upsert_contact(session: Session, lead: InboundLead) -> Optional[int]:
 
     result = session.execute(
         text(
-            "INSERT INTO contacts (company_id, first_name, email, phone, created_at) "
-            "VALUES (:company_id, :first_name, :email, :phone, NOW()) "
+            "INSERT INTO contacts "
+            "(company_id, contact_role_type, first_name, email, phone, created_at) "
+            "VALUES (:company_id, 'OWNER_BROKER_MD', :first_name, :email, :phone, NOW()) "
+            "ON CONFLICT (company_id, contact_role_type) DO UPDATE "
+            "SET email = COALESCE(EXCLUDED.email, contacts.email), "
+            "    phone = COALESCE(EXCLUDED.phone, contacts.phone), "
+            "    first_name = COALESCE(EXCLUDED.first_name, contacts.first_name) "
             "RETURNING id"
         ),
         {
@@ -202,14 +207,14 @@ def _ensure_inbound_company(session: Session, lead: InboundLead) -> Optional[int
 
     result = session.execute(
         text(
-            "INSERT INTO companies (company_id, owning_client_id, name, created_at) "
-            "VALUES (:company_id, :client_id, :name, NOW()) "
+            "INSERT INTO companies (company_id, owning_client_id, company_name, created_at) "
+            "VALUES (:company_id, :client_id, :company_name, NOW()) "
             "RETURNING id"
         ),
         {
             "company_id": company_id,
             "client_id": lead.client_id,
-            "name": lead.company_name or (f"Inbound:{domain}" if lead.email and "@" in lead.email else "Inbound"),
+            "company_name": lead.company_name or (f"Inbound:{domain}" if lead.email and "@" in lead.email else "Inbound"),
         },
     ).scalar()
     return result

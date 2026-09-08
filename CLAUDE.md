@@ -22,6 +22,7 @@ PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
+PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
 PYTHONPATH=. python migrations/apply_relay_halts.py   # not tenant-bearing, any time after clients
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py

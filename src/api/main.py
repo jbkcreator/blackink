@@ -99,6 +99,8 @@ def _start_background_workers() -> None:
 		("no_show_recovery_sender.run_sweep", _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS, no_show_recovery_sweep),
 		("self_serve_audit_worker.run_sweep", _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS, self_serve_audit_sweep),
 		("meeting_outcome_prompt_sender.run_sweep", _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS, meeting_outcome_prompt_sweep),
+		# Task 4.2.1 — SLA sweep dispatches deferred Speed-to-Lead auto-responses.
+		("speed_to_lead_sweep.run_sweep", _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS, speed_to_lead_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
