@@ -5,7 +5,7 @@ through run_inbound_pipeline(). Nothing else in the codebase writes to
 inbound_messages directly; this is the single write path.
 
 Pipeline steps (SPEC-4.2.1.md §2):
-  1. Dedupe on (client_id, dedupe_key) — duplicate → no-op, returns existing.
+  1. Dedupe on idempotency_key (global UNIQUE) — duplicate → no-op, returns existing.
   2. Non-poach gate (advisory) — look up an EXISTING company by sender email
      domain; if claimed by another client → status=SUPPRESSED, event, return.
   3. Write inbound_messages (prospect fields stored inline, contact_id NULL)
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -46,19 +45,21 @@ class InboundLead:
     client_id: str
     channel: str                    # 'WEBHOOK' or 'EMAIL'
     source_channel: str             # e.g. 'WEBSITE_FORM', 'LISTING_PORTAL', 'APM', …
-    dedupe_key: str                 # Path A: external_id; Path B: Mailgun Message-Id
+    idempotency_key: str            # namespaced per client; global-unique on inbound_messages
+    destination_address: str        # Path A: "webhook:<source>"; Path B: the leads@ recipient
     prospect_name: Optional[str]
     email: Optional[str]
     phone: Optional[str]
     property_address: Optional[str]
     inquiry_text: Optional[str]
-    raw_payload: Optional[str]
+    subject: Optional[str] = None
+    body_html: Optional[str] = None
     utm: Optional[dict] = None
 
 
 @dataclass
 class PipelineResult:
-    message_id: Optional[str]
+    message_id: Optional[str]       # str(inbound_messages.id)
     outcome: str    # 'written' | 'duplicate' | 'suppressed'
 
 
@@ -72,15 +73,14 @@ def run_inbound_pipeline(lead: InboundLead) -> PipelineResult:
 
 def _run(session: Session, lead: InboundLead) -> PipelineResult:
     # ── 1. Dedupe ─────────────────────────────────────────────────────────
+    # idempotency_key is GLOBALLY unique on inbound_messages (Dev 2's
+    # constraint); the key is already namespaced with client_id by the caller.
     existing = session.execute(
-        text(
-            "SELECT message_id FROM inbound_messages "
-            "WHERE client_id = :client_id AND dedupe_key = :dedupe_key LIMIT 1"
-        ),
-        {"client_id": lead.client_id, "dedupe_key": lead.dedupe_key},
+        text("SELECT id FROM inbound_messages WHERE idempotency_key = :k LIMIT 1"),
+        {"k": lead.idempotency_key},
     ).scalar()
     if existing:
-        logger.info("[inbound] duplicate dedupe_key=%s client=%s — no-op", lead.dedupe_key, lead.client_id)
+        logger.info("[inbound] duplicate idempotency_key=%s client=%s — no-op", lead.idempotency_key, lead.client_id)
         return PipelineResult(message_id=str(existing), outcome="duplicate")
 
     # ── 2. Non-poach gate (advisory) ──────────────────────────────────────
@@ -172,37 +172,51 @@ def _write_message(
     send_at: Optional[datetime],
     lead_sla_due_at: Optional[datetime] = None,
 ) -> str:
+    """Insert one inbound_messages row using Dev 2's column names, and return
+    str(id). sender_email is NOT NULL on the shared table — a phone-only lead
+    stores '' there (the SLA sweep then skips the email send) and keeps the
+    number in sender_phone."""
     import json as _json
-    message_id = str(uuid.uuid4())
-    session.execute(
+    new_id = session.execute(
         text(
             "INSERT INTO inbound_messages "
-            "(message_id, client_id, channel, source_channel, raw_payload, cleaned_body, "
-            " prospect_name, prospect_email, prospect_phone, property_address, "
-            " received_at, send_at, lead_sla_due_at, status, dedupe_key, utm) "
-            "VALUES (:message_id, :client_id, :channel, :source_channel, :raw_payload, :cleaned_body, "
-            "        :prospect_name, :prospect_email, :prospect_phone, :property_address, "
-            "        NOW(), :send_at, :lead_sla_due_at, :status, :dedupe_key, :utm)"
+            "(client_id, idempotency_key, destination_address, original_message_id, "
+            " sender_email, sender_name, sender_phone, subject, body_text, body_html, "
+            " channel, source_channel, property_address, "
+            " received_at, send_at, lead_sla_due_at, status) "
+            "VALUES (:client_id, :idempotency_key, :destination_address, :original_message_id, "
+            "        :sender_email, :sender_name, :sender_phone, :subject, :body_text, :body_html, "
+            "        :channel, :source_channel, :property_address, "
+            "        NOW(), :send_at, :lead_sla_due_at, :status) "
+            "RETURNING id"
         ),
         {
-            "message_id": message_id,
             "client_id": lead.client_id,
+            "idempotency_key": lead.idempotency_key,
+            "destination_address": lead.destination_address,
+            "original_message_id": lead.idempotency_key,
+            "sender_email": lead.email or "",
+            "sender_name": lead.prospect_name,
+            "sender_phone": lead.phone,
+            "subject": lead.subject,
+            "body_text": lead.inquiry_text,
+            "body_html": lead.body_html,
             "channel": lead.channel,
             "source_channel": lead.source_channel,
-            "raw_payload": lead.raw_payload,
-            "cleaned_body": lead.inquiry_text,
-            "prospect_name": lead.prospect_name,
-            "prospect_email": lead.email,
-            "prospect_phone": lead.phone,
             "property_address": lead.property_address,
             "send_at": send_at,
             "lead_sla_due_at": lead_sla_due_at,
             "status": status,
-            "dedupe_key": lead.dedupe_key,
-            "utm": _json.dumps(lead.utm) if lead.utm else None,
         },
-    )
-    return message_id
+    ).scalar()
+    # utm is a Dev 4 extension column; set separately so a fresh DB missing it
+    # (shouldn't happen — this migration adds it) never fails the core insert.
+    if lead.utm:
+        session.execute(
+            text("UPDATE inbound_messages SET utm = CAST(:utm AS JSONB) WHERE id = :id"),
+            {"utm": _json.dumps(lead.utm), "id": new_id},
+        )
+    return str(new_id)
 
 
 def _compute_sla_due(received_at: datetime) -> datetime:

@@ -95,29 +95,33 @@ async def mailgun_inbound(request: Request) -> dict:
     sender = form.get("sender", "")
     subject = form.get("subject", "")
     body_plain = form.get("body-plain", "") or form.get("stripped-text", "")
-    message_id = form.get("Message-Id", "") or form.get("message-id", "")
+    body_html = form.get("body-html", "") or None
+    mg_message_id = form.get("Message-Id", "") or form.get("message-id", "")
 
     # Derive email from sender field (e.g. "Name <email@domain.com>")
     email_match = re.search(r"<([^>]+)>", sender) or re.search(r"[\w.+-]+@[\w.-]+", sender)
     email = email_match.group(1 if "<" in sender else 0) if email_match else None
 
-    dedupe_key = message_id.strip("<>") if message_id else hashlib.sha256(
-        f"{client_id}:{sender}:{subject}:{body_plain[:200]}".encode()
+    # idempotency_key is globally UNIQUE — namespace with client_id. Prefer the
+    # Mailgun Message-Id; fall back to a content hash if absent.
+    stable = mg_message_id.strip("<>") if mg_message_id else hashlib.sha256(
+        f"{sender}:{subject}:{body_plain[:200]}".encode()
     ).hexdigest()
-
-    raw_payload = str(dict(form))[:4000]
+    idempotency_key = f"{client_id}:{stable}"
 
     lead = InboundLead(
         client_id=client_id,
         channel="EMAIL",
         source_channel="LISTING_PORTAL",   # refined by 4.2.3 portal parsers
-        dedupe_key=dedupe_key,
+        idempotency_key=idempotency_key,
+        destination_address=recipient,
         prospect_name=None,
         email=email,
         phone=None,
         property_address=None,
         inquiry_text=body_plain[:2000],
-        raw_payload=raw_payload,
+        subject=subject or None,
+        body_html=body_html,
     )
 
     try:

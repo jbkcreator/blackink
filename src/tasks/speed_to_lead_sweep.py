@@ -51,14 +51,14 @@ def _claim_due(session: Session, limit: int):
     rows = session.execute(
         text(
             "UPDATE inbound_messages SET status = 'DEFERRED' "
-            "WHERE message_id IN ("
-            "  SELECT message_id FROM inbound_messages "
+            "WHERE id IN ("
+            "  SELECT id FROM inbound_messages "
             "  WHERE status = 'RECEIVED' AND send_at <= NOW() "
             "  ORDER BY send_at ASC LIMIT :limit "
             "  FOR UPDATE SKIP LOCKED"
             ") "
-            "RETURNING message_id, client_id, source_channel, "
-            "          prospect_name, prospect_email, received_at, dedupe_key"
+            "RETURNING id, client_id, source_channel, "
+            "          sender_name, sender_email, received_at, idempotency_key"
         ),
         {"limit": limit},
     ).fetchall()
@@ -68,10 +68,10 @@ def _claim_due(session: Session, limit: int):
 
 def _send_response(row) -> None:
     client_id = row.client_id
-    message_id = str(row.message_id)
+    message_id = str(row.id)
 
-    prospect_email = row.prospect_email
-    prospect_name = row.prospect_name
+    prospect_email = row.sender_email
+    prospect_name = row.sender_name
 
     with get_db_context(client_id=client_id) as session:
         if not prospect_email:
@@ -107,7 +107,7 @@ def _send_response(row) -> None:
             logger.error("[stl-sweep] no mailbox for client=%s message=%s: %s", client_id, message_id, exc)
             # Re-flip to RECEIVED so the next sweep tick retries
             session.execute(
-                text("UPDATE inbound_messages SET status = 'RECEIVED' WHERE message_id = :id"),
+                text("UPDATE inbound_messages SET status = 'RECEIVED' WHERE id = :id"),
                 {"id": message_id},
             )
             session.commit()
@@ -140,7 +140,7 @@ def _mark_responded(session: Session, message_id: str, ack_latency: Optional[flo
     session.execute(
         text(
             "UPDATE inbound_messages SET status = 'RESPONDED', "
-            "ack_latency_seconds = :ack WHERE message_id = :id"
+            "ack_latency_seconds = :ack WHERE id = :id"
         ),
         {"ack": ack_latency, "id": message_id},
     )

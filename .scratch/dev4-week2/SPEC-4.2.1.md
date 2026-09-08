@@ -3,7 +3,30 @@
 Locked via grilling 2026-09-07. Covers map tickets 05 (schema), 07 (orchestrator),
 08 (SLA response). Branch: `feature/week2-4.2.1-speed-to-lead-ingest`.
 
-## 1. `inbound_messages` schema (ticket 05) — ✅ FINALIZED (Dev 2 relay received 2026-09-07)
+## 1. `inbound_messages` schema (ticket 05) — ✅ RECONCILED to Dev 2's live table (2026-09-08)
+
+**Reality check (server introspection 2026-09-08):** Dev 2's reply-triage
+`inbound_messages` is ALREADY deployed on the server (9 rows) with its own
+column names — `id` (BIGSERIAL PK), `idempotency_key` (global UNIQUE),
+`sender_email`, `sender_name`, `destination_address`, `body_text`/`body_html`,
+plus the triage columns. The earlier "Dev 4 owns a fresh superset" plan was
+overtaken by that deployment.
+
+**Decision: adopt Dev 2's column names.** Dev 4 reuses their table and adds
+only its own columns via an additive migration
+(`apply_inbound_messages_lead_fields.py`): `channel`, `source_channel`,
+`send_at`, `lead_sla_due_at`, `ack_latency_seconds`, `property_address`,
+`sender_phone`, `utm`. Mapping: `message_id→id`, `dedupe_key→idempotency_key`
+(namespaced `"<client_id>:<key>"`, since it's globally unique),
+`prospect_email→sender_email`, `prospect_name→sender_name`,
+`cleaned_body→body_text`. Status CHECK widened (purely additive) with
+`RECEIVED`/`RESPONDED` so Dev 4's lifecycle stays disjoint from Dev 2's
+`PENDING→…→ROUTED`; rows are told apart by `channel` (Dev 4 = EMAIL/WEBHOOK,
+Dev 2's own rows leave it NULL). A phone-only lead stores `''` in the NOT NULL
+`sender_email` and keeps the number in `sender_phone`; the SLA sweep then skips
+the email send.
+
+--- superseded below (original fresh-superset plan, kept for history) ---
 
 New **tenant-bearing** table → register in `config/tenant_policies.py` + push through
 `apply_rls_policies.py`. Migration `migrations/apply_inbound_messages.py`.

@@ -70,7 +70,9 @@ def _fallback_dedupe_key(client_id: str, payload: "InboundLeadPayload") -> str:
     UUID would let a source retry (after a lost 202) create a duplicate lead
     and a duplicate response, since each retry would carry a new key. Deriving
     the key from the stable payload content makes an identical retry collapse
-    onto the existing row via the UNIQUE (client_id, dedupe_key) constraint."""
+    onto the existing row via the UNIQUE idempotency_key constraint. client_id
+    is folded into the hash so the globally-unique key can't collide across
+    tenants."""
     canonical = "|".join([
         client_id,
         (payload.source or "").strip().lower(),
@@ -91,23 +93,31 @@ def receive_inbound_lead(
     if not client_id:
         raise HTTPException(status_code=401, detail="invalid client_secret")
 
-    dedupe_key = payload.external_id or _fallback_dedupe_key(client_id, payload)
+    # idempotency_key is globally UNIQUE on inbound_messages — namespace it
+    # with client_id so a caller-supplied external_id can't collide across
+    # tenants. The fallback hash is already client-scoped.
+    if payload.external_id:
+        idempotency_key = f"{client_id}:{payload.external_id}"
+    else:
+        idempotency_key = _fallback_dedupe_key(client_id, payload)
 
     lead = InboundLead(
         client_id=client_id,
         channel="WEBHOOK",
         source_channel=payload.source,
-        dedupe_key=dedupe_key,
+        idempotency_key=idempotency_key,
+        destination_address=f"webhook:{payload.source}",
         prospect_name=payload.prospect_name,
         email=payload.email,
         phone=payload.phone,
         property_address=payload.property_address,
         inquiry_text=payload.inquiry_text,
-        raw_payload=payload.model_dump_json(),
+        subject=None,
+        body_html=None,
         utm=payload.utm,
     )
     background_tasks.add_task(_dispatch, lead)
-    return {"accepted": True, "dedupe_key": dedupe_key}
+    return {"accepted": True, "dedupe_key": idempotency_key}
 
 
 def _dispatch(lead: InboundLead) -> None:

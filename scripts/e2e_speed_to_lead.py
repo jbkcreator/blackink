@@ -12,8 +12,8 @@ PREREQUISITES
      (PowerShell:                     $env:ENV_FILE=".env.local")
   3. Full migration sequence applied (see CLAUDE.md), including the two new
      4.2.1 migrations:
-        migrations/apply_clients_stl_fields.py   (before RLS)
-        migrations/apply_inbound_messages.py     (before RLS)
+        migrations/apply_clients_stl_fields.py           (before RLS)
+        migrations/apply_inbound_messages_lead_fields.py (before RLS)
 
 RUN
     PYTHONPATH=. python scripts/e2e_speed_to_lead.py
@@ -122,9 +122,9 @@ def seed() -> None:
 # ── Query helpers scoped to our client ───────────────────────────────────────
 def messages():
     return _owner_query(
-        "SELECT message_id, status, channel, source_channel, prospect_email, "
-        " prospect_name, contact_id, send_at, lead_sla_due_at, dedupe_key, "
-        " ack_latency_seconds "
+        "SELECT id, status, channel, source_channel, sender_email, "
+        " sender_name, sender_phone, send_at, lead_sla_due_at, idempotency_key, "
+        " destination_address, ack_latency_seconds "
         "FROM inbound_messages WHERE client_id = :c ORDER BY received_at",
         c=CLIENT_ID,
     )
@@ -179,8 +179,8 @@ def main() -> int:
         m = msgs[0]
         R.check("status RECEIVED", m.status == "RECEIVED", m.status)
         R.check("channel WEBHOOK", m.channel == "WEBHOOK", m.channel)
-        R.check("prospect_email stored inline", m.prospect_email == "jane@renterco.com", str(m.prospect_email))
-        R.check("contact_id is NULL (no PM-firm shell)", m.contact_id is None, str(m.contact_id))
+        R.check("sender_email stored inline", m.sender_email == "jane@renterco.com", str(m.sender_email))
+        R.check("destination_address set", bool(m.destination_address), str(m.destination_address))
         R.check("send_at computed", m.send_at is not None)
         R.check("lead_sla_due_at computed", m.lead_sla_due_at is not None)
     R.check("inbound_lead_received event logged", "inbound_lead_received" in event_types())
@@ -256,8 +256,8 @@ def main() -> int:
     email_rows = [m for m in after if m.channel == "EMAIL"]
     R.check("Path B wrote an EMAIL-channel row", len(email_rows) == 1, f"got {len(email_rows)}")
     if email_rows:
-        R.check("Path B parsed sender email", email_rows[0].prospect_email == "eve@renterco.com",
-                str(email_rows[0].prospect_email))
+        R.check("Path B parsed sender email", email_rows[0].sender_email == "eve@renterco.com",
+                str(email_rows[0].sender_email))
 
     # ── SLA sweep: dispatch the auto-response ─────────────────────────────────
     print("\n[SLA sweep] force due + dispatch")
