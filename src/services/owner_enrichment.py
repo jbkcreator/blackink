@@ -220,13 +220,25 @@ class _TracerfySubmitHandle:
     poll, the estimated wait Tracerfy itself reported, and a match_key ->
     winback_row_id map built from exactly the rows that were actually
     submitted (address-unparseable inputs are excluded before submission —
-    see _split_address — so they are never in this map and therefore
-    correctly fall into collect()'s "absent = not-found" path without a
-    wasted vendor credit)."""
+    see _split_address).
+
+    unprocessable_ids carries exactly those excluded row ids — PR review
+    finding, confirmed real: without this, an unparseable address was
+    simply absent from match_keys, indistinguishable from a row Tracerfy
+    was genuinely asked about and found nothing for. A row with a
+    pre-existing CSV email would then sail through apply_result's
+    has_usable_email fallback as if enrichment had actually run for it,
+    passing the /arm gate despite Tracerfy never having been asked.
+    src/tasks/enrichment_verification.py reads this (getattr, same
+    optional-metadata pattern as queue_id — StubOwnerEnrichmentProvider's
+    handle is a plain list with no such attribute) to route these rows
+    through apply_result(..., unprocessable=True) instead of a normal
+    not-found result."""
 
     queue_id: str
     estimated_wait_seconds: int
     match_keys: dict[str, int]  # normalized street address -> winback_row_id
+    unprocessable_ids: frozenset[int] = frozenset()  # winback_row_ids excluded before submission — address didn't parse
 
 
 class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
@@ -267,14 +279,17 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
 
         records: list[dict] = []
         match_keys: dict[str, int] = {}
+        unprocessable_ids: set[int] = set()
         for i in inputs:
             split = _split_address(i.property_address)
             if split is None:
                 # Excluded from this submission — no vendor credit spent on
-                # an address we can't even ask about correctly. Absent from
-                # match_keys, so collect() naturally reports it as
-                # not-found, which apply_result already handles: bounded
-                # retry, terminal via self-heal once attempts are exhausted.
+                # an address we can't even ask about correctly. Recorded in
+                # unprocessable_ids so the caller can force
+                # requires_enrichment_review=TRUE rather than let it look
+                # like a genuine vendor miss (see _TracerfySubmitHandle's
+                # own docstring for why that distinction matters).
+                unprocessable_ids.add(i.winback_row_id)
                 continue
             street, city, state = split
             first_name, last_name = _split_owner_name(i.owner_name)
@@ -295,10 +310,16 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
             # to submit. A handle with an empty match_keys map still flows
             # correctly through collect() (nothing to match, empty result),
             # without a wasted HTTP call.
-            return _TracerfySubmitHandle(queue_id="", estimated_wait_seconds=0, match_keys={})
+            return _TracerfySubmitHandle(
+                queue_id="", estimated_wait_seconds=0, match_keys={},
+                unprocessable_ids=frozenset(unprocessable_ids),
+            )
 
         queue_id, estimated_wait = submit_skiptrace_batch(records, self._api_key)
-        return _TracerfySubmitHandle(queue_id=queue_id, estimated_wait_seconds=estimated_wait, match_keys=match_keys)
+        return _TracerfySubmitHandle(
+            queue_id=queue_id, estimated_wait_seconds=estimated_wait, match_keys=match_keys,
+            unprocessable_ids=frozenset(unprocessable_ids),
+        )
 
     def collect(self, handle: object) -> dict[int, EnrichmentResult]:
         from src.services.tracerfy_client import poll_skiptrace_queue
@@ -370,10 +391,26 @@ class ApplyOutcome:
     phone: Optional[str]  # the row's phone AFTER this call, same rule
 
 
-def apply_result(session: Session, winback_row_id: int, result: EnrichmentResult, now: datetime) -> Optional[ApplyOutcome]:
+def apply_result(
+    session: Session, winback_row_id: int, result: EnrichmentResult, now: datetime, unprocessable: bool = False,
+) -> Optional[ApplyOutcome]:
     """Persists one row's enrichment result. Returns None only if the row
     itself was not found (logged as an error — should not happen under
     normal operation, since the caller always claimed the row first).
+
+    unprocessable=True (PR review finding, confirmed real) means the vendor
+    was never actually asked — the row's address didn't parse
+    (TracerfyEnrichmentProvider.submit()'s _TracerfySubmitHandle.
+    unprocessable_ids) — as opposed to a normal result where the vendor was
+    asked and simply returned nothing. Without this distinction, a row that
+    already had a pre-existing CSV email would get
+    requires_enrichment_review=FALSE via the has_usable_email fallback below
+    even though enrichment never actually ran for it, letting it pass the
+    /arm gate (enrichment_timestamp IS NOT NULL AND
+    requires_enrichment_review = FALSE) unenriched. unprocessable=True
+    forces requires_enrichment_review=TRUE unconditionally, overriding that
+    fallback — email/phone are still persisted normally (result.email is
+    always None for this case, so old_email is simply preserved).
 
     Never overwrites a client-supplied value with a None from the provider —
     a provider that found nothing for a field must not erase what the CSV
@@ -438,7 +475,7 @@ def apply_result(session: Session, winback_row_id: int, result: EnrichmentResult
     # phone_verified=True with phone=None, so this is a second, independent
     # guard against the same mistake, not the only one.
     has_verified_phone = bool(result.phone) and result.phone_verified is True
-    requires_review = not has_usable_email and not has_verified_phone
+    requires_review = unprocessable or (not has_usable_email and not has_verified_phone)
 
     params = {
         "id": winback_row_id,

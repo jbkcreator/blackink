@@ -201,6 +201,24 @@ def test_apply_result_phone_unchanged_from_existing_is_not_newly_discovered():
 	assert outcome.newly_discovered_phone is None
 
 
+def test_apply_result_unprocessable_forces_review_even_with_preexisting_email():
+	# PR review finding, confirmed real: a row with a CSV email must not
+	# pass the /arm gate just because it already had one -- if enrichment
+	# never actually ran (address didn't parse), requires_enrichment_review
+	# must be TRUE regardless of has_usable_email's normal fallback.
+	session = _FakeApplyResultSession(existing_email="keep@example.com", existing_phone=None)
+	outcome = apply_result(session, 1, _result(email=None), _NOW, unprocessable=True)
+	assert outcome.email == "keep@example.com"
+	assert outcome.requires_enrichment_review is True
+	assert session.update_params["requires_review"] is True
+
+
+def test_apply_result_unprocessable_forces_review_even_with_verified_phone():
+	session = _FakeApplyResultSession(existing_email=None, existing_phone=None)
+	outcome = apply_result(session, 1, _result(phone="8135551234", phone_verified=True), _NOW, unprocessable=True)
+	assert outcome.requires_enrichment_review is True
+
+
 def test_apply_result_row_not_found_returns_none():
 	class _EmptySession:
 		def execute(self, *_a, **_kw):
@@ -335,6 +353,10 @@ def test_tracerfy_provider_submits_only_parseable_addresses():
 	# only the parseable row has a match key -- the unparseable one was
 	# never submitted, so it correctly falls into collect()'s not-found path
 	assert list(handle.match_keys.values()) == [1]
+	# ... but it's still distinguishable from a genuine vendor miss, via
+	# unprocessable_ids (PR review finding, confirmed real -- see
+	# apply_result's own unprocessable parameter).
+	assert handle.unprocessable_ids == frozenset({2})
 
 
 def test_tracerfy_provider_submits_nothing_when_every_address_unparseable():
@@ -343,6 +365,7 @@ def test_tracerfy_provider_submits_nothing_when_every_address_unparseable():
 		handle = provider.submit([_tracerfy_input(property_address="123 Main St")])
 	mock_submit.assert_not_called()
 	assert handle.match_keys == {}
+	assert handle.unprocessable_ids == frozenset({1})
 
 
 def test_tracerfy_provider_collect_matches_by_normalized_address_not_row_id():

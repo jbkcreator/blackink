@@ -294,18 +294,33 @@ def _enrich_claimed_rows(
             )
             continue
 
+        # getattr, not an ABC method — same optional-metadata pattern as
+        # queue_id above. StubOwnerEnrichmentProvider's handle (a plain
+        # list) has no such attribute and correctly falls back to empty:
+        # the stub never fails to parse an address, it just passes CSV
+        # values through (see StubOwnerEnrichmentProvider's own docstring).
+        unprocessable_ids = getattr(handle, "unprocessable_ids", frozenset())
+
         for i in chunk:
             result = results.get(i.winback_row_id)
+            unprocessable = i.winback_row_id in unprocessable_ids
             with session.begin_nested():
                 if result is None:
-                    # Not-found — apply a terminal "no answer" result rather
-                    # than a bespoke code path, so requires_enrichment_review
-                    # and the event log both come from the same one place.
+                    # Not-found (vendor was asked, returned nothing) or
+                    # unprocessable (address never parsed, vendor was never
+                    # asked at all) — both produce a synthetic result here
+                    # so requires_enrichment_review and the event log come
+                    # from the same one place, but apply_result's
+                    # unprocessable flag keeps them from being treated as
+                    # equivalent (PR review finding, confirmed real: a
+                    # pre-existing CSV email must not let an unprocessable
+                    # row pass the /arm gate as if enrichment had run).
+                    reason = "unprocessable_address" if unprocessable else "not_found"
                     result = oe.EnrichmentResult(
                         email=None, email_status="UNVERIFIED", phone=None,
-                        phone_verified=None, provider=f"{_provider_name(provider)} (not_found)",
+                        phone_verified=None, provider=f"{_provider_name(provider)} ({reason})",
                     )
-                outcome = oe.apply_result(session, i.winback_row_id, result, now)
+                outcome = oe.apply_result(session, i.winback_row_id, result, now, unprocessable=unprocessable)
                 if outcome is None:
                     logger.error("enrichment_verification: winback_row_id=%s vanished mid-sweep — skipped", i.winback_row_id)
                     continue
