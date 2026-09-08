@@ -34,6 +34,8 @@ import time
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from sqlalchemy import text
+
 from src.agents.ink.subagents.ghost_shopper.prompts import (
     FORM_VALIDATOR_SYSTEM,
     FORM_VALIDATOR_USER,
@@ -41,10 +43,26 @@ from src.agents.ink.subagents.ghost_shopper.prompts import (
     QUEUE_RANKER_USER,
 )
 from src.agents.ink.subagents.ghost_shopper.state import CrawlState, SUBMISSION_TEMPLATE
+from src.core.database import get_system_db_context
 
 logger = logging.getLogger(__name__)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+_BOT_BLOCK_PHRASES = (
+    "access denied", "403 forbidden", "cloudflare", "captcha",
+    "please verify you are human", "ddos-guard", "bot detected",
+    "enable javascript and cookies", "checking your browser",
+    "just a moment", "pardon our interruption",
+)
+_BOT_BLOCK_STATUSES = {403, 429, 502, 503}
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 
 def _same_domain(base: str, url: str) -> bool:
     try:
@@ -78,6 +96,122 @@ def _call_llm(system: str, user: str) -> str:
     return msg.content[0].text
 
 
+def _do_fetch(url: str, proxy: dict | None = None) -> dict:
+    """Core Playwright fetch shared by node_fetch_and_extract and node_fetch_with_proxy.
+
+    Returns {"hrefs": [...], "forms": [...], "fetch_blocked": bool}.
+    fetch_blocked=True when the page returned a bot-block response or both
+    timeout fallbacks failed — the caller should route to the proxy node.
+    """
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    hrefs: list[str] = []
+    forms: list[dict] = []
+    fetch_blocked = False
+    needed_load_fallback = False
+
+    try:
+        with sync_playwright() as pw:
+            launch_kwargs: dict = {"headless": True}
+            if proxy:
+                launch_kwargs["proxy"] = proxy
+            browser = pw.chromium.launch(**launch_kwargs)
+            page = browser.new_page()
+            page.set_extra_http_headers({"User-Agent": _USER_AGENT})
+
+            response = None
+            try:
+                response = page.goto(url, timeout=20_000, wait_until="networkidle")
+            except PWTimeout:
+                logger.warning("ghost_shopper.fetch: networkidle timeout url=%s proxy=%s", url, bool(proxy))
+                needed_load_fallback = True
+                try:
+                    response = page.goto(url, timeout=15_000, wait_until="load")
+                    # Give the JS framework extra time to hydrate navigation links.
+                    try:
+                        page.wait_for_selector("a[href]", timeout=8_000)
+                    except Exception:
+                        pass
+                except PWTimeout:
+                    logger.warning("ghost_shopper.fetch: load timeout too url=%s proxy=%s", url, bool(proxy))
+                    browser.close()
+                    return {"hrefs": [], "forms": [], "fetch_blocked": True}
+
+            status = response.status if response else 0
+            if status in _BOT_BLOCK_STATUSES:
+                logger.warning(
+                    "ghost_shopper.fetch: HTTP %d detected url=%s proxy=%s", status, url, bool(proxy)
+                )
+                fetch_blocked = True
+
+            if not fetch_blocked:
+                try:
+                    body_lower = page.inner_text("body").lower()
+                    if any(p in body_lower for p in _BOT_BLOCK_PHRASES):
+                        logger.warning(
+                            "ghost_shopper.fetch: bot-block phrase in body url=%s proxy=%s", url, bool(proxy)
+                        )
+                        fetch_blocked = True
+                except Exception:
+                    pass
+
+            if not fetch_blocked:
+                # Extra wait for lazy-rendered forms (React/Vue hydration)
+                try:
+                    page.wait_for_selector("form", timeout=3_000)
+                except Exception:
+                    pass
+
+                anchors = page.eval_on_selector_all(
+                    "a[href]",
+                    "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText.trim()}))",
+                )
+                for a in anchors:
+                    norm = _normalize(url, a.get("href", ""))
+                    if norm:
+                        hrefs.append(norm)
+
+                raw_forms = page.eval_on_selector_all("form", """els => els.map(form => ({
+                    action: form.action,
+                    method: form.method,
+                    fields: Array.from(form.querySelectorAll('input,textarea,select')).map(f => ({
+                        type:        f.type || f.tagName.toLowerCase(),
+                        name:        f.name || f.id || '',
+                        placeholder: f.placeholder || '',
+                        label:       (() => {
+                            if (f.labels && f.labels[0]) return f.labels[0].innerText.trim();
+                            const forEl = f.id && document.querySelector('label[for="' + f.id + '"]');
+                            if (forEl) return forEl.innerText.trim();
+                            const wrap = f.closest('label');
+                            return wrap ? wrap.innerText.replace(f.value || '', '').trim() : '';
+                        })()
+                    })).filter(f => f.type !== 'hidden')
+                }))""")
+                forms = [f for f in raw_forms if f.get("fields")]
+
+            # Soft-block: networkidle timed out (JS-heavy SPA) AND page yielded
+            # nothing after the load fallback — almost certainly a JS skeleton
+            # that hasn't hydrated yet. Trigger proxy so a real browser identity
+            # gets a chance to render the full page.
+            # A self-link (href="/" normalising back to url) doesn't count —
+            # a page with only self-referencing anchors is effectively empty.
+            outbound_hrefs = [h for h in hrefs if h != url]
+            if needed_load_fallback and not fetch_blocked and not outbound_hrefs and not forms:
+                logger.warning(
+                    "ghost_shopper.fetch: load fallback yielded no outbound links or forms "
+                    "— treating as soft-block url=%s proxy=%s",
+                    url, bool(proxy),
+                )
+                fetch_blocked = True
+
+            browser.close()
+    except Exception as exc:
+        logger.error("ghost_shopper.fetch: error url=%s proxy=%s: %s", url, bool(proxy), exc)
+        fetch_blocked = True
+
+    return {"hrefs": hrefs, "forms": forms, "fetch_blocked": fetch_blocked}
+
+
 def _compress_form(form: dict) -> str:
     parts = []
     for field in form.get("fields", []):
@@ -91,111 +225,99 @@ def _compress_form(form: dict) -> str:
     return f"FORM action={action!r} method={method}\n" + "\n".join(parts)
 
 
-# ── 1. FETCH & EXTRACT ────────────────────────────────────────────────────────
+# ── helpers shared by fetch nodes ────────────────────────────────────────────
 
-def node_fetch_and_extract(state: CrawlState) -> dict:
-    """Playwright: fetch current_url, extract <a> hrefs and <form> elements.
-
-    Uses networkidle wait so JS-rendered forms are present before extraction.
-    Falls back to domcontentloaded if networkidle times out (SPAs with endless
-    background polling would hang otherwise).
-    """
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-    url = state["current_url"]
-    logger.info("ghost_shopper.fetch: url=%s depth=%d", url, state["depth"])
-
-    hrefs: list[str] = []
-    forms: list[dict] = []
-
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.set_extra_http_headers({"User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            )})
-
-            # networkidle ensures JS-rendered forms are in the DOM
-            try:
-                page.goto(url, timeout=20_000, wait_until="networkidle")
-            except PWTimeout:
-                # networkidle timed out (SPA with background polling) — use whatever loaded
-                logger.warning(
-                    "ghost_shopper.fetch: networkidle timeout, retrying with load url=%s", url
-                )
-                try:
-                    page.goto(url, timeout=15_000, wait_until="load")
-                except PWTimeout:
-                    logger.warning("ghost_shopper.fetch: load timeout too url=%s", url)
-                    browser.close()
-                    return {
-                        "visited":         list(set(state["visited"]) | {url}),
-                        "current_forms":   [],
-                        "post_submit_url":  None,
-                        "post_submit_body": None,
-                    }
-
-            # Extra wait for lazy-rendered forms (React/Vue hydration)
-            try:
-                page.wait_for_selector("form", timeout=3_000)
-            except Exception:
-                pass  # no form appeared — proceed with whatever is in the DOM
-
-            # Extract hrefs
-            anchors = page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(e => ({href: e.getAttribute('href'), text: e.innerText.trim()}))",
-            )
-            for a in anchors:
-                norm = _normalize(url, a.get("href", ""))
-                if norm and norm not in state["visited"]:
-                    hrefs.append(norm)
-
-            # Extract forms — includes shadow-DOM-accessible inputs where possible
-            raw_forms = page.eval_on_selector_all("form", """els => els.map(form => ({
-                action: form.action,
-                method: form.method,
-                fields: Array.from(form.querySelectorAll('input,textarea,select')).map(f => ({
-                    type:        f.type || f.tagName.toLowerCase(),
-                    name:        f.name || f.id || '',
-                    placeholder: f.placeholder || '',
-                    label:       (() => {
-                        if (f.labels && f.labels[0]) return f.labels[0].innerText.trim();
-                        const forEl = f.id && document.querySelector('label[for="' + f.id + '"]');
-                        if (forEl) return forEl.innerText.trim();
-                        const wrap = f.closest('label');
-                        return wrap ? wrap.innerText.replace(f.value || '', '').trim() : '';
-                    })()
-                })).filter(f => f.type !== 'hidden')
-            }))""")
-            forms = [f for f in raw_forms if f.get("fields")]  # skip empty/hidden forms
-            browser.close()
-    except Exception as exc:
-        logger.error("ghost_shopper.fetch: error url=%s: %s", url, exc)
-
-    existing_urls = {c["url"] for c in state["candidate_queue"]}
+def _apply_fetch_result(state: CrawlState, result: dict, used_proxy: bool) -> dict:
+    """Merge a _do_fetch() result dict into the CrawlState update."""
+    url           = state["current_url"]
     visited_set   = set(state["visited"])
+    existing_urls = {c["url"] for c in state["candidate_queue"]}
     new_candidates = [
         {"url": h, "score": 0.5, "depth": state["depth"] + 1}
-        for h in hrefs
+        for h in result["hrefs"]
         if h not in existing_urls and h not in visited_set and h != url
     ]
-
     logger.info(
-        "ghost_shopper.fetch: forms=%d new_candidates=%d url=%s",
-        len(forms), len(new_candidates), url,
+        "ghost_shopper.fetch: forms=%d new_candidates=%d blocked=%s proxy=%s url=%s",
+        len(result["forms"]), len(new_candidates), result["fetch_blocked"], used_proxy, url,
     )
     return {
         "visited":          list(visited_set | {url}),
         "candidate_queue":  state["candidate_queue"] + new_candidates,
-        "current_forms":    forms,
+        "current_forms":    result["forms"],
         "form_valid":       None,
         "post_submit_url":  None,
         "post_submit_body": None,
+        "fetch_blocked":    result["fetch_blocked"],
+        "used_proxy":       used_proxy,
     }
+
+
+# ── 1. FETCH & EXTRACT ────────────────────────────────────────────────────────
+
+def node_fetch_and_extract(state: CrawlState) -> dict:
+    """Playwright: fetch current_url without proxy.
+
+    If proxy_confirmed is already True (proxy proved effective earlier in this
+    job), skips the direct fetch entirely and signals fetch_blocked=True so
+    route_after_fetch goes straight to the proxy node — no wasted direct attempt.
+    Otherwise fetches directly; on block/timeout sets fetch_blocked=True for
+    the same routing outcome.
+    """
+    url = state["current_url"]
+    if state.get("proxy_confirmed"):
+        logger.info(
+            "ghost_shopper.fetch: proxy_confirmed — skipping direct fetch url=%s depth=%d",
+            url, state["depth"],
+        )
+        return {"fetch_blocked": True, "used_proxy": False}
+
+    logger.info("ghost_shopper.fetch: url=%s depth=%d", url, state["depth"])
+    result = _do_fetch(url, proxy=None)
+    return _apply_fetch_result(state, result, used_proxy=False)
+
+
+def node_fetch_with_proxy(state: CrawlState) -> dict:
+    """Playwright: retry current_url through Oxylabs residential proxy.
+
+    Only reached when node_fetch_and_extract set fetch_blocked=True and
+    used_proxy=False. Oxylabs creds come from OXYLABS_USERNAME / OXYLABS_PASSWORD.
+    After this node the graph always proceeds to form_validator regardless of
+    whether the proxy fetch succeeded — one proxy attempt per URL, no loop.
+    """
+    from config.settings import get_settings
+    settings = get_settings()
+
+    url = state["current_url"]
+    proxy: dict | None = None
+
+    if settings.oxylabs_username and settings.oxylabs_password:
+        proxy = {
+            "server":   "http://pr.oxylabs.io:7777",
+            "username": settings.oxylabs_username,
+            "password": settings.oxylabs_password.get_secret_value(),
+        }
+        logger.info("ghost_shopper.fetch_proxy: retrying via Oxylabs url=%s", url)
+    else:
+        logger.warning(
+            "ghost_shopper.fetch_proxy: OXYLABS_USERNAME/PASSWORD not set — "
+            "proceeding without proxy url=%s", url
+        )
+
+    result = _do_fetch(url, proxy=proxy)
+    update = _apply_fetch_result(state, result, used_proxy=True)
+    # Confirm proxy at session level the first time it gets through.
+    # All subsequent pages in this job then skip the wasted direct-fetch attempt.
+    if not result["fetch_blocked"]:
+        update["proxy_confirmed"] = True
+    return update
+
+
+def route_after_fetch(state: CrawlState) -> str:
+    """Route to proxy retry if blocked and proxy not yet tried; else form_validator."""
+    if state.get("fetch_blocked") and not state.get("used_proxy"):
+        return "fetch_with_proxy"
+    return "form_validator"
 
 
 # ── 2. FORM VALIDATOR ─────────────────────────────────────────────────────────
@@ -286,8 +408,70 @@ _MESSAGE_SELECTORS = [
 ]
 
 
+def _get_existing_submission(work_order_id: str, form_url: str) -> dict | None:
+    """Return the existing ghost_form_submissions row for this (work_order_id, form_url), or None."""
+    try:
+        with get_system_db_context() as db:
+            row = db.execute(
+                text("""
+                    SELECT status, submitted_at
+                    FROM ghost_form_submissions
+                    WHERE work_order_id = :woid AND form_url = :url
+                """),
+                {"woid": work_order_id, "url": form_url},
+            ).fetchone()
+            return {"status": row.status, "submitted_at": row.submitted_at} if row else None
+    except Exception as exc:
+        logger.warning("ghost_shopper.fill_and_submit: idempotency check failed: %s", exc)
+        return None
+
+
+def _write_submission_status(
+    work_order_id: str,
+    company_id: str,
+    form_url: str,
+    status: str,
+    submitted_at: int | None = None,
+) -> None:
+    """Upsert ghost_form_submissions with the given status. Commits immediately
+    on its own connection — independent of LangGraph's checkpointer session."""
+    try:
+        with get_system_db_context() as db:
+            db.execute(
+                text("""
+                    INSERT INTO ghost_form_submissions
+                        (work_order_id, company_id, form_url, status, submitted_at)
+                    VALUES
+                        (:woid, :cid, :url, :status, :submitted_at)
+                    ON CONFLICT (work_order_id, form_url)
+                    DO UPDATE SET
+                        status       = EXCLUDED.status,
+                        submitted_at = EXCLUDED.submitted_at,
+                        updated_at   = NOW()
+                """),
+                {
+                    "woid":         work_order_id,
+                    "cid":          company_id,
+                    "url":          form_url,
+                    "status":       status,
+                    "submitted_at": submitted_at,
+                },
+            )
+            db.commit()
+    except Exception as exc:
+        logger.warning(
+            "ghost_shopper.fill_and_submit: idempotency write failed status=%s: %s", status, exc
+        )
+
+
 def node_fill_and_submit(state: CrawlState) -> dict:
     """Playwright: fill the valid form with SUBMISSION_TEMPLATE and submit.
+
+    Idempotency: checks ghost_form_submissions for (work_order_id, form_url)
+    before firing Playwright. A SUBMITTED row means the form was already sent
+    on a prior attempt — skip the POST and return the stored submitted_at.
+    Writes PENDING before the POST (separate committed transaction) so a
+    checkpointer failure after a successful submit cannot erase the record.
 
     Captures post_submit_url and post_submit_body *before* closing the browser
     so confirm_check doesn't need to re-fetch (and can check the redirect page).
@@ -295,8 +479,28 @@ def node_fill_and_submit(state: CrawlState) -> dict:
     """
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-    url  = state["current_url"]
-    tmpl = SUBMISSION_TEMPLATE
+    url          = state["current_url"]
+    work_order_id = state["work_order_id"]
+    company_id   = state["company_id"]
+    tmpl         = SUBMISSION_TEMPLATE
+
+    # ── Idempotency check ────────────────────────────────────────────────────
+    existing = _get_existing_submission(work_order_id, url)
+    if existing and existing["status"] == "SUBMITTED":
+        logger.info(
+            "ghost_shopper.fill_and_submit: already submitted (idempotent skip) url=%s", url
+        )
+        return {
+            "submitted_at":    existing["submitted_at"],
+            "post_submit_url":  None,
+            "post_submit_body": None,
+            "result":          "PENDING",
+        }
+
+    # Mark PENDING before firing Playwright — commits independently so a
+    # checkpointer failure after a successful submit cannot roll this back.
+    _write_submission_status(work_order_id, company_id, url, "PENDING")
+
     logger.info("ghost_shopper.fill_and_submit: url=%s", url)
 
     submitted_at: int | None     = None
@@ -347,6 +551,14 @@ def node_fill_and_submit(state: CrawlState) -> dict:
             browser.close()
     except Exception as exc:
         logger.error("ghost_shopper.fill_and_submit: error url=%s: %s", url, exc)
+
+    # Persist final status — SUBMITTED commits the idempotency record;
+    # FAILED leaves it so a manual retry can inspect without re-checking.
+    _write_submission_status(
+        work_order_id, company_id, url,
+        "SUBMITTED" if success else "FAILED",
+        submitted_at=submitted_at,
+    )
 
     return {
         "submitted_at":    submitted_at if success else None,
@@ -519,6 +731,9 @@ def node_loop_controller(state: CrawlState) -> dict:
         "form_valid":      None,
         "post_submit_url":  None,
         "post_submit_body": None,
+        # Reset per-URL proxy flags for the next page.
+        "fetch_blocked":   False,
+        "used_proxy":      False,
     }
 
 

@@ -92,8 +92,11 @@ def calculate_county_ranks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not above_floor:
         return rows
 
-    # Sort descending by score_total; break ties by company_id for stability.
-    above_floor.sort(key=lambda r: (-r["score_total"], r["company_id"]))
+    # Sort descending by score_total; ties broken by data_coverage_pct descending
+    # (higher data coverage wins — spec 2.1.2 tie rule), then company_id for stability.
+    above_floor.sort(
+        key=lambda r: (-r["score_total"], -(r.get("data_coverage_pct") or 0), r["company_id"])
+    )
 
     n = len(above_floor)
 

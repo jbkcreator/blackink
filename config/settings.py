@@ -341,6 +341,20 @@ class AppSettings(BaseSettings):
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
+	# ── Ghost Shopper IMAP listener (src/tasks/imap_listener.py) ───────────────
+	# Monitors the audit-bot inbox for PM firm replies to Ghost Shopper form
+	# submissions. Fail-closed: if imap_enabled is False the listener logs a
+	# warning and exits immediately — active Ghost Shopper campaigns will stay
+	# suspended at WAIT_REPLY until manually resumed or until imap_enabled is set.
+	imap_enabled: bool = Field(default=False, env="IMAP_ENABLED")
+	imap_host: str = Field(default="imap.gmail.com", env="IMAP_HOST")
+	imap_port: int = Field(default=993, env="IMAP_PORT")
+	imap_user: str = Field(default="audit-bot@audit-blackink.com", env="IMAP_USER")
+	imap_password: Optional[SecretStr] = Field(default=None, env="IMAP_PASSWORD")
+	# How long (hours) to wait for a PM firm reply before publishing a null resume
+	# signal so the campaign continues without audit data.
+	ghost_reply_timeout_hours: int = Field(default=24, env="GHOST_REPLY_TIMEOUT_HOURS")
+
 	# ── Respond Reply Triage Agent ───────────────────────────────────────────
 	# Fail-closed: if ANTHROPIC_API_KEY is unset the classifier returns the
 	# NURTURE fallback on every non-deterministic message rather than raising.
@@ -351,6 +365,25 @@ class AppSettings(BaseSettings):
 	# Domain suffix used to construct per-client inbound addresses:
 	# replies@{client_id}.{inbound_email_domain}
 	inbound_email_domain: str = Field(default="getblackink.com", env="INBOUND_EMAIL_DOMAIN")
+
+	# ── Ink PDF Generator ─────────────────────────────────────────────────────
+	# Local directory for campaign audit PDFs (dev/staging only).
+	# Set PDF_LOCAL_DIR to a writable path; swap get_pdf_store() for S3PdfStore
+	# once AWS credentials exist.
+	pdf_local_dir: str = Field(default="tmp/pdf", env="PDF_LOCAL_DIR")
+
+	# ── Ink Sendspark ─────────────────────────────────────────────────────────
+	# Fail-closed: if either is unset, node_sendspark logs SENDSPARK_SKIPPED and
+	# returns video_id=None / landing_url=None -- campaign continues without video.
+	sendspark_api_key:    Optional[SecretStr] = Field(default=None, env="SENDSPARK_API_KEY")
+	sendspark_template_id: Optional[str]      = Field(default=None, env="SENDSPARK_TEMPLATE_ID")
+
+	# ── Ink Approval Webhook ──────────────────────────────────────────────────
+	# Shared secret for POST /api/v1/webhooks/ink/approve.
+	# Fail-closed: if unset, every request returns 503.
+	# Normal operator path is the Slack card buttons (Bolt action handlers),
+	# which write to ink:resume_signals directly without this secret.
+	ink_webhook_secret: Optional[SecretStr] = Field(default=None, env="INK_WEBHOOK_SECRET")
 
 
 @lru_cache

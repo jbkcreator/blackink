@@ -1,17 +1,5 @@
 """Ink (Campaign Agent) — LangGraph node functions.
 
-# ============================================================
-# DEFERRED — Ghost Shopper, Sendspark, GIF Generator nodes
-# ============================================================
-# node_ghost_shopper (via make_node_ghost_shopper), node_wait_reply,
-# node_sendspark, node_gif_generator are deferred as of 2026-09-03.
-# They are preserved here for future reactivation.
-#
-# The active OVS pipeline replaces ghost_shopper + wait_reply with an
-# OVS score lookup. When reactivating, restore those nodes and update
-# the graph topology in graph.py.
-# ============================================================
-
 Each node receives the full GlobalState and returns a partial dict that
 LangGraph merges into the state. Nodes update `stage` as a side effect for
 observability; routing is driven by graph edges, not the stage field.
@@ -78,14 +66,21 @@ def make_node_ghost_shopper(ghost_shopper_graph):
                 with get_db_context(client_id=state["client_id"]) as db:
                     db.execute(
                         text(
-                            "UPDATE contacts SET ghost_submitted_at = :ts "
+                            "UPDATE contacts "
+                            "SET ghost_submitted_at  = :ts, "
+                            "    ghost_work_order_id = :woid "
                             "WHERE company_id = :cid"
                         ),
-                        {"ts": result.submitted_at, "cid": state["company_id"]},
+                        {
+                            "ts":   result.submitted_at,
+                            "woid": state["work_order_id"],
+                            "cid":  state["company_id"],
+                        },
                     )
                 logger.info(
-                    "ink.nodes: ghost_shopper wrote ghost_submitted_at=%s company_id=%s",
-                    result.submitted_at, state["company_id"],
+                    "ink.nodes: ghost_shopper wrote ghost_submitted_at=%s "
+                    "ghost_work_order_id=%s company_id=%s",
+                    result.submitted_at, state["work_order_id"], state["company_id"],
                 )
             except Exception as exc:
                 logger.error(
@@ -152,72 +147,195 @@ def node_wait_reply(state: GlobalState) -> dict:
 # ── 3. PDF Generator ─────────────────────────────────────────────────────────
 
 def node_pdf_generator(state: GlobalState) -> dict:
-    """
-    TODO: invoke PDFGeneratorAgent(company_id, latency_sec, loss_est).
-    Compiles branded 2-page loss report PDF, stores on S3, returns pdf_url.
-    Revenue loss formula: Monthly Leads × (1 − e^(−0.0005 × latency_sec))
-                          × (Avg Fee × 12) × Avg Door Retention
-    See: Tasks/campaign_agent_architecture.md §2.1.3
-    """
-    logger.warning(
-        "ink.nodes: pdf_generator STUB — company_id=%s latency_sec=%s",
-        state["company_id"], state.get("latency_sec"),
+    """Compile the 2-page campaign audit PDF and upload to configured storage."""
+    import datetime
+
+    from sqlalchemy import text
+
+    from src.agents.ink.subagents.pdf_generator.pdf_report import (
+        CampaignAuditData,
+        compile_campaign_pdf,
     )
-    return {
-        "pdf_url": f"https://s3.example.com/stub/{state['company_id']}/loss_report.pdf",
-        "stage": InkStage.ASSETS_MERGE,
-    }
+    from src.agents.ink.subagents.pdf_generator.storage import get_pdf_store
+    from src.core.database import get_db_context
+
+    # Fetch company name and county for the report header
+    with get_db_context(client_id=state["client_id"]) as db:
+        row = db.execute(
+            text("""
+                SELECT c.company_name, co.county_name
+                FROM   companies c
+                JOIN   counties  co ON co.county_slug = c.county_slug
+                WHERE  c.company_id = :cid
+            """),
+            {"cid": state["company_id"]},
+        ).fetchone()
+
+    company_name = row.company_name if row else state["company_id"]
+    county_name  = row.county_name  if row else "Unknown County"
+    audit_date   = datetime.date.today().strftime("%B %Y")
+
+    data = CampaignAuditData(
+        company_name=company_name,
+        county_name=county_name,
+        audit_date=audit_date,
+        latency_sec=state.get("latency_sec"),
+        loss_est=state.get("loss_est") or 0,
+    )
+
+    pdf_bytes = compile_campaign_pdf(data)
+
+    store   = get_pdf_store()
+    pdf_key = f"{state['company_id']}/{state['work_order_id']}/audit_report.pdf"
+    pdf_url = store.put(pdf_key, pdf_bytes)
+
+    logger.info(
+        "ink.nodes: pdf_generator complete — company_id=%s size=%d url=%s",
+        state["company_id"], len(pdf_bytes), pdf_url,
+    )
+    return {"pdf_url": pdf_url}
 
 
 # ── 4. Sendspark ─────────────────────────────────────────────────────────────
 
 def node_sendspark(state: GlobalState) -> dict:
+    """Call Sendspark API to render a personalised video landing page.
+
+    Skips gracefully (video_id=None, landing_url=None) when:
+      - latency_sec or loss_est are missing (no audit data to personalise with)
+      - SENDSPARK_API_KEY / SENDSPARK_TEMPLATE_ID are not configured
+
+    GIF Generator downstream uses landing_url; it also handles None gracefully.
     """
-    TODO: invoke SendsparkAgent(company_id, company_name, latency_sec, loss_est).
-    Calls Sendspark REST API to generate personalised video landing page.
-    URL pattern: https://watch.blackink.io/v/{company_id}?company=...&speed=...&loss=...
-    Skips if latency_sec or loss_est is None (logs SENDSPARK_SKIPPED_MISSING_DATA).
-    See: Tasks/campaign_agent_architecture.md §2.2.1
-    """
-    if not state.get("latency_sec") or not state.get("loss_est"):
+    from src.agents.ink.subagents.pdf_generator.pdf_report import _fmt_latency
+    from src.agents.ink.subagents.sendspark.client import SendsparkSkipped, get_client
+
+    latency_sec = state.get("latency_sec")
+    loss_est    = state.get("loss_est")
+
+    if latency_sec is None or not loss_est:
         logger.warning(
             "ink.nodes: sendspark SKIPPED — missing audit data company_id=%s",
             state["company_id"],
         )
         return {"video_id": None, "landing_url": None}
 
-    logger.warning(
-        "ink.nodes: sendspark STUB — company_id=%s returning placeholder",
-        state["company_id"],
-    )
-    company_id = state["company_id"]
-    return {
-        "video_id": f"stub-video-{company_id}",
-        "landing_url": (
-            f"https://watch.blackink.io/v/{company_id}"
-            f"?speed={state['latency_sec']}&loss={state['loss_est']}"
-        ),
-    }
+    try:
+        client = get_client()
+    except SendsparkSkipped as exc:
+        logger.warning(
+            "ink.nodes: sendspark SKIPPED — not configured company_id=%s reason=%s",
+            state["company_id"], exc,
+        )
+        return {"video_id": None, "landing_url": None}
+
+    # Fetch company name for the video title (reuse what pdf_generator already wrote
+    # to state if available, else fall back to a DB lookup)
+    company_name = _get_company_name(state)
+
+    response_time = _fmt_latency(latency_sec)
+    loss_estimate = f"${loss_est:,}"
+
+    try:
+        result = client.render(
+            company_name=company_name,
+            response_time=response_time,
+            loss_estimate=loss_estimate,
+        )
+        logger.info(
+            "ink.nodes: sendspark complete — company_id=%s video_id=%s",
+            state["company_id"], result.video_id,
+        )
+        return {"video_id": result.video_id, "landing_url": result.landing_url}
+    except Exception as exc:
+        logger.error(
+            "ink.nodes: sendspark FAILED — company_id=%s: %s — continuing without video",
+            state["company_id"], exc,
+        )
+        return {"video_id": None, "landing_url": None}
+
+
+def _get_company_name(state: GlobalState) -> str:
+    """Best-effort company name lookup for Sendspark personalisation."""
+    from sqlalchemy import text
+
+    from src.core.database import get_db_context
+
+    try:
+        with get_db_context(client_id=state["client_id"]) as db:
+            row = db.execute(
+                text("SELECT company_name FROM companies WHERE company_id = :cid"),
+                {"cid": state["company_id"]},
+            ).fetchone()
+        return row.company_name if row else state["company_id"]
+    except Exception:
+        return state["company_id"]
 
 
 # ── 5. GIF Generator ─────────────────────────────────────────────────────────
 
 def node_gif_generator(state: GlobalState) -> dict:
+    """Screencap prospect website, overlay audit data, encode animated GIF.
+
+    60-second hard timeout on the Playwright screenshot step. Falls back to
+    a grey placeholder frame if the site is unreachable or too slow.
+    Always returns a gif_url -- never None -- so assets_merge is never blocked.
     """
-    TODO: invoke GIFGeneratorAgent(company_id, website_url, landing_url, latency_sec).
-    Screencaps prospect website, overlays audit score, generates 600×338px
-    animated GIF (max 1.5 MB). Non-blocking — falls back to static image
-    if generation exceeds 60 seconds.
-    See: Tasks/campaign_agent_architecture.md §2.2.2
-    """
-    logger.warning(
-        "ink.nodes: gif_generator STUB — company_id=%s returning placeholder",
-        state["company_id"],
+    import concurrent.futures
+
+    from sqlalchemy import text
+
+    from src.agents.ink.subagents.gif_generator.composer import compose_gif
+    from src.agents.ink.subagents.gif_generator.screenshot import capture
+    from src.agents.ink.subagents.pdf_generator.storage import get_pdf_store
+    from src.core.database import get_db_context
+
+    with get_db_context(client_id=state["client_id"]) as db:
+        row = db.execute(
+            text("SELECT company_name, website FROM companies WHERE company_id = :cid"),
+            {"cid": state["company_id"]},
+        ).fetchone()
+
+    company_name = row.company_name if row else state["company_id"]
+    website_url  = row.website      if row else None
+
+    # Screenshot with 55-second timeout (leaves 5 s for compose + encode)
+    screenshot = None
+    if website_url:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(capture, website_url)
+            try:
+                screenshot = future.result(timeout=55)
+            except concurrent.futures.TimeoutError:
+                logger.warning(
+                    "ink.nodes: gif screenshot timed out — using placeholder company_id=%s",
+                    state["company_id"],
+                )
+                future.cancel()
+
+    try:
+        gif_bytes = compose_gif(
+            screenshot=screenshot,
+            company_name=company_name,
+            latency_sec=state.get("latency_sec"),
+            loss_est=state.get("loss_est") or 0,
+        )
+    except Exception as exc:
+        logger.error(
+            "ink.nodes: gif compose failed company_id=%s: %s — skipping gif",
+            state["company_id"], exc,
+        )
+        return {"gif_url": None}
+
+    store   = get_pdf_store()
+    gif_key = f"{state['company_id']}/{state['work_order_id']}/thumbnail.gif"
+    gif_url = store.put(gif_key, gif_bytes)
+
+    logger.info(
+        "ink.nodes: gif_generator complete — company_id=%s size=%d screenshot=%s url=%s",
+        state["company_id"], len(gif_bytes), screenshot is not None, gif_url,
     )
-    return {
-        "gif_url": f"https://s3.example.com/stub/{state['company_id']}/thumbnail.gif",
-        "stage": InkStage.ASSETS_MERGE,
-    }
+    return {"gif_url": gif_url}
 
 
 # ── 6. Assets Merge ───────────────────────────────────────────────────────────
@@ -322,14 +440,22 @@ def route_after_approve(state: GlobalState) -> str:
 # ── 9. Relay Dispatch ─────────────────────────────────────────────────────────
 
 def node_relay_dispatch(state: GlobalState) -> dict:
-    """
-    TODO: publish approved draft to relay:sends Redis Stream.
-    Relay worker picks up, checks halt_service, enforces mailbox rate limits,
-    dispatches via Instantly API, logs touch_sent to events.
-    relay:sends stream not yet built — implement alongside Relay worker.
-    """
-    logger.warning(
-        "ink.nodes: relay_dispatch STUB — company_id=%s draft_message_id=%s",
-        state["company_id"], state.get("draft_message_id"),
+    """Publish approved campaign to relay:sends so the Relay worker dispatches it."""
+    from src.agents.relay.sends_queue import publish as relay_publish
+
+    message_id = relay_publish(
+        work_order_id=state["work_order_id"],
+        campaign_id=state["campaign_id"],
+        company_id=state["company_id"],
+        client_id=state["client_id"],
+        draft_message_id=state.get("draft_message_id") or "",
+        pdf_url=state.get("pdf_url"),
+        video_id=state.get("video_id"),
+        landing_url=state.get("landing_url"),
+        gif_url=state.get("gif_url"),
+    )
+    logger.info(
+        "ink.nodes: relay_dispatch published — work_order_id=%s relay_message_id=%s",
+        state["work_order_id"], message_id,
     )
     return {"stage": InkStage.DONE}

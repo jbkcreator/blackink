@@ -58,4 +58,6 @@ psycopg[binary]>=3.1
 # ── Ghost Shopper subagent ───────────────────────────────────────────────────
 playwright>=1.44
 anthropic>=0.40
+# IMAP IDLE listener (src/tasks/imap_listener.py) — async IMAP with IDLE support.
+aioimaplib>=1.0
 

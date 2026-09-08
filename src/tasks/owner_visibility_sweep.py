@@ -67,36 +67,43 @@ def score_one_company(db, company: dict, month_key: str):
     )
     breakdown = calculate_score(signals)
 
+    # data_coverage_pct: fraction of the 10 scored signals that returned SCORED
+    # (not MISSING_DATA). Used as the tie-breaking key in county ranking.
+    _TOTAL_SIGNALS = 10
+    data_coverage_pct = round((_TOTAL_SIGNALS - len(breakdown.data_gaps)) / _TOTAL_SIGNALS * 100)
+
     db.execute(
         text(
             "INSERT INTO owner_visibility_scores "
             "  (company_id, month_key, county_slug, score_total, "
             "   score_website, score_dbpr, score_google, "
-            "   signal_detail, data_gaps, scored_at) "
+            "   signal_detail, data_gaps, data_coverage_pct, scored_at) "
             "VALUES "
             "  (:company_id, :month_key, :county_slug, :score_total, "
             "   :score_website, :score_dbpr, :score_google, "
-            "   :signal_detail ::jsonb, :data_gaps, NOW()) "
+            "   :signal_detail ::jsonb, :data_gaps, :data_coverage_pct, NOW()) "
             "ON CONFLICT (company_id, month_key) DO UPDATE SET "
-            "  county_slug    = EXCLUDED.county_slug, "
-            "  score_total    = EXCLUDED.score_total, "
-            "  score_website  = EXCLUDED.score_website, "
-            "  score_dbpr     = EXCLUDED.score_dbpr, "
-            "  score_google   = EXCLUDED.score_google, "
-            "  signal_detail  = EXCLUDED.signal_detail, "
-            "  data_gaps      = EXCLUDED.data_gaps, "
-            "  scored_at      = EXCLUDED.scored_at"
+            "  county_slug       = EXCLUDED.county_slug, "
+            "  score_total       = EXCLUDED.score_total, "
+            "  score_website     = EXCLUDED.score_website, "
+            "  score_dbpr        = EXCLUDED.score_dbpr, "
+            "  score_google      = EXCLUDED.score_google, "
+            "  signal_detail     = EXCLUDED.signal_detail, "
+            "  data_gaps         = EXCLUDED.data_gaps, "
+            "  data_coverage_pct = EXCLUDED.data_coverage_pct, "
+            "  scored_at         = EXCLUDED.scored_at"
         ),
         {
-            "company_id": company["company_id"],
-            "month_key": month_key,
-            "county_slug": company["county_slug"],
-            "score_total": breakdown.score_total,
-            "score_website": breakdown.score_website,
-            "score_dbpr": breakdown.score_dbpr,
-            "score_google": breakdown.score_google,
-            "signal_detail": json.dumps(breakdown.signal_detail),
-            "data_gaps": breakdown.data_gaps,
+            "company_id":        company["company_id"],
+            "month_key":         month_key,
+            "county_slug":       company["county_slug"],
+            "score_total":       breakdown.score_total,
+            "score_website":     breakdown.score_website,
+            "score_dbpr":        breakdown.score_dbpr,
+            "score_google":      breakdown.score_google,
+            "signal_detail":     json.dumps(breakdown.signal_detail),
+            "data_gaps":         breakdown.data_gaps,
+            "data_coverage_pct": data_coverage_pct,
         },
     )
 
@@ -178,7 +185,9 @@ def _update_county_ranks(month_key: str) -> None:
             raw_rows = db.execute(
                 text(
                     "SELECT o.score_id, o.company_id, c.company_name, "
-                    "       o.score_total, o.signal_detail "
+                    "       o.score_total, o.signal_detail, "
+                    "       COALESCE(o.data_coverage_pct, 0) AS data_coverage_pct, "
+                    "       c.owning_client_id "
                     "FROM owner_visibility_scores o "
                     "JOIN companies c ON c.company_id = o.company_id "
                     "WHERE o.county_slug = :county_slug AND o.month_key = :month_key"
@@ -188,11 +197,13 @@ def _update_county_ranks(month_key: str) -> None:
 
         rows = [
             {
-                "score_id":     r.score_id,
-                "company_id":   r.company_id,
-                "company_name": r.company_name,
-                "score_total":  r.score_total,
-                "signal_detail": r.signal_detail or {},
+                "score_id":          r.score_id,
+                "company_id":        r.company_id,
+                "company_name":      r.company_name,
+                "score_total":       r.score_total,
+                "signal_detail":     r.signal_detail or {},
+                "data_coverage_pct": r.data_coverage_pct,
+                "owning_client_id":  r.owning_client_id,
             }
             for r in raw_rows
         ]
@@ -216,6 +227,42 @@ def _update_county_ranks(month_key: str) -> None:
                         "score_id":          row["score_id"],
                     },
                 )
+
+            # Log owner_visibility_score_calculated event per firm that has an
+            # owning client. Unallocated prospects (owning_client_id IS NULL) are
+            # skipped — there is no client to log under. Event payload carries
+            # score_total, county_slug, data_coverage_pct, county_rank, and the
+            # top-3 peer comparisons so the daily digest and alert jobs can read
+            # them without re-joining owner_visibility_scores.
+            for row in ranked:
+                client_id = row.get("owning_client_id")
+                if not client_id:
+                    continue
+                event_payload = json.dumps({
+                    "score_total":       row["score_total"],
+                    "county_slug":       county_slug,
+                    "data_coverage_pct": row["data_coverage_pct"],
+                    "county_rank":       row["county_rank"],
+                    "county_percentile": row["county_percentile"],
+                    "is_published":      row.get("is_published", False),
+                    "peer_comparisons":  row["peer_comparisons"][:3],
+                    "month_key":         month_key,
+                })
+                db.execute(
+                    text(
+                        "INSERT INTO events "
+                        "  (client_id, event_type, entity_type, entity_id, payload, actor) "
+                        "VALUES "
+                        "  (:client_id, 'owner_visibility_score_calculated', "
+                        "   'company', :company_id, :payload ::jsonb, 'owner_visibility_sweep')"
+                    ),
+                    {
+                        "client_id":  client_id,
+                        "company_id": row["company_id"],
+                        "payload":    event_payload,
+                    },
+                )
+
             logger.info(
                 "owner_visibility_sweep: ranked county=%s (%d firms)", county_slug, len(ranked)
             )

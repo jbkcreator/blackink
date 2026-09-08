@@ -60,7 +60,7 @@ def publish(
             "ink.queue: publish failed company_id=%s work_order_id=%s: %s",
             company_id, work_order_id, exc,
         )
-        return None
+        raise
 
 
 def _parse(message_id: str, fields: dict, delivery_count: int = 1) -> WorkOrderMessage:

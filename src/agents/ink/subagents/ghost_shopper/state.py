@@ -41,6 +41,11 @@ class CrawlState(TypedDict):
     max_llm_calls:   int                  # hard cap, default 6
     llm_calls_used:  int
 
+    # ── Proxy state ───────────────────────────────────────────────────────────
+    fetch_blocked:   bool                 # True when last fetch hit 403/timeout/bot-block
+    used_proxy:      bool                 # True once proxy was tried for current_url (per-URL, reset by loop_controller)
+    proxy_confirmed: bool                 # True once proxy proved it works for this job — never reset; all subsequent fetches skip direct and go straight to proxy
+
     # ── Result ────────────────────────────────────────────────────────────────
     submitted_at:    Optional[int]        # ms epoch, set by fill_and_submit
     result:          str                  # PENDING | SUBMITTED | FORM_NOT_FOUND | ERROR
@@ -59,7 +64,7 @@ class GhostResult:
 # Email domain is the inbox the IMAP listener monitors.
 SUBMISSION_TEMPLATE = {
     "name":    "Jordan Mitchell",
-    "email":   "audit-bot@audit-blackink.com",
+    "email":   "samurai@x-mail.com",
     "phone":   "(813) 555-0192",
     "address": "4821 Harborview Dr, Tampa FL 33611",
     "message": (

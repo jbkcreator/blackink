@@ -58,22 +58,30 @@ def _ensure_resume_group() -> None:
 
 
 def _read_resume_signals() -> list[dict]:
-    """Poll ink:resume_signals for pending resume events."""
-    try:
-        result = get_redis_client().xreadgroup(
-            RESUME_GROUP_NAME, CONSUMER_NAME,
-            {RESUME_STREAM_KEY: ">"},
-            count=10, block=0,
-        )
-    except Exception as exc:
-        logger.warning("ink.worker: resume_signals read failed: %s", exc)
-        return []
-    if not result:
-        return []
+    """Poll ink:resume_signals for resume events — new messages AND own PEL.
+
+    Reads own PEL first (id="0") to pick up any messages that were delivered
+    to this consumer in a prior run but never acked (e.g. crash mid-process).
+    Then reads new undelivered messages (id=">").
+    """
+    r = get_redis_client()
     signals = []
-    for _stream, entries in result:
-        for message_id, fields in entries:
-            signals.append({"_message_id": message_id, **fields})
+    for stream_id in ("0", ">"):
+        try:
+            result = r.xreadgroup(
+                RESUME_GROUP_NAME, CONSUMER_NAME,
+                {RESUME_STREAM_KEY: stream_id},
+                count=10, block=0,
+            )
+        except Exception as exc:
+            logger.debug("ink.worker: resume_signals read failed id=%s: %s", stream_id, exc)
+            continue
+        if not result:
+            continue
+        for _stream, entries in result:
+            for message_id, fields in entries:
+                if fields:  # xclaimed tombstones have None fields
+                    signals.append({"_message_id": message_id, **fields})
     return signals
 
 
@@ -220,6 +228,44 @@ class InkWorker:
                     message_id,
                 )
 
+    def _maybe_claim_stale_resume_signals(self) -> None:
+        """Reclaim resume signals delivered to dead consumers back into this consumer.
+
+        Resume signals use `>` in _read_resume_signals so they only receive new
+        messages. Any signal delivered to a worker that died before acking it
+        would be stuck in the PEL forever without this sweep.
+        """
+        now = time.monotonic()
+        if now - self._last_claim < CLAIM_INTERVAL_SEC:
+            return
+        r = get_redis_client()
+        try:
+            pending = r.xpending_range(
+                RESUME_STREAM_KEY, RESUME_GROUP_NAME, min="-", max="+", count=50
+            )
+        except Exception as exc:
+            logger.warning("ink.worker: resume xpending_range failed: %s", exc)
+            return
+        stale = [
+            e["message_id"]
+            for e in pending
+            if e.get("time_since_delivered", 0) >= CLAIM_MIN_IDLE_MS
+               and e.get("consumer") != CONSUMER_NAME
+        ]
+        if not stale:
+            return
+        try:
+            r.xclaim(
+                RESUME_STREAM_KEY, RESUME_GROUP_NAME, CONSUMER_NAME,
+                min_idle_time=CLAIM_MIN_IDLE_MS, message_ids=stale,
+            )
+            logger.info(
+                "ink.worker: reclaimed %d stale resume signal(s) from dead consumers",
+                len(stale),
+            )
+        except Exception as exc:
+            logger.warning("ink.worker: resume xclaim failed: %s", exc)
+
     def _maybe_claim_stale(self) -> None:
         now = time.monotonic()
         if now - self._last_claim < CLAIM_INTERVAL_SEC:
@@ -272,15 +318,82 @@ class InkWorker:
                     msg.message_id,
                 )
 
-    def run_forever(self) -> None:
+    def _wait_for_redis(self, max_attempts: int = 10, base_delay: float = 2.0) -> None:
+        """Exponential backoff until Redis is reachable. Raises after max_attempts."""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                ensure_group()
+                _ensure_resume_group()
+                return
+            except Exception as exc:
+                if attempt == max_attempts:
+                    logger.error(
+                        "ink.worker: Redis not reachable after %d attempts — giving up: %s",
+                        max_attempts, exc,
+                    )
+                    raise
+                delay = base_delay * (2 ** (attempt - 1))  # 2, 4, 8, 16 … seconds
+                logger.warning(
+                    "ink.worker: Redis not reachable (attempt %d/%d) — retrying in %.0fs: %s",
+                    attempt, max_attempts, delay, exc,
+                )
+                time.sleep(delay)
+
+    def run_forever(self, max_consecutive_errors: int = 10, error_backoff: float = 2.0) -> None:
         logger.info("ink.worker: starting — consumer=%s", CONSUMER_NAME)
-        ensure_group()
-        _ensure_resume_group()
+        self._wait_for_redis()
+        consecutive_errors = 0
         while self._running:
-            self._process_resume_signals()
-            self._process_new_work_orders()
-            self._maybe_claim_stale()
+            try:
+                self._process_resume_signals()
+                self._process_new_work_orders()
+                self._maybe_claim_stale_resume_signals()
+                self._maybe_claim_stale()
+                consecutive_errors = 0  # reset on any clean tick
+            except Exception as exc:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(
+                        "ink.worker: %d consecutive errors — shutting down: %s",
+                        consecutive_errors, exc,
+                    )
+                    self._running = False
+                    break
+                delay = error_backoff * consecutive_errors
+                logger.warning(
+                    "ink.worker: loop error (%d/%d) — retrying in %.0fs: %s",
+                    consecutive_errors, max_consecutive_errors, delay, exc,
+                )
+                time.sleep(delay)
         logger.info("ink.worker: stopped")
+
+
+def _wait_for_postgres(
+    database_url: str,
+    max_attempts: int = 10,
+    base_delay: float = 2.0,
+) -> None:
+    """Probe Postgres with exponential backoff until reachable. Raises after max_attempts."""
+    import psycopg2
+    for attempt in range(1, max_attempts + 1):
+        try:
+            conn = psycopg2.connect(database_url)
+            conn.close()
+            logger.info("ink.worker: Postgres reachable")
+            return
+        except Exception as exc:
+            if attempt == max_attempts:
+                logger.error(
+                    "ink.worker: Postgres not reachable after %d attempts — giving up: %s",
+                    max_attempts, exc,
+                )
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "ink.worker: Postgres not reachable (attempt %d/%d) — retrying in %.0fs: %s",
+                attempt, max_attempts, delay, exc,
+            )
+            time.sleep(delay)
 
 
 def main() -> None:
@@ -291,8 +404,13 @@ def main() -> None:
     from config.settings import get_settings
     settings = get_settings()
 
+    _wait_for_postgres(settings.database_url)
     with PostgresSaver.from_conn_string(settings.database_url) as checkpointer:
-        checkpointer.setup()
+        # Register InkStage so LangGraph's msgpack serializer doesn't warn about it
+        try:
+            checkpointer.serde.allowed_msgpack_modules.add("src.agents.ink.state")
+        except AttributeError:
+            pass  # older LangGraph versions don't expose this — warning is benign
 
         from src.agents.ink.subagents.ghost_shopper.graph import (
             build_graph as build_ghost_shopper_graph,

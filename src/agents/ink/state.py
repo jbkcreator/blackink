@@ -1,21 +1,5 @@
 """Ink (Campaign Agent) — global state and stage definitions.
 
-# ============================================================
-# DEFERRED — Ghost Shopper / Sendspark / GIF Generator stages
-# ============================================================
-# Ghost Shopper, Sendspark, and GIF Generator were deferred on 2026-09-03
-# (Source of Truth). The Ink agent foundation is preserved here for future
-# reactivation. The active campaign pipeline (feature/owner-visibility-score-engine)
-# uses Owner Visibility Score (OVS) instead.
-#
-# Deferred GlobalState fields (never populated in the current pipeline):
-#   ghost_result, submitted_at, latency_sec, video_id, landing_url, gif_url
-#
-# When Ghost Shopper is reactivated, update InkStage and GlobalState to
-# replace the OVS fields (ovs_score_id, county_rank, pdf_url) with the
-# ghost-shopper fields, and restore the GHOST_SHOPPER / WAIT_REPLY stages.
-# ============================================================
-
 GlobalState is the single source of truth for the entire campaign lifecycle.
 It is owned by the LangGraph graph, persisted via Postgres checkpointer, and
 survives process restarts across the two async suspend points (WAIT_REPLY,

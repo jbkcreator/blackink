@@ -12,7 +12,7 @@ never attempts a live call.
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -79,3 +79,62 @@ class InstantlyService:
 
 	def list_accounts(self) -> Optional[Dict[str, Any]]:
 		return self._request("GET", "/api/v2/accounts")
+
+	# ── Campaign dispatch — called by the Relay worker ────────────────────────
+	#
+	# NOTE: The endpoint paths and request/response shapes below are based on
+	# the Instantly v2 API docs (api.instantly.ai). Verify against
+	# app.instantly.ai/api-docs before deploying. The _request() method
+	# handles auth and retries; update endpoint paths here if they differ.
+
+	def create_campaign(
+		self,
+		name:           str,
+		sequence_steps: List[Dict[str, Any]],
+		account_emails: Optional[List[str]] = None,
+	) -> Optional[str]:
+		"""Create a campaign with the given sequence steps.
+
+		sequence_steps: list of step dicts from build_instantly_sequence()
+		  [{"type": "email", "delay": N, "variants": [{"subject": ..., "body": ...}]}, ...]
+
+		Returns the campaign_id string, or None on failure.
+
+		VERIFY: POST /api/v2/campaigns request/response shape.
+		"""
+		body: Dict[str, Any] = {
+			"name": name,
+			"sequences": [{"steps": sequence_steps}],
+		}
+		if account_emails:
+			body["email_account"] = account_emails[0]  # VERIFY: key name and cardinality
+		result = self._request("POST", "/api/v2/campaigns", json=body)
+		if not result:
+			return None
+		# VERIFY: exact key name in response (id vs campaign_id)
+		return result.get("id") or result.get("campaign_id")
+
+	def add_leads(
+		self,
+		campaign_id: str,
+		leads:       List[Dict[str, Any]],
+	) -> bool:
+		"""Add leads to a campaign.
+
+		Each lead dict: {email, first_name, last_name, company_name, ...}
+		Custom variables should be nested under the key Instantly expects.
+
+		VERIFY: POST /api/v2/leads endpoint and request shape.
+		"""
+		body = {"campaign_id": campaign_id, "leads": leads}
+		result = self._request("POST", "/api/v2/leads", json=body)
+		return result is not None
+
+	def activate_campaign(self, campaign_id: str) -> bool:
+		"""Start a campaign so Instantly begins sending.
+
+		VERIFY: endpoint path (may be PATCH /api/v2/campaigns/{id} with
+		{status: "active"} rather than a dedicated /activate route).
+		"""
+		result = self._request("POST", f"/api/v2/campaigns/{campaign_id}/activate")
+		return result is not None

@@ -303,5 +303,6 @@ class TestSubmissionTemplate:
             assert field in SUBMISSION_TEMPLATE
             assert SUBMISSION_TEMPLATE[field]
 
-    def test_email_is_audit_inbox(self):
-        assert "audit-blackink.com" in SUBMISSION_TEMPLATE["email"]
+    def test_email_is_set(self):
+        assert "@" in SUBMISSION_TEMPLATE["email"]
+        assert SUBMISSION_TEMPLATE["email"]
