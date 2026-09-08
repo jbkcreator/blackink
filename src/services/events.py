@@ -47,6 +47,7 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
 	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Per-disposition-bucket counts,
 	# not just a total, so the proof-ledger-style visibility the spec asks
 	# for ("winback_import_completed event written with row counts for each
