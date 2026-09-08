@@ -111,6 +111,45 @@ DDL = [
     "GRANT SELECT, INSERT, UPDATE ON inbound_messages TO blackink_system",
     "GRANT USAGE ON SEQUENCE inbound_messages_id_seq TO blackink_app",
     "GRANT USAGE ON SEQUENCE inbound_messages_id_seq TO blackink_system",
+    # ── Cross-tenant non-poach by domain (SECURITY DEFINER) ──────────────────
+    # is_claimed_by_other_client(company_id) can't be reached from the inbound
+    # pipeline: resolving company_id from the sender domain first requires an
+    # RLS-scoped SELECT, which HIDES a company owned by another client — the
+    # exact case non-poach must catch. This variant takes the domain directly,
+    # bypasses RLS as DEFINER, derives the requesting client from session
+    # context (never a parameter — no identity-probing), and returns only a
+    # boolean (never another tenant's company_id).
+    "DROP FUNCTION IF EXISTS is_domain_claimed_by_other_client(VARCHAR)",
+    """
+    CREATE OR REPLACE FUNCTION is_domain_claimed_by_other_client(p_domain VARCHAR)
+    RETURNS BOOLEAN
+    SECURITY DEFINER
+    SET search_path = public
+    LANGUAGE plpgsql
+    AS $$
+    DECLARE
+        v_requesting_client_id VARCHAR(40);
+    BEGIN
+        v_requesting_client_id := current_setting('app.current_client_id', true);
+        IF v_requesting_client_id IS NULL OR v_requesting_client_id = '' THEN
+            -- No tenant context to exclude — fail closed (treat as claimed).
+            RETURN TRUE;
+        END IF;
+        IF p_domain IS NULL OR p_domain = '' THEN
+            RETURN FALSE;
+        END IF;
+        RETURN EXISTS (
+            SELECT 1 FROM client_pm_books b
+            WHERE b.client_id <> v_requesting_client_id
+              AND lower(b.owner_domain) = lower(p_domain)
+        );
+    END;
+    $$
+    """,
+    "REVOKE EXECUTE ON FUNCTION is_domain_claimed_by_other_client(VARCHAR) FROM PUBLIC",
+    "GRANT EXECUTE ON FUNCTION is_domain_claimed_by_other_client(VARCHAR) TO blackink_app",
+    "GRANT EXECUTE ON FUNCTION is_domain_claimed_by_other_client(VARCHAR) TO blackink_system",
+    "ALTER FUNCTION is_domain_claimed_by_other_client(VARCHAR) OWNER TO CURRENT_USER",
 ]
 
 

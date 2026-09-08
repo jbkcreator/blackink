@@ -67,6 +67,12 @@ DOMAIN = "e2eacme-outreach.com"
 MAILBOX = "sales1@e2eacme-outreach.com"
 SIGNING_KEY = os.environ["MAILGUN_WEBHOOK_SIGNING_KEY"]
 
+# A SECOND client that has claimed a PM-book domain — used to prove the
+# cross-tenant non-poach gate: a lead to CLIENT_ID from POACHED_DOMAIN (owned by
+# CLIENT_B) must be suppressed even though RLS hides B's company from A.
+CLIENT_B_ID = "E2E_STL_CLIENT_B"
+POACHED_DOMAIN = "e2e-poached-owner.com"
+
 
 # ── Tiny assertion harness ───────────────────────────────────────────────────
 class Results:
@@ -104,7 +110,8 @@ def cleanup() -> None:
     _owner_exec("DELETE FROM events WHERE client_id = :c", c=CLIENT_ID)
     _owner_exec("DELETE FROM mailboxes WHERE client_id = :c", c=CLIENT_ID)
     _owner_exec("DELETE FROM sending_domains WHERE client_id = :c", c=CLIENT_ID)
-    _owner_exec("DELETE FROM clients WHERE client_id = :c", c=CLIENT_ID)
+    _owner_exec("DELETE FROM client_pm_books WHERE client_id = :c", c=CLIENT_B_ID)
+    _owner_exec("DELETE FROM clients WHERE client_id IN (:a, :b)", a=CLIENT_ID, b=CLIENT_B_ID)
 
 
 def seed() -> None:
@@ -129,6 +136,17 @@ def seed() -> None:
         "VALUES ((SELECT id FROM sending_domains WHERE domain = :d), "
         " :m, :c, 'warmed', 'active')",
         d=DOMAIN, m=MAILBOX, c=CLIENT_ID,
+    )
+    # Second client that has claimed POACHED_DOMAIN in its PM book.
+    _owner_exec(
+        "INSERT INTO clients (client_id, display_name, is_active, plan_tier) "
+        "VALUES (:c, 'E2E STL Client B', TRUE, 'pilot')",
+        c=CLIENT_B_ID,
+    )
+    _owner_exec(
+        "INSERT INTO client_pm_books (client_id, owner_domain, owner_email, synced_at) "
+        "VALUES (:c, :d, :e, NOW())",
+        c=CLIENT_B_ID, d=POACHED_DOMAIN, e=f"owner@{POACHED_DOMAIN}",
     )
 
 
@@ -217,6 +235,21 @@ def main() -> int:
         "client_secret": "wrong-secret", "email": "x@y.com", "source": "WEBSITE_FORM",
     })
     R.check("401 on bad client_secret", resp.status_code == 401, f"got {resp.status_code}")
+
+    # ── Cross-tenant non-poach: domain owned by CLIENT_B must be suppressed ────
+    print("\n[non-poach] cross-tenant suppression")
+    resp = client.post("/api/v1/webhooks/inbound-lead", json={
+        "client_secret": SECRET,  # to CLIENT_ID (A)
+        "email": f"prospect@{POACHED_DOMAIN}",  # domain claimed by CLIENT_B
+        "inquiry_text": "interested", "source": "WEBSITE_FORM",
+        "external_id": "e2e-poach-1",
+    })
+    R.check("poached-domain lead accepted (202)", resp.status_code == 202, f"got {resp.status_code}")
+    poached = [m for m in messages() if m.idempotency_key.endswith("e2e-poach-1")]
+    R.check("cross-tenant lead row SUPPRESSED (RLS-blind lookup would have missed it)",
+            len(poached) == 1 and poached[0].status == "SUPPRESSED",
+            f"rows={len(poached)} status={poached[0].status if poached else 'none'}")
+    R.check("non_poach_suppressed event logged", "non_poach_suppressed" in event_types())
 
     # ── Path A: dedupe on explicit external_id ────────────────────────────────
     print("\n[Path A] idempotency")

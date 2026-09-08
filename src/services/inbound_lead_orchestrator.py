@@ -99,23 +99,22 @@ def _run(session: Session, lead: InboundLead) -> PipelineResult:
         logger.info("[inbound] duplicate idempotency_key=%s client=%s — no-op", lead.idempotency_key, lead.client_id)
         return PipelineResult(message_id=str(existing), outcome="duplicate")
 
-    # ── 2. Non-poach gate (advisory) ──────────────────────────────────────
+    # ── 2. Non-poach gate ─────────────────────────────────────────────────
     #
     # An inbound speed-to-lead prospect is a renter/owner inquiring — NOT a
-    # PM-firm prospect — so nothing is written to companies/contacts here
-    # (those model outbound prospect firms and require domain + county_slug).
-    # The gate is advisory: it only looks up an EXISTING company by the
-    # sender's email domain and suppresses if that company is claimed by
-    # another client. No match → proceed. contact_id stays NULL.
-    company_id = _resolve_existing_company_id(session, lead)
-    if company_id and _check_non_poach(session, company_id):
+    # PM-firm prospect — so nothing is written to companies/contacts here.
+    # Suppress if the sender's email domain is claimed by ANOTHER client's PM
+    # book. This MUST go through the domain SECURITY DEFINER predicate: a plain
+    # SELECT on companies runs under this tenant's RLS and would hide exactly
+    # the other-client company we need to detect, silently defeating non-poach.
+    if _is_domain_claimed_by_other_client(session, lead):
         message_id = _write_message(session, lead, status="SUPPRESSED", send_at=None)
         log_event(
             lead.client_id,
             "non_poach_suppressed",
             entity_type="inbound_message",
             entity_id=message_id,
-            payload={"message_id": message_id, "source_channel": lead.source_channel, "company_id": company_id},
+            payload={"message_id": message_id, "source_channel": lead.source_channel},
             session=session,
         )
         return PipelineResult(message_id=message_id, outcome="suppressed")
@@ -151,33 +150,28 @@ def _run(session: Session, lead: InboundLead) -> PipelineResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def _resolve_existing_company_id(session: Session, lead: InboundLead) -> Optional[str]:
-    """Advisory non-poach lookup: does an EXISTING companies row match the
-    sender's email domain? Returns its company_id, else None. Never creates a
-    company — inbound leads are not PM-firm prospects. `companies.domain` is
-    UNIQUE, so at most one row matches."""
+def _is_domain_claimed_by_other_client(session: Session, lead: InboundLead) -> bool:
+    """True if the sender's email domain is claimed by ANOTHER client's PM book.
+
+    Goes through the is_domain_claimed_by_other_client SECURITY DEFINER function
+    (apply_inbound_messages_lead_fields.py): it bypasses RLS to see other
+    tenants' claims — a plain companies SELECT under this tenant's RLS would hide
+    exactly the row that must trigger suppression — while deriving the requesting
+    client from session context and returning only a boolean (no identity leak).
+    Fails closed (True/suppress) on error, since a non-poach breach is worse than
+    a missed auto-response."""
     if not lead.email or "@" not in lead.email:
-        return None
+        return False
     domain = lead.email.split("@", 1)[1].lower().strip()
-    row = session.execute(
-        text("SELECT company_id FROM companies WHERE domain = :domain LIMIT 1"),
-        {"domain": domain},
-    ).scalar()
-    return str(row) if row else None
-
-
-def _check_non_poach(session: Session, company_id: str) -> bool:
-    """Returns True if another client has claimed this company. Reads the
-    session's own app.current_client_id — same approach as compliance_gate.py."""
     try:
         claimed = session.execute(
-            text("SELECT is_claimed_by_other_client(:company_id) AS claimed"),
-            {"company_id": company_id},
+            text("SELECT is_domain_claimed_by_other_client(:domain) AS claimed"),
+            {"domain": domain},
         ).scalar()
         return bool(claimed)
     except Exception:
-        logger.exception("[inbound] non-poach check failed for company_id=%s — skipping gate", company_id)
-        return False
+        logger.exception("[inbound] non-poach domain check failed for %s — suppressing (fail closed)", domain)
+        return True
 
 
 def _write_message(
