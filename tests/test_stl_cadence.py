@@ -118,7 +118,8 @@ def test_arm_check_arms_and_enqueues_5_touches():
 
 def test_touch_still_ready_returns_true_for_armed():
     from src.services import stl_cadence
-    order = _fake_order()
+    # touch_step=1 has no prior step, so ordering check is skipped
+    order = _fake_order(payload={"message_id": "100", "touch_step": 1})
     msg = _msg_row(cadence_state="ARMED")
 
     with patch("src.services.stl_cadence.get_db_context") as ctx, \
@@ -131,6 +132,84 @@ def test_touch_still_ready_returns_true_for_armed():
         result = stl_cadence.stl_cadence_touch_still_ready(order)
 
     assert result is True
+
+
+def test_touch_still_ready_holds_when_prior_not_sent():
+    """Issue 2 fix: touch N must not post its card if touch N-1 is unsent."""
+    from src.services import stl_cadence
+    order = _fake_order(payload={"message_id": "100", "touch_step": 2})
+    msg = _msg_row(cadence_state="ARMED")
+
+    call_count = [0]
+
+    def _execute(q, params=None):
+        call_count[0] += 1
+        result = MagicMock()
+        if call_count[0] == 1:
+            result.fetchone.return_value = msg       # message row
+        else:
+            result.fetchone.return_value = None      # prior dispatch: not found
+        return result
+
+    with patch("src.services.stl_cadence.get_db_context") as ctx, \
+         patch.object(stl_cadence.wo, "record_decision") as mock_decision:
+        sess = MagicMock()
+        sess.execute.side_effect = _execute
+        ctx.return_value.__enter__ = lambda s: sess
+        ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = stl_cadence.stl_cadence_touch_still_ready(order)
+
+    assert result is False
+    # Must NOT mark SKIPPED — order stays QUEUED for re-evaluation next sweep
+    mock_decision.assert_not_called()
+
+
+def test_touch_still_ready_allows_when_prior_sent():
+    """Issue 2 fix: touch N is ready once touch N-1 shows status SENT."""
+    from src.services import stl_cadence
+    order = _fake_order(payload={"message_id": "100", "touch_step": 2})
+    msg = _msg_row(cadence_state="ARMED")
+    prior_row = MagicMock()
+    prior_row.status = "SENT"
+
+    call_count = [0]
+
+    def _execute(q, params=None):
+        call_count[0] += 1
+        result = MagicMock()
+        if call_count[0] == 1:
+            result.fetchone.return_value = msg
+        else:
+            result.fetchone.return_value = prior_row
+        return result
+
+    with patch("src.services.stl_cadence.get_db_context") as ctx, \
+         patch.object(stl_cadence.wo, "record_decision"):
+        sess = MagicMock()
+        sess.execute.side_effect = _execute
+        ctx.return_value.__enter__ = lambda s: sess
+        ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = stl_cadence.stl_cadence_touch_still_ready(order)
+
+    assert result is True
+
+
+def test_stop_active_stl_cadences_stops_pre_arm_rows():
+    """Issue 1 fix: stop must also latch NULL-state (pre-arm) rows."""
+    from src.services import stl_cadence
+    session = MagicMock()
+    session.execute.return_value.fetchall.return_value = [(100,)]
+
+    with patch("src.services.stl_cadence._cancel_queued_touch_orders"), \
+         patch("src.services.stl_cadence.log_event"):
+        count = stl_cadence.stop_active_stl_cadences(session, "client_a", "lead@example.com", "OPT_OUT")
+
+    assert count == 1
+    sql = session.execute.call_args.args[0].text
+    # The WHERE clause must allow NULL cadence_state, not just ARMED
+    assert "cadence_state IS NULL" in sql
 
 
 def test_touch_still_ready_returns_false_and_skips_for_stopped():

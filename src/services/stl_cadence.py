@@ -362,13 +362,22 @@ def stop_active_stl_cadences(
       - booking_ingest after CLIENT_OWNER_BOOKING confirmed (BOOKED)
       - inbound_ingest (reply via Mailgun, if Reply-To is configured) (REPLY)
 
-    Returns count of rows latched. No-op if no matching ARMED rows.
+    Returns count of rows latched. No-op if no matching rows.
+    Matches both ARMED cadences AND NULL-state (pre-arm) rows so that a
+    reply/booking/unsubscribe during the 24h window before arm_check fires
+    still prevents the cadence from arming.
     Runs on the caller's session (RLS app session from unsubscribe_router, or
     the BYPASSRLS system session from inbound_ingest/booking_ingest); either
     way the WHERE client_id = :cid guard scopes the batch to this client.
     Does NOT commit — the caller owns the surrounding transaction."""
     if not email:
         return 0
+    # Also match NULL cadence_state (pre-arm leads): a reply, booking, or
+    # unsubscribe during the 24h window before arm_check fires must still
+    # prevent arming. The arm_check event-ledger fallback (step 2) catches
+    # events logged against the same message entity_id, but booking/reply
+    # events are logged against their own IDs — so the latch here is the
+    # authoritative stop for pre-arm engagement too.
     rows = session.execute(
         text(
             "UPDATE inbound_messages "
@@ -377,7 +386,7 @@ def stop_active_stl_cadences(
             "    cadence_stop_reason = :reason "
             "WHERE client_id = :client_id "
             "  AND lower(sender_email) = lower(:email) "
-            "  AND cadence_state = 'ARMED' "
+            "  AND (cadence_state = 'ARMED' OR cadence_state IS NULL) "
             "RETURNING id"
         ),
         {"client_id": client_id, "email": email, "reason": reason},
@@ -400,11 +409,14 @@ def stop_active_stl_cadences(
 def stl_cadence_touch_still_ready(order) -> bool:
     """Pre-card gate check in sequence_sweep — mirrors _winback_touch_still_ready.
 
-    Returns False (and marks the order SKIPPED) if the lead's cadence has been
-    stopped since the touch was enqueued. Prevents a stale approval card sitting
-    in #blackink-setter after the prospect has already replied or opted out."""
+    Returns False (and marks the order SKIPPED) if:
+    - the cadence has been stopped, OR
+    - the previous touch (step N-1) has not been sent yet (ordering enforcement:
+      prevents multiple approval cards from being actioned in the same sweep run
+      and dispatching out of order or back-to-back without the intended daily gap).
+    """
     message_id = int(order.payload.get("message_id", order.entity_id))
-    touch_step = order.payload.get("touch_step", "?")
+    touch_step = int(order.payload.get("touch_step", 0))
 
     try:
         with get_db_context(client_id=order.client_id) as session:
@@ -412,22 +424,43 @@ def stl_cadence_touch_still_ready(order) -> bool:
                 text("SELECT cadence_state FROM inbound_messages WHERE id = :id"),
                 {"id": message_id},
             ).fetchone()
+            if row is None:
+                logger.error("[stl_cadence] gate_check: message_id=%s not found — skipping touch %s", message_id, touch_step)
+                wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="stl_cadence:not_found")
+                return False
+
+            if row.cadence_state == "STOPPED":
+                logger.info(
+                    "[stl_cadence] gate_check: touch %s SKIPPED — cadence STOPPED for message_id=%s",
+                    touch_step, message_id,
+                )
+                wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="stl_cadence:gate_stopped")
+                return False
+
+            # Ordering gate: touch N may only post its card once touch N-1 is
+            # confirmed sent. Without this, a delayed approval for step 1 and
+            # the day-2 card can both become APPROVED in the same sweep run,
+            # sending two emails minutes apart and potentially out of order.
+            if touch_step > 1:
+                prior = session.execute(
+                    text(
+                        "SELECT status FROM stl_cadence_dispatches "
+                        "WHERE message_id = :mid AND touch_step = :prior_step"
+                    ),
+                    {"mid": message_id, "prior_step": touch_step - 1},
+                ).fetchone()
+                prior_sent = prior is not None and prior.status in ("SENT", "SENT_UNCONFIRMED")
+                if not prior_sent:
+                    logger.info(
+                        "[stl_cadence] gate_check: touch %s HELD — prior touch %s not yet sent for message_id=%s",
+                        touch_step, touch_step - 1, message_id,
+                    )
+                    # Do NOT mark SKIPPED — leave QUEUED so the sweep re-evaluates
+                    # next run once the prior touch clears.
+                    return False
     except Exception:
         logger.exception("[stl_cadence] gate_check: DB error for message_id=%s — skipping", message_id)
         wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="stl_cadence:gate_error")
-        return False
-
-    if row is None:
-        logger.error("[stl_cadence] gate_check: message_id=%s not found — skipping touch %s", message_id, touch_step)
-        wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="stl_cadence:not_found")
-        return False
-
-    if row.cadence_state == "STOPPED":
-        logger.info(
-            "[stl_cadence] gate_check: touch %s SKIPPED — cadence STOPPED for message_id=%s",
-            touch_step, message_id,
-        )
-        wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="stl_cadence:gate_stopped")
         return False
 
     return True
