@@ -87,9 +87,10 @@ def main() -> int:
 		cols = db.execute(
 			text(
 				"SELECT column_name FROM information_schema.columns "
-				"WHERE table_name = 'winback_rows' AND ("
-				"  column_name LIKE 'enrichment%' "
-				"  OR column_name IN ('email_status', 'email_previous', 'phone_verified')"
+				"WHERE table_name = 'winback_rows' AND column_name IN ("
+				"  'email_status', 'email_previous', 'phone_verified', "
+				"  'requires_enrichment_review', 'enrichment_provider', "
+				"  'enrichment_timestamp', 'enrichment_attempts'"
 				") ORDER BY ordinal_position"
 			)
 		).fetchall()
