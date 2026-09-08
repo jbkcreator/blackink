@@ -78,6 +78,9 @@ _SETTLEMENT_INSTALLMENT_2_SWEEP_INTERVAL_SECONDS = 3600
 # Task 4.2.1 — 30-second tick keeps SLA response latency well under 30 min
 _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS = 30
 _RESPOND_SLA_SWEEP_INTERVAL_SECONDS = 60
+# Task 4.2.2 — sequence_sweep surfaces due STL cadence arm-checks (auto) and
+# touch approval cards (human-gated). Day-grain touches tolerate 5-min ticks.
+_SEQUENCE_SWEEP_INTERVAL_SECONDS = 300
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -105,6 +108,7 @@ def _start_background_workers() -> None:
 	)
 	from src.tasks.speed_to_lead_sweep import run_sweep as speed_to_lead_sweep
 	from src.tasks.respond_sla_sweep import run_sweep as respond_sla_sweep
+	from src.tasks.sequence_sweep import run_sweep as sequence_sweep
 	from src.agents.respond.worker import Worker as RespondWorker
 
 	workers = [
@@ -125,6 +129,8 @@ def _start_background_workers() -> None:
 		# Task 4.2.1 — SLA sweep dispatches deferred Speed-to-Lead auto-responses.
 		("speed_to_lead_sweep.run_sweep", _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS, speed_to_lead_sweep),
 		("respond_sla_sweep.run_sweep", _RESPOND_SLA_SWEEP_INTERVAL_SECONDS, respond_sla_sweep),
+		# Task 4.2.2 — surfaces STL cadence arm-checks + touch approval cards.
+		("sequence_sweep.run_sweep", _SEQUENCE_SWEEP_INTERVAL_SECONDS, sequence_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)

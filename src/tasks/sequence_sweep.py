@@ -48,15 +48,20 @@ _ACTION_CHANNEL = {
     "DISPATCH_EMAIL_TOUCH": "setter",
     "DIAL_TASK": "dial",
     "LINKEDIN_TASK": "setter",
-    "DISPATCH_WINBACK_TOUCH": "setter",   # Subtask 3.1.2
+    "DISPATCH_WINBACK_TOUCH": "setter",       # Subtask 3.1.2
+    "DISPATCH_STL_CADENCE_TOUCH": "setter",   # Task 4.2.2
 }
 
 _WINBACK_ACTION = "DISPATCH_WINBACK_TOUCH"
+_STL_ARM_ACTION = "STL_CADENCE_ARM"
+_STL_TOUCH_ACTION = "DISPATCH_STL_CADENCE_TOUCH"
 
 # Action classes the sweep actually surfaces. DIAL_TASK is excluded on purpose
 # (event-driven on Touch 1 approval, ADR 0001) — it is in _ACTION_CHANNEL only
 # for channel resolution, never swept.
-_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION)
+# STL_CADENCE_ARM is auto-executed (no card) — listed separately in _ARM_ACTIONS.
+_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION, _STL_TOUCH_ACTION)
+_ARM_ACTIONS = (_STL_ARM_ACTION,)
 
 
 async def _post_due_card(order, channel_key: str) -> bool:
@@ -237,6 +242,21 @@ def _winback_touch_still_ready(order) -> bool:
     return True
 
 
+def _run_arm_orders(arm_orders: list) -> int:
+    """Auto-execute STL_CADENCE_ARM orders — no Slack card, no human approval.
+    These are system-internal: check stop state at +24h then enqueue 5 touches."""
+    from src.services.stl_cadence import run_arm_check
+
+    executed = 0
+    for order in arm_orders:
+        try:
+            run_arm_check(order)
+            executed += 1
+        except Exception:
+            logger.exception("sequence_sweep: STL arm_check failed action_id=%s entity=%s", order.action_id, order.entity_id)
+    return executed
+
+
 def run_sweep(client_id=None, limit: int = 100) -> int:
     """Fetch due QUEUED orders and post their approval cards. Returns cards posted.
 
@@ -244,9 +264,16 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
     touch (2) is NOT swept — it is posted event-driven on Touch 1 approval
     (docs/adr/0001-non-email-touch-posting-model.md)."""
     batch = wo.due_batch(client_id=client_id, limit=limit)
+
+    # STL_CADENCE_ARM orders are system actions — auto-execute, no card.
+    arm_orders = [o for o in batch if o.action_class in _ARM_ACTIONS]
+    if arm_orders:
+        executed = _run_arm_orders(arm_orders)
+        logger.info("sequence_sweep: %d STL arm-check(s) executed", executed)
+
     # DIAL_TASK is deliberately NOT swept — it is posted event-driven on Touch 1
-    # approval (docs/adr/0001-non-email-touch-posting-model.md); only email and
-    # LinkedIn touches surface here.
+    # approval (docs/adr/0001-non-email-touch-posting-model.md); only email,
+    # LinkedIn, winback, and STL cadence touches surface here.
     touch_orders = [o for o in batch if o.action_class in _SWEPT_ACTIONS]
 
     if not touch_orders:
@@ -264,6 +291,10 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
             # blocked when someone later clicks Approve. Skip posting and
             # mark the order terminal so due_batch never re-selects it.
             continue
+        if order.action_class == _STL_TOUCH_ACTION:
+            from src.services.stl_cadence import stl_cadence_touch_still_ready
+            if not stl_cadence_touch_still_ready(order):
+                continue
         # LINKEDIN_TASK is posted through its own poster, which re-checks the
         # per-touch compliance gate before showing the card and logs a
         # touch_skipped_compliance / linkedin_task_created event (v2 §3.1.2).
