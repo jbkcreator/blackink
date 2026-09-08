@@ -10,8 +10,10 @@ Payload (JSON): {
   inquiry_text, source (WEBSITE_FORM|LISTING_PORTAL), utm?
 }
 422 if neither email nor phone present.
-Processing budget: 2s (FastAPI background task pattern used so the HTTP
-response returns immediately; the pipeline runs async-safe).
+The lead is persisted synchronously BEFORE the 202 is returned — a caller
+that gets a 202 is guaranteed the lead is durably stored (or a duplicate of
+one already stored). Persistence failure returns a retryable 503 so the
+source can retry, rather than acking a lead that was silently lost.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import hmac
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, model_validator
 from sqlalchemy import text
 
@@ -85,10 +87,7 @@ def _fallback_dedupe_key(client_id: str, payload: "InboundLeadPayload") -> str:
 
 
 @router.post("/inbound-lead", status_code=202)
-def receive_inbound_lead(
-    payload: InboundLeadPayload,
-    background_tasks: BackgroundTasks,
-) -> dict:
+def receive_inbound_lead(payload: InboundLeadPayload) -> dict:
     client_id = _resolve_client_id(payload.client_secret)
     if not client_id:
         raise HTTPException(status_code=401, detail="invalid client_secret")
@@ -116,13 +115,13 @@ def receive_inbound_lead(
         body_html=None,
         utm=payload.utm,
     )
-    background_tasks.add_task(_dispatch, lead)
-    return {"accepted": True, "dedupe_key": idempotency_key}
-
-
-def _dispatch(lead: InboundLead) -> None:
+    # Persist synchronously BEFORE acking — a 202 means the lead is durably
+    # stored. A failure returns a retryable 503 rather than losing the lead.
     try:
         result = run_inbound_pipeline(lead)
-        logger.info("[inbound-webhook] outcome=%s message_id=%s", result.outcome, result.message_id)
     except Exception:
-        logger.exception("[inbound-webhook] pipeline failed for client=%s", lead.client_id)
+        logger.exception("[inbound-webhook] persistence failed for client=%s", client_id)
+        raise HTTPException(status_code=503, detail="temporarily unable to accept lead; retry")
+
+    logger.info("[inbound-webhook] outcome=%s message_id=%s", result.outcome, result.message_id)
+    return {"accepted": True, "dedupe_key": idempotency_key, "outcome": result.outcome}

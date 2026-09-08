@@ -42,18 +42,44 @@ class BookingLink:
 	prefilled: bool
 
 
-def resolve_booking_link(session: Session, *, name: Optional[str] = None, email: Optional[str] = None) -> Optional[BookingLink]:
-	"""Returns None (never a broken/fabricated redirect) if no connection
-	is flagged default, if it has no public_booking_url, if the URL isn't
+def resolve_booking_link(
+	session: Session,
+	*,
+	name: Optional[str] = None,
+	email: Optional[str] = None,
+	scope: str = "INTERNAL_SALES_DEMO",
+) -> Optional[BookingLink]:
+	"""Returns None (never a broken/fabricated redirect) if no suitable
+	connection exists, if it has no public_booking_url, if the URL isn't
 	https, or if its host isn't in settings.booking_redirect_allowed_hosts.
-	Callers must handle None with a 'we'll follow up by email' fallback."""
-	row = session.execute(
-		text(
-			"SELECT provider, public_booking_url FROM calendar_connections "
-			"WHERE connection_scope = 'INTERNAL_SALES_DEMO' AND is_default_sales_booking = TRUE "
-			"AND status = 'ACTIVE' LIMIT 1"
-		)
-	).first()
+	Callers must handle None with a 'we'll follow up by email' fallback.
+
+	`scope` selects which calendar the link points at:
+	  - INTERNAL_SALES_DEMO (default): a Blackink sales rep's demo calendar,
+	    keyed off the is_default_sales_booking flag.
+	  - CLIENT_OWNER_BOOKING: the receiving client's own owner-booking
+	    calendar — what a Speed-to-Lead auto-response to an inquiring owner
+	    must point at. The session is already tenant-scoped, so this only ever
+	    sees the current client's connections; pick the default-flagged one if
+	    any, else the oldest active connection that has a public booking URL."""
+	if scope == "INTERNAL_SALES_DEMO":
+		row = session.execute(
+			text(
+				"SELECT provider, public_booking_url FROM calendar_connections "
+				"WHERE connection_scope = 'INTERNAL_SALES_DEMO' AND is_default_sales_booking = TRUE "
+				"AND status = 'ACTIVE' LIMIT 1"
+			)
+		).first()
+	else:
+		row = session.execute(
+			text(
+				"SELECT provider, public_booking_url FROM calendar_connections "
+				"WHERE connection_scope = :scope AND status = 'ACTIVE' "
+				"AND public_booking_url IS NOT NULL "
+				"ORDER BY is_default_sales_booking DESC NULLS LAST, connection_id ASC LIMIT 1"
+			),
+			{"scope": scope},
+		).first()
 	if row is None or not row.public_booking_url:
 		return None
 

@@ -43,6 +43,7 @@ class EmailSender(Protocol):
         subject: str,
         body: str,
         sending_domain: str,
+        html_body: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         attachments: Optional[list[Attachment]] = None,
     ) -> SendResult: ...
@@ -59,6 +60,7 @@ class StubEmailSender:
         subject: str,
         body: str,
         sending_domain: str,
+        html_body: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         attachments: Optional[list[Attachment]] = None,
     ) -> SendResult:
@@ -109,6 +111,7 @@ class SmtpEmailSender:
         subject: str,
         body: str,
         sending_domain: str,
+        html_body: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         attachments: Optional[list[Attachment]] = None,
     ) -> SendResult:
@@ -129,6 +132,11 @@ class SmtpEmailSender:
         if self._bcc:
             rcpts.append(self._bcc)
         msg.set_content(body)
+        if html_body:
+            # multipart/alternative — text/plain fallback + text/html for
+            # clients that render it. Without this the HTML is delivered as
+            # literal <p>/<a> markup in a text/plain body.
+            msg.add_alternative(html_body, subtype="html")
         for filename, content, mime in (attachments or []):
             maintype, _, subtype = mime.partition("/")
             msg.add_attachment(content, maintype=maintype, subtype=subtype or "octet-stream", filename=filename)

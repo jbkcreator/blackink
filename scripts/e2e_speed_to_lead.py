@@ -137,7 +137,7 @@ def messages():
     return _owner_query(
         "SELECT id, status, channel, source_channel, sender_email, "
         " sender_name, sender_phone, send_at, lead_sla_due_at, idempotency_key, "
-        " destination_address, ack_latency_seconds "
+        " destination_address, ack_latency_seconds, mailbox_id, responded_at "
         "FROM inbound_messages WHERE client_id = :c ORDER BY received_at",
         c=CLIENT_ID,
     )
@@ -294,6 +294,11 @@ def main() -> int:
     R.check("rows flipped to RESPONDED", len(responded) == len(received_before),
             f"{len(responded)} RESPONDED")
     R.check("ack_latency_seconds recorded", all(m.ack_latency_seconds is not None for m in responded))
+    # #4: sends that actually emailed must record the mailbox for capacity counting.
+    emailed = [m for m in responded if m.sender_email]
+    R.check("responded sends record mailbox_id + responded_at (capacity accounting)",
+            all(m.mailbox_id is not None and m.responded_at is not None for m in emailed),
+            f"emailed={len(emailed)}")
     R.check("speed_to_lead_response_sent event logged", "speed_to_lead_response_sent" in event_types())
 
     # ── Report ────────────────────────────────────────────────────────────────

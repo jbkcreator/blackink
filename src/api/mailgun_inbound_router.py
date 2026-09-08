@@ -128,9 +128,11 @@ async def mailgun_inbound(request: Request) -> dict:
         result = run_inbound_pipeline(lead)
         logger.info("[mailgun] outcome=%s message_id=%s", result.outcome, result.message_id)
     except Exception:
-        logger.exception("[mailgun] pipeline failed for client=%s", client_id)
-        # Return 200 to Mailgun — non-200 triggers retry, which could storm
-        # on a persistent error. Log and accept; alert via Slack.
-        return {"ok": False, "detail": "pipeline error"}
+        logger.exception("[mailgun] persistence failed for client=%s", client_id)
+        # Return a retryable 500 so Mailgun re-delivers rather than dropping
+        # the lead. Mailgun backs off over hours then stops, so a persistent
+        # error self-limits instead of storming. Signature/slug rejections
+        # above stay 406 (not retryable — those will never succeed).
+        raise HTTPException(status_code=500, detail="temporarily unable to persist lead; retry")
 
     return {"ok": True, "outcome": result.outcome}

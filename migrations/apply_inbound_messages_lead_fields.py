@@ -84,20 +84,28 @@ DDL = [
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS property_address TEXT",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS sender_phone VARCHAR(40)",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS utm JSONB",
-    # Widen the status CHECK to include Dev 4's RECEIVED/RESPONDED (additive —
-    # never removes a Dev 2 value). Drop-and-recreate so re-running is safe.
+    # Which mailbox sent the auto-response + when — so the mailbox picker can
+    # count Speed-to-Lead sends against the per-mailbox rolling-24h cap.
+    "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS mailbox_id BIGINT",
+    "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS responded_at TIMESTAMPTZ",
+    # Widen the status CHECK to include Dev 4's RECEIVED/SENDING/RESPONDED
+    # (additive — never removes a Dev 2 value). SENDING is the sweep's own
+    # in-progress sentinel, distinct from Dev 2's DEFERRED (LATER intent).
+    # Drop-and-recreate so re-running is safe.
     "ALTER TABLE inbound_messages DROP CONSTRAINT IF EXISTS ck_inbound_messages_status",
     """
     ALTER TABLE inbound_messages ADD CONSTRAINT ck_inbound_messages_status CHECK (
         status IN (
             'PENDING','PROCESSING','CLASSIFIED','FAILED','SUPPRESSED','ESCALATED',
             'DEFERRED','ROUTED','REALLOCATED',
-            'RECEIVED','RESPONDED'
+            'RECEIVED','SENDING','RESPONDED'
         )
     )
     """,
     # Dev 4 sweep claim index: due, unresponded leads.
     "CREATE INDEX IF NOT EXISTS ix_inbound_messages_lead_due ON inbound_messages (send_at) WHERE status = 'RECEIVED'",
+    # Capacity count: responses sent per mailbox in the rolling 24h window.
+    "CREATE INDEX IF NOT EXISTS ix_inbound_messages_mailbox_responded ON inbound_messages (mailbox_id, responded_at) WHERE mailbox_id IS NOT NULL",
     # Grants (idempotent) — needed on a fresh local DB; no-op re-grant on server.
     "GRANT SELECT, INSERT, UPDATE ON inbound_messages TO blackink_app",
     "GRANT SELECT, INSERT, UPDATE ON inbound_messages TO blackink_system",

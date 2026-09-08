@@ -40,20 +40,31 @@ def run_sweep(limit: int = _BATCH) -> int:
             _send_response(row)
             dispatched += 1
         except Exception:
-            logger.exception("[stl-sweep] failed for message_id=%s", row.message_id)
+            # Reset the claim so the row is retried on a later tick instead of
+            # being stranded in SENDING forever. Idempotency is preserved by
+            # _mark_responded only running after a successful send.
+            logger.exception("[stl-sweep] failed for id=%s — resetting to RECEIVED", row.id)
+            _reset_to_received(row.id)
     logger.info("[stl-sweep] dispatched %d response(s)", dispatched)
     return dispatched
 
 
 def _claim_due(session: Session, limit: int):
-    """Atomic claim: flip status to DEFERRED (in-progress sentinel) while
-    fetching; prevents concurrent sweep ticks from double-sending."""
+    """Atomic claim: flip status RECEIVED→SENDING while fetching, so concurrent
+    ticks never double-send (FOR UPDATE SKIP LOCKED). SENDING is the sweep's
+    own in-progress sentinel, distinct from Dev 2's DEFERRED.
+
+    Durable recovery: also reclaims rows stuck in SENDING whose send_at is more
+    than 15 minutes past — a process crash between claim and mark would
+    otherwise strand them. 15 min is well beyond a normal send, so a legitimate
+    in-flight row is never stolen."""
     rows = session.execute(
         text(
-            "UPDATE inbound_messages SET status = 'DEFERRED' "
+            "UPDATE inbound_messages SET status = 'SENDING' "
             "WHERE id IN ("
             "  SELECT id FROM inbound_messages "
-            "  WHERE status = 'RECEIVED' AND send_at <= NOW() "
+            "  WHERE (status = 'RECEIVED' AND send_at <= NOW()) "
+            "     OR (status = 'SENDING' AND send_at <= NOW() - INTERVAL '15 minutes') "
             "  ORDER BY send_at ASC LIMIT :limit "
             "  FOR UPDATE SKIP LOCKED"
             ") "
@@ -66,6 +77,20 @@ def _claim_due(session: Session, limit: int):
     return rows
 
 
+def _reset_to_received(message_id) -> None:
+    """Reset a failed/stranded claim back to RECEIVED for retry."""
+    try:
+        with get_system_db_context() as session:
+            session.execute(
+                text("UPDATE inbound_messages SET status = 'RECEIVED' "
+                     "WHERE id = :id AND status = 'SENDING'"),
+                {"id": message_id},
+            )
+            session.commit()
+    except Exception:
+        logger.exception("[stl-sweep] failed to reset id=%s to RECEIVED", message_id)
+
+
 def _send_response(row) -> None:
     client_id = row.client_id
     message_id = str(row.id)
@@ -75,12 +100,15 @@ def _send_response(row) -> None:
 
     with get_db_context(client_id=client_id) as session:
         if not prospect_email:
-            logger.warning("[stl-sweep] no prospect email for message_id=%s — marking RESPONDED", message_id)
-            _mark_responded(session, message_id, ack_latency=None)
+            logger.warning("[stl-sweep] no prospect email for id=%s — marking RESPONDED (no send)", message_id)
+            _mark_responded(session, message_id, ack_latency=None, mailbox_id=None)
             return
 
-        # Resolve booking link (best-effort; None → omit from email)
-        booking = resolve_booking_link(session, name=prospect_name, email=prospect_email)
+        # Booking link points at the RECEIVING CLIENT's own owner-booking
+        # calendar (CLIENT_OWNER_BOOKING), not an internal sales-demo calendar.
+        booking = resolve_booking_link(
+            session, name=prospect_name, email=prospect_email, scope="CLIENT_OWNER_BOOKING"
+        )
         booking_url = booking.url if booking else None
 
         # Resolve per-client template
@@ -100,11 +128,12 @@ def _send_response(row) -> None:
             html_body = html_body.replace("{{booking_link}}", f'<a href="{booking_url}">Schedule a call</a>')
         else:
             html_body = html_body.replace("{{booking_link}}", "We'll be in touch shortly to schedule a call.")
+        text_body = _html_to_text(html_body)
 
         try:
             mailbox = get_active_mailbox_for_client(session, client_id)
         except (NoMailboxAvailable, AllMailboxesCapped) as exc:
-            logger.error("[stl-sweep] no mailbox for client=%s message=%s: %s", client_id, message_id, exc)
+            logger.error("[stl-sweep] no mailbox for client=%s id=%s: %s", client_id, message_id, exc)
             # Re-flip to RECEIVED so the next sweep tick retries
             session.execute(
                 text("UPDATE inbound_messages SET status = 'RECEIVED' WHERE id = :id"),
@@ -118,7 +147,8 @@ def _send_response(row) -> None:
             from_address=mailbox.mailbox_address,
             to_address=prospect_email,
             subject=subject,
-            body=html_body,
+            body=text_body,          # text/plain part
+            html_body=html_body,     # text/html alternative
             sending_domain=mailbox.sending_domain,
         )
 
@@ -138,18 +168,34 @@ def _send_response(row) -> None:
             payload={"message_id": message_id, "ack_latency_seconds": ack_latency},
             session=session,
         )
-        _mark_responded(session, message_id, ack_latency)
+        # Record the sending mailbox + timestamp so the mailbox picker counts
+        # this send against that mailbox's rolling-24h cap.
+        _mark_responded(session, message_id, ack_latency, mailbox_id=mailbox.mailbox_id)
 
 
-def _mark_responded(session: Session, message_id: str, ack_latency: Optional[float]) -> None:
+def _mark_responded(
+    session: Session, message_id: str, ack_latency: Optional[float], mailbox_id: Optional[int]
+) -> None:
     session.execute(
         text(
             "UPDATE inbound_messages SET status = 'RESPONDED', "
-            "ack_latency_seconds = :ack WHERE id = :id"
+            "ack_latency_seconds = :ack, mailbox_id = :mb, responded_at = NOW() "
+            "WHERE id = :id"
         ),
-        {"ack": ack_latency, "id": message_id},
+        {"ack": ack_latency, "mb": mailbox_id, "id": message_id},
     )
     session.commit()
+
+
+def _html_to_text(html: str) -> str:
+    """Minimal HTML→text for the multipart/alternative plain part. Not a full
+    renderer — turns <br>/<p> into newlines and strips remaining tags."""
+    import re
+
+    t = re.sub(r"(?i)<br\s*/?>", "\n", html)
+    t = re.sub(r"(?i)</p\s*>", "\n\n", t)
+    t = re.sub(r"<[^>]+>", "", t)
+    return re.sub(r"\n{3,}", "\n\n", t).strip()
 
 
 def _default_template() -> str:
