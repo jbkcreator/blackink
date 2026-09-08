@@ -21,12 +21,23 @@ slack-bolt>=1.18
 # happened to be installed in developer environments. CI installs this file
 # and nothing else, so a clean box needs it declared explicitly.
 httpx>=0.27
+# Required by FastAPI to parse form-encoded POST bodies — the Mailgun inbound
+# webhook (src/api/inbound_email_router.py) posts application/x-www-form-urlencoded,
+# and fastapi.testclient exercises it (tests/test_inbound_email_router.py). Not a
+# transitive dep of anything already listed, so CI needs it declared explicitly.
+python-multipart>=0.0.6
 # aiohttp is required by slack_bolt's AsyncSocketModeHandler but is only
 # declared under slack_sdk's "optional" extra, not a hard dependency —
 # confirmed via `importlib.metadata.requires("slack_sdk")`. Without this
 # explicit line, `pip install -r requirements.txt` on a clean environment
 # installs slack-bolt fine but AsyncSocketModeHandler fails to import.
 aiohttp>=3.13
+# Required by FastAPI's UploadFile/Form handling (src/api/winback_router.py,
+# Subtask 3.1.1's CSV upload endpoint) — an optional extra FastAPI only
+# imports lazily at request-handling time, so it happened to already be
+# installed in developer environments and was never missed until a clean
+# CI box tried to even collect the test modules that import src.api.main.
+python-multipart>=0.0.9
 fakeredis>=2.0
 cryptography>=42.0
 icalendar>=5.0

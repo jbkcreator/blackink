@@ -158,6 +158,7 @@ class AppSettings(BaseSettings):
 	sales_replies_slack_channel: Optional[str] = Field(default=None, env="SALES_REPLIES_SLACK_CHANNEL")
 	dial_tasks_slack_channel: Optional[str] = Field(default=None, env="DIAL_TASKS_SLACK_CHANNEL")
 	blackink_economics_slack_channel: Optional[str] = Field(default=None, env="BLACKINK_ECONOMICS_SLACK_CHANNEL")
+	client_growth_slack_channel: Optional[str] = Field(default=None, env="CLIENT_GROWTH_SLACK_CHANNEL")
 	# Fail-closed workspace-wide approver allowlist — Slack user IDs,
 	# comma-separated (e.g. "U012ABC,U034DEF"). src.services.slack.auth.
 	# approver_authorized() treats an empty/unset list as "nobody
@@ -206,6 +207,12 @@ class AppSettings(BaseSettings):
 	# HMAC-SHA256 signing key for cryptographic resume tokens. Must be set
 	# before any halt can be issued or resumed. Recommended: 32+ bytes of entropy.
 	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
+
+	# ── Inbound email (3.1.3 reply bridge) ──────────────────────────────────
+	# Mailgun webhook signing key — used to verify HMAC-SHA256 signatures on
+	# inbound-email webhook POSTs (src/api/inbound_email_router.py). Without
+	# this the /webhooks/inbound-email endpoint rejects all requests.
+	mailgun_signing_key: Optional[SecretStr] = Field(default=None, env="MAILGUN_SIGNING_KEY")
 
 	# ── Internal admin API ───────────────────────────────────────────────────
 	# HS256 signing secret for admin JWT tokens (internal dashboard auth).
@@ -335,12 +342,28 @@ class AppSettings(BaseSettings):
 	# rationale as calendar_oauth_state_secret above: unrelated token
 	# families must be able to rotate independently.
 	no_show_token_secret: Optional[SecretStr] = Field(default=None, env="NO_SHOW_TOKEN_SECRET")
+	# Signs one-click email-unsubscribe tokens (src/services/email_unsubscribe.py).
+	# Deliberately its own secret, not a reuse of admin_jwt_secret — same
+	# rationale as calendar_oauth_state_secret above: a public-facing token
+	# must not share a signing key with an internal-admin-scoped one.
+	email_unsubscribe_secret: Optional[SecretStr] = Field(default=None, env="EMAIL_UNSUBSCRIBE_SECRET")
 	# ── Rent valuation adapter ───────────────────────────────────────────────
 	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
 	# False: no valuation vendor is under contract, so enabling this would
 	# point the adapter at a provider that does not exist. Flipped to True
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
+
+	# ── Respond Reply Triage Agent ───────────────────────────────────────────
+	# Fail-closed: if ANTHROPIC_API_KEY is unset the classifier returns the
+	# NURTURE fallback on every non-deterministic message rather than raising.
+	anthropic_api_key: Optional[SecretStr] = Field(default=None, env="ANTHROPIC_API_KEY")
+	# Shared secret the inbound parse service adds as X-Blackink-Inbound-Secret.
+	# Fail-closed: if unset every inbound POST returns 503.
+	inbound_parse_secret: Optional[SecretStr] = Field(default=None, env="INBOUND_PARSE_SECRET")
+	# Domain suffix used to construct per-client inbound addresses:
+	# replies@{client_id}.{inbound_email_domain}
+	inbound_email_domain: str = Field(default="getblackink.com", env="INBOUND_EMAIL_DOMAIN")
 
 
 @lru_cache

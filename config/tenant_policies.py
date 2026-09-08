@@ -66,22 +66,45 @@ TENANT_POLICIES = {
 		"join_column": "client_id",
 	},
 	# booking_reminder_jobs has no client_id column of its own — scoped through
-	# bookings.client_id via booking_id FK (Subtask 3.2.2).
+	# bookings.client_id via booking_id FK.
 	"booking_reminder_jobs": {
 		"mode": "join",
 		"join_table": "bookings",
 		"join_on": "booking_id",
 		"join_column": "client_id",
 	},
-	# Subtask 3.2.3 — No-Show Handler. Both carry their own client_id column.
+	# No-Show Handler. Both carry their own client_id column.
 	"no_show_prompt_jobs": {"mode": "direct", "column": "client_id"},
 	"no_show_recovery_jobs": {"mode": "direct", "column": "client_id"},
-	# Addendum to Subtask 3.2.1 — "Log Outcome" trigger card. Carries its own
+	# "Log Outcome" trigger card. Carries its own
 	# client_id column (copied from bookings.client_id at schedule time).
 	"meeting_outcome_prompt_jobs": {"mode": "direct", "column": "client_id"},
-	# Task 4.2.1 — Speed-to-Lead ingest. Superset table shared with Dev 2
-	# triage; Dev 2 columns are nullable. Scoped directly via client_id.
+	# Subtask 1.1.1 — Appointment operations. The blueprint's printed
+	# `client_id UUID REFERENCES companies` is adapted to this repo's real
+	# tenant boundary: a VARCHAR(40) client_id added directly to all four
+	# appointment tables (see apply_appointment_ops.py), so each is scoped at
+	# the row it is written on rather than through a parent join.
+	"appointments": {"mode": "direct", "column": "client_id"},
+	"confirmation_logs": {"mode": "direct", "column": "client_id"},
+	"appointment_dispositions": {"mode": "direct", "column": "client_id"},
+	"appointment_disputes": {"mode": "direct", "column": "client_id"},
+	# Reply Triage Agent inbound email intake.
 	"inbound_messages": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Both carry their own client_id
+	# column (winback_rows.client_id is denormalized from winback_imports at
+	# insert time, same "direct mode needs its own column per table"
+	# reasoning as meeting_outcome_prompt_jobs above).
+	"winback_imports": {"mode": "direct", "column": "client_id"},
+	"winback_rows": {"mode": "direct", "column": "client_id"},
+	# Subtask 3.1.2 — Three-Touch Win-Back Sequence. At-most-once dispatch
+	# claim table, mirrors sequence_touch_dispatches' own direct-mode entry
+	# above, keyed on winback_row_id instead of run_id.
+	"winback_touch_dispatches": {"mode": "direct", "column": "client_id"},
+	# Audit-trail counterpart to compliance_gate_checks (above), for the
+	# win-back touch gate — a separate table because compliance_gate_checks'
+	# contact_id column is a hard FK to contacts, which a winback_row_id can
+	# never satisfy correctly.
+	"winback_gate_checks": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence
@@ -90,7 +113,7 @@ TENANT_POLICIES = {
 #   raw_prospect_companies, raw_prospect_contacts — Akrash has no visibility
 #     into the client roster by design; ownership is assigned only at
 #     promotion time (ownership is assigned at promotion, not ingestion).
-#   self_serve_audit_submissions (Subtask 3.2.3) — pre-company, pre-tenant
+#   self_serve_audit_submissions — pre-company, pre-tenant
 #     public landing-page staging data, same posture as raw_prospect_*;
 #     ownership is assigned only once the worker resolves/creates a
 #     companies row, never at submission time.

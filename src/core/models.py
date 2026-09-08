@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy import (
 	ARRAY,
 	CheckConstraint,
+	Computed,
 	Date,
 	DateTime,
 	ForeignKey,
@@ -775,3 +776,170 @@ class AgentWorkOrder(Base):
 		Index("ix_awo_entity", "entity_type", "entity_id"),
 		Index("ix_awo_due", "status", "due_at"),
 	)
+
+
+# ============================================================================
+# APPOINTMENT OPERATIONS — Subtask 1.1.1 (settlement billing gate depends on
+# these; full 4-rule qualification lands Week 4). Deployed by
+# migrations/apply_appointment_ops.py, which carries the full rationale for
+# adapting the blueprint's UUID-typed `client_id REFERENCES companies` into the
+# repo's real split: a VARCHAR(40) tenant client_id (the RLS boundary) plus a
+# VARCHAR(64) company_id and BIGINT contact_id. The nine-state machine
+# (reschedule cap → LOST, opportunity_id retained) lives in
+# src/services/appointment_state.py. All four tables are tenant-bearing (direct
+# client_id) — registered in config/tenant_policies.py.
+# ============================================================================
+
+# The nine appointment states, kept in one place for the CHECK/enum + docs.
+_APPOINTMENT_STATES = (
+	"BOOKED, CONFIRMED_24H, CONFIRMED_3H, ATTENDED, DISPOSITIONED, "
+	"RESCHEDULED, NO_SHOW_RECOVERY, REBOOKED, LOST"
+)
+
+
+class Appointment(Base):
+	"""One scheduled meeting. is_billable is a STORED generated column — TRUE
+	only when state='ATTENDED' AND both confirmation timestamps are set — so the
+	billing gate reads a materialized truth, not an application recomputation. It
+	is NOT the sole billing authority (Source D caveat): the full ownership/
+	intent/ICP/duration bar is checked at settlement."""
+
+	__tablename__ = "appointments"
+
+	appointment_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), primary_key=True, server_default=func.gen_random_uuid()
+	)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	company_id: Mapped[Optional[str]] = mapped_column(
+		String(64), ForeignKey("companies.company_id"), nullable=True
+	)
+	# Preserved across every reschedule and no-show recovery — the exactly-once
+	# billing anchor. Not a DB unique (one opportunity spans many appointment
+	# rows); opportunity-level billing idempotency is enforced at settlement.
+	opportunity_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
+	contact_id: Mapped[Optional[int]] = mapped_column(
+		BigInteger, ForeignKey("contacts.contact_id"), nullable=True
+	)
+	# The enum type is created in the migration; the ORM only needs the string.
+	state: Mapped[str] = mapped_column(
+		String, nullable=False, server_default=text("'BOOKED'")
+	)
+	reschedule_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+	scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	attended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	confirmed_24h_timestamp: Mapped[Optional[datetime]] = mapped_column(
+		DateTime(timezone=True), nullable=True
+	)
+	confirmed_3h_timestamp: Mapped[Optional[datetime]] = mapped_column(
+		DateTime(timezone=True), nullable=True
+	)
+	is_billable: Mapped[bool] = mapped_column(
+		Boolean,
+		Computed(
+			"state = 'ATTENDED' AND confirmed_24h_timestamp IS NOT NULL "
+			"AND confirmed_3h_timestamp IS NOT NULL",
+			persisted=True,
+		),
+	)
+	owner_brief_url: Mapped[str] = mapped_column(Text, nullable=False)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		Index("idx_appointments_billing_gate", "state", "confirmed_24h_timestamp", "confirmed_3h_timestamp"),
+		Index("idx_opportunity_dedupe", "opportunity_id"),
+	)
+
+
+class ConfirmationLog(Base):
+	"""Per-tier confirmation delivery audit. Verified delivery timestamps here
+	are a hard input to the billing gate (Source B: no confirmed delivery →
+	appointment can't evaluate billable)."""
+
+	__tablename__ = "confirmation_logs"
+
+	log_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), primary_key=True, server_default=func.gen_random_uuid()
+	)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	appointment_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), ForeignKey("appointments.appointment_id", ondelete="CASCADE"), nullable=False
+	)
+	channel: Mapped[str] = mapped_column(String(10), nullable=False)
+	confirmation_tier: Mapped[str] = mapped_column(String(10), nullable=False)
+	sent_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	delivery_status: Mapped[str] = mapped_column(String(50), nullable=False)
+	reply_received_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	raw_response: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+	__table_args__ = (
+		CheckConstraint("channel IN ('SMS', 'EMAIL')", name="ck_confirmation_logs_channel"),
+		CheckConstraint("confirmation_tier IN ('24H', '3H')", name="ck_confirmation_logs_tier"),
+	)
+
+
+class AppointmentDisposition(Base):
+	"""Post-meeting outcome capture, exactly one per appointment (UNIQUE)."""
+
+	__tablename__ = "appointment_dispositions"
+
+	disposition_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), primary_key=True, server_default=func.gen_random_uuid()
+	)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	appointment_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), ForeignKey("appointments.appointment_id", ondelete="CASCADE"),
+		nullable=False, unique=True,
+	)
+	outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+	doors_signed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+	close_reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+	brief_accurate: Mapped[str] = mapped_column(String(10), nullable=False)
+	disposition_captured_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now()
+	)
+
+	__table_args__ = (
+		CheckConstraint(
+			"outcome IN ('SIGNED', 'DECIDING', 'NO', 'NOT_A_FIT')", name="ck_appt_disposition_outcome"
+		),
+		CheckConstraint(
+			"close_reason IN ('PRICE', 'TIMING', 'STAYING_SELF_MANAGED', 'WENT_ELSEWHERE', 'NOT_QUALIFIED')",
+			name="ck_appt_disposition_close_reason",
+		),
+		CheckConstraint(
+			"brief_accurate IN ('YES', 'PARTLY', 'NO')", name="ck_appt_disposition_brief_accurate"
+		),
+	)
+
+
+class AppointmentDispute(Base):
+	"""Client-flagged billing dispute, exactly one per appointment (UNIQUE). An
+	unverifiable outcome credits automatically (default CREDITED_AUTOMATIC)."""
+
+	__tablename__ = "appointment_disputes"
+
+	dispute_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), primary_key=True, server_default=func.gen_random_uuid()
+	)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	appointment_id: Mapped[str] = mapped_column(
+		UUID(as_uuid=False), ForeignKey("appointments.appointment_id", ondelete="CASCADE"),
+		nullable=False, unique=True,
+	)
+	flagged_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	reason: Mapped[str] = mapped_column(Text, nullable=False)
+	evidence_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	outcome: Mapped[str] = mapped_column(String(50), nullable=False, server_default=text("'CREDITED_AUTOMATIC'"))
+	resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

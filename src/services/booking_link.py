@@ -42,62 +42,82 @@ class BookingLink:
 	prefilled: bool
 
 
-def resolve_booking_link(
-	session: Session,
-	*,
-	name: Optional[str] = None,
-	email: Optional[str] = None,
-	scope: str = "INTERNAL_SALES_DEMO",
-) -> Optional[BookingLink]:
-	"""Returns None (never a broken/fabricated redirect) if no suitable
-	connection exists, if it has no public_booking_url, if the URL isn't
-	https, or if its host isn't in settings.booking_redirect_allowed_hosts.
-	Callers must handle None with a 'we'll follow up by email' fallback.
-
-	`scope` selects which calendar the link points at:
-	  - INTERNAL_SALES_DEMO (default): a Blackink sales rep's demo calendar,
-	    keyed off the is_default_sales_booking flag.
-	  - CLIENT_OWNER_BOOKING: the receiving client's own owner-booking
-	    calendar — what a Speed-to-Lead auto-response to an inquiring owner
-	    must point at. The session is already tenant-scoped, so this only ever
-	    sees the current client's connections; pick the default-flagged one if
-	    any, else the oldest active connection that has a public booking URL."""
-	if scope == "INTERNAL_SALES_DEMO":
-		row = session.execute(
-			text(
-				"SELECT provider, public_booking_url FROM calendar_connections "
-				"WHERE connection_scope = 'INTERNAL_SALES_DEMO' AND is_default_sales_booking = TRUE "
-				"AND status = 'ACTIVE' LIMIT 1"
-			)
-		).first()
-	else:
-		row = session.execute(
-			text(
-				"SELECT provider, public_booking_url FROM calendar_connections "
-				"WHERE connection_scope = :scope AND status = 'ACTIVE' "
-				"AND public_booking_url IS NOT NULL "
-				"ORDER BY is_default_sales_booking DESC NULLS LAST, connection_id ASC LIMIT 1"
-			),
-			{"scope": scope},
-		).first()
-	if row is None or not row.public_booking_url:
-		return None
-
-	parsed = urlparse(row.public_booking_url)
+def _is_valid_public_url(public_booking_url: Optional[str]) -> bool:
+	"""Shared https-only + host-allowlist check — never a fabricated or
+	unsafe redirect, for any connection_scope."""
+	if not public_booking_url:
+		return False
+	parsed = urlparse(public_booking_url)
 	if parsed.scheme != "https":
-		return None
+		return False
 	allowed_hosts = get_settings().booking_redirect_allowed_hosts
-	if not allowed_hosts or (parsed.hostname or "").lower() not in allowed_hosts:
+	return bool(allowed_hosts) and (parsed.hostname or "").lower() in allowed_hosts
+
+
+def _apply_ghl_prefill(public_booking_url: str, *, name: Optional[str], email: Optional[str]) -> BookingLink:
+	params = {}
+	if name:
+		params[_GHL_PREFILL_PARAMS["name"]] = name
+	if email:
+		params[_GHL_PREFILL_PARAMS["email"]] = email
+	if not params:
+		return BookingLink(url=public_booking_url, prefilled=False)
+	parsed = urlparse(public_booking_url)
+	separator = "&" if parsed.query else "?"
+	return BookingLink(url=f"{public_booking_url}{separator}{urlencode(params)}", prefilled=True)
+
+
+def resolve_booking_link(session: Session, *, name: Optional[str] = None, email: Optional[str] = None) -> Optional[BookingLink]:
+	"""Returns None (never a broken/fabricated redirect) if no connection
+	is flagged default, if it has no public_booking_url, if the URL isn't
+	https, or if its host isn't in settings.booking_redirect_allowed_hosts.
+	Callers must handle None with a 'we'll follow up by email' fallback."""
+	row = session.execute(
+		text(
+			"SELECT provider, public_booking_url FROM calendar_connections "
+			"WHERE connection_scope = 'INTERNAL_SALES_DEMO' AND is_default_sales_booking = TRUE "
+			"AND status = 'ACTIVE' LIMIT 1"
+		)
+	).first()
+	if row is None or not _is_valid_public_url(row.public_booking_url):
 		return None
 
 	if row.provider == "GOHIGHLEVEL":
-		params = {}
-		if name:
-			params[_GHL_PREFILL_PARAMS["name"]] = name
-		if email:
-			params[_GHL_PREFILL_PARAMS["email"]] = email
-		if params:
-			separator = "&" if parsed.query else "?"
-			return BookingLink(url=f"{row.public_booking_url}{separator}{urlencode(params)}", prefilled=True)
+		return _apply_ghl_prefill(row.public_booking_url, name=name, email=email)
+
+	return BookingLink(url=row.public_booking_url, prefilled=False)
+
+
+def resolve_owner_booking_link(
+	session: Session, client_id: str, *, name: Optional[str] = None, email: Optional[str] = None
+) -> Optional[BookingLink]:
+	"""CLIENT_OWNER_BOOKING counterpart to resolve_booking_link() (Subtask
+	3.1.2) — a property owner booking the *client's* own calendar, not
+	Blackink's sales calendar. Per-client default (unlike
+	is_default_sales_booking's single global default — each PM-firm client
+	has its own calendar), so client_id is required, not optional.
+
+	name/email are optional GHL prefill params, same as resolve_booking_link
+	— pass the specific owner's own name/email (not a batch-level default)
+	so a GHL booking page prefills correctly per recipient.
+
+	Returns None (never a fabricated link) until an operator has flagged a
+	CLIENT_OWNER_BOOKING connection for this client with
+	is_default_owner_booking=TRUE and a real https public_booking_url —
+	callers (winback_content.render_winback_touch's Touch 3) must handle
+	None with a 'just reply' fallback, same posture as resolve_booking_link."""
+	row = session.execute(
+		text(
+			"SELECT provider, public_booking_url FROM calendar_connections "
+			"WHERE client_id = :client_id AND connection_scope = 'CLIENT_OWNER_BOOKING' "
+			"AND is_default_owner_booking = TRUE AND status = 'ACTIVE' LIMIT 1"
+		),
+		{"client_id": client_id},
+	).first()
+	if row is None or not _is_valid_public_url(row.public_booking_url):
+		return None
+
+	if row.provider == "GOHIGHLEVEL":
+		return _apply_ghl_prefill(row.public_booking_url, name=name, email=email)
 
 	return BookingLink(url=row.public_booking_url, prefilled=False)

@@ -16,6 +16,18 @@ from src.services import sequence_enrollment
 from src.services.sequence_content import render_touch, EMAIL_TOUCH_STEPS
 
 
+@pytest.fixture(autouse=True)
+def _stub_unsubscribe():
+    """Subtask 3.1.2's mandatory one-click unsubscribe footer/header is
+    computed unconditionally on every send path that reaches sender.send()
+    — stub it here since this suite never configures EMAIL_UNSUBSCRIBE_SECRET."""
+    with (
+        patch("src.services.sequence_orchestrator.unsubscribe_url", return_value="https://app.example.com/unsub?token=t"),
+        patch("src.services.sequence_orchestrator.append_unsubscribe_footer", side_effect=lambda body, url: body),
+    ):
+        yield
+
+
 def test_render_touch_has_real_non_placeholder_copy():
     for step in EMAIL_TOUCH_STEPS:
         subject, body, tv = render_touch(step, first_name="Dana", company_name="Acme PM")
@@ -54,20 +66,22 @@ def test_enroll_persists_content_for_email_touches_only(monkeypatch):
         first_name="Dana", company_name="Acme PM",
     )
     assert run_id is not None
-    assert len(captured) == 5
+    # Touch 2 (dial) is NOT enrolled — it is posted event-driven on Touch 1
+    # approval (ADR 0001), so enrollment enqueues only steps 1, 3, 4, 5.
+    assert len(captured) == 4
 
     by_step = {c["payload"]["touch_step"]: c for c in captured}
+    assert 2 not in by_step
     # Email touches carry approved copy.
     for step in (1, 3, 5):
         p = by_step[step]["payload"]
         assert p["subject"] and p["body"]
         assert p["template_version"] == f"t{step}_v1"
         assert by_step[step]["config_fingerprint"]["channel"] == "setter"
-    # Manual touches carry no email body and route to the manual dispatcher.
-    for step in (2, 4):
-        p = by_step[step]["payload"]
-        assert "subject" not in p and "body" not in p
-        assert by_step[step]["config_fingerprint"]["channel"] == "manual"
+    # The LinkedIn touch carries no email body and routes to the manual dispatcher.
+    p = by_step[4]["payload"]
+    assert "subject" not in p and "body" not in p
+    assert by_step[4]["config_fingerprint"]["channel"] == "manual"
 
 
 def test_enrolled_content_reaches_sender_end_to_end(monkeypatch):

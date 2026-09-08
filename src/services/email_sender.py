@@ -46,6 +46,7 @@ class EmailSender(Protocol):
         html_body: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         attachments: Optional[list[Attachment]] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> SendResult: ...
 
 
@@ -63,13 +64,14 @@ class StubEmailSender:
         html_body: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         attachments: Optional[list[Attachment]] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> SendResult:
         message_id = make_msgid(domain=sending_domain)
         logger.info(
             "STUB email send from=%s to=%s domain=%s in_reply_to=%s message_id=%s "
-            "attachments=%s (no vendor contracted — nothing transmitted)",
+            "attachments=%s list_unsubscribe_url=%s (no vendor contracted — nothing transmitted)",
             from_address, to_address, sending_domain, in_reply_to, message_id,
-            [a[0] for a in (attachments or [])],
+            [a[0] for a in (attachments or [])], list_unsubscribe_url,
         )
         return SendResult(message_id=message_id)
 
@@ -114,6 +116,7 @@ class SmtpEmailSender:
         html_body: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         attachments: Optional[list[Attachment]] = None,
+        list_unsubscribe_url: Optional[str] = None,
     ) -> SendResult:
         message_id = make_msgid(domain=sending_domain)
         login = self._username or from_address
@@ -125,6 +128,12 @@ class SmtpEmailSender:
         msg["Subject"] = subject
         if self._reply_to:
             msg["Reply-To"] = self._reply_to
+        if list_unsubscribe_url:
+            # RFC 8058 one-click unsubscribe — CLAUDE.md's mandatory
+            # invariant. Mailbox providers POST to this URL when the
+            # recipient clicks their native "Unsubscribe" button.
+            msg["List-Unsubscribe"] = f"<{list_unsubscribe_url}>"
+            msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
         if in_reply_to:
             msg["In-Reply-To"] = in_reply_to
             msg["References"] = in_reply_to

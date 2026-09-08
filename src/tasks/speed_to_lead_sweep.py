@@ -21,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.core.database import get_system_db_context, get_db_context
-from src.services.booking_link import resolve_booking_link
+from src.services.booking_link import resolve_owner_booking_link
 from src.services.email_sender import build_email_sender
 from src.services.events import log_event
 from src.services.mailbox_dispatcher import get_active_mailbox_for_client, NoMailboxAvailable, AllMailboxesCapped
@@ -106,8 +106,8 @@ def _send_response(row) -> None:
 
         # Booking link points at the RECEIVING CLIENT's own owner-booking
         # calendar (CLIENT_OWNER_BOOKING), not an internal sales-demo calendar.
-        booking = resolve_booking_link(
-            session, name=prospect_name, email=prospect_email, scope="CLIENT_OWNER_BOOKING"
+        booking = resolve_owner_booking_link(
+            session, client_id, name=prospect_name, email=prospect_email
         )
         booking_url = booking.url if booking else None
 

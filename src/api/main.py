@@ -5,8 +5,8 @@ model (no orchestration layer, no separate container per background
 concern yet):
 
 - Runs the Slack Socket Mode connection (src.services.slack.bolt_app) as
-  a background asyncio task inside this same process's lifespan — Week 0
-  has exactly one deployable process (blackink-master). Revisit if the
+  a background asyncio task inside this same process's lifespan — there is
+  exactly one deployable process (blackink-master). Revisit if the
   API needs to restart independently of the Slack connection, or the API
   scales horizontally (each instance would otherwise open a redundant
   socket).
@@ -29,16 +29,20 @@ from fastapi import FastAPI
 
 from src.agents.relay.sync import sync_halts_from_db
 from src.api.akrash_ingest_router import router as akrash_router
+from src.api.inbound_email_router import router as inbound_email_router
 from src.api.auth_router import router as auth_router
 from src.api.sandbox_router import router as sandbox_router
 from src.api.metrics_router import router as metrics_router
 from src.api.meetings_router import router as meetings_router
 from src.api.ovs_router import router as ovs_router
 from src.api.booking_webhook_router import router as booking_webhook_router
+from src.api.inbound_router import router as inbound_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
 from src.api.public_landing_router import router as public_landing_router
 from src.api.inbound_lead_router import router as inbound_lead_router
 from src.api.mailgun_inbound_router import router as mailgun_inbound_router
+from src.api.winback_router import router as winback_router
+from src.api.unsubscribe_router import router as unsubscribe_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -56,14 +60,15 @@ _SAFETY_SWEEP_INTERVAL_SECONDS = 300
 _CONFIRMATION_SWEEP_INTERVAL_SECONDS = 30
 _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS = 3600
 _SHOW_RATE_REMINDER_SWEEP_INTERVAL_SECONDS = 60
-# Subtask 3.2.3 — comfortably inside the DoD's "5 minutes" no-show
-# recovery-email budget and the "10 minutes" no-show-prompt window.
+# Comfortably inside the "5 minutes" no-show recovery-email budget and
+# the "10 minutes" no-show-prompt window.
 _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS = 60
 _SELF_SERVE_AUDIT_SWEEP_INTERVAL_SECONDS = 30
 _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS = 60
 # Task 4.2.1 — 30-second tick keeps SLA response latency well under 30 min
 _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS = 30
+_RESPOND_SLA_SWEEP_INTERVAL_SECONDS = 60
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -85,15 +90,16 @@ def _start_background_workers() -> None:
 	from src.tasks.self_serve_audit_worker import run_sweep as self_serve_audit_sweep
 	from src.tasks.meeting_outcome_prompt_sender import run_sweep as meeting_outcome_prompt_sweep
 	from src.tasks.speed_to_lead_sweep import run_sweep as speed_to_lead_sweep
+	from src.tasks.respond_sla_sweep import run_sweep as respond_sla_sweep
+	from src.agents.respond.worker import Worker as RespondWorker
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
 		("calendar_sync_worker.sweep_all_active_connections", _SAFETY_SWEEP_INTERVAL_SECONDS, sweep_all_active_connections),
 		("booking_confirmation_sender.run_sweep", _CONFIRMATION_SWEEP_INTERVAL_SECONDS, run_sweep),
 		("calendar_subscription_renewal.run_renewal_sweep", _SUBSCRIPTION_RENEWAL_INTERVAL_SECONDS, run_renewal_sweep),
-		# Subtask 3.2.2 — the show-rate reminder cascade's only sender. Without
-		# this the 24h/30min booking_reminder_jobs stay PENDING forever and the
-		# whole feature never emails anyone in the deployed app.
+		# The show-rate reminder cascade's only sender. Without this the
+		# 24h/30min booking_reminder_jobs stay PENDING forever.
 		("show_rate_reminder_sender.run_sweep", _SHOW_RATE_REMINDER_SWEEP_INTERVAL_SECONDS, show_rate_reminder_sweep),
 		("no_show_prompt_sender.run_sweep", _NO_SHOW_PROMPT_SWEEP_INTERVAL_SECONDS, no_show_prompt_sweep),
 		("no_show_recovery_sender.run_sweep", _NO_SHOW_RECOVERY_SWEEP_INTERVAL_SECONDS, no_show_recovery_sweep),
@@ -101,11 +107,25 @@ def _start_background_workers() -> None:
 		("meeting_outcome_prompt_sender.run_sweep", _MEETING_OUTCOME_PROMPT_SWEEP_INTERVAL_SECONDS, meeting_outcome_prompt_sweep),
 		# Task 4.2.1 — SLA sweep dispatches deferred Speed-to-Lead auto-responses.
 		("speed_to_lead_sweep.run_sweep", _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS, speed_to_lead_sweep),
+		("respond_sla_sweep.run_sweep", _RESPOND_SLA_SWEEP_INTERVAL_SECONDS, respond_sla_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
 		thread.start()
 		logger.info("Started background worker %s (interval=%ds)", name, interval)
+
+	# The respond worker has its own internal loop and error handling — run it
+	# directly rather than wrapping in _loop(). Signal handlers are not
+	# installed: only the main thread can handle signals in Python, and Cloud
+	# Run SIGTERM terminates the container regardless.
+	respond_worker = RespondWorker()
+	respond_thread = threading.Thread(
+		target=respond_worker.run_forever,
+		name="respond_worker",
+		daemon=True,
+	)
+	respond_thread.start()
+	logger.info("Started background worker respond_worker")
 
 
 # PR review finding: src.services.events._pending_buffer is process-local,
@@ -159,6 +179,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Blackink API", lifespan=lifespan)
 
 app.include_router(akrash_router)
+app.include_router(inbound_email_router)
 app.include_router(auth_router)
 app.include_router(sandbox_router)
 app.include_router(metrics_router)
@@ -166,9 +187,12 @@ app.include_router(meetings_router)
 app.include_router(ovs_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
+app.include_router(inbound_router)
 app.include_router(public_landing_router)
 app.include_router(inbound_lead_router)
 app.include_router(mailgun_inbound_router)
+app.include_router(winback_router)
+app.include_router(unsubscribe_router)
 
 
 @app.get("/healthz")
