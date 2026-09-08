@@ -663,17 +663,11 @@ an `OwnerEnrichmentProvider` ABC (mirroring `compliance_gate.py`'s
 `DncProvider`/`EmailVerificationProvider` pattern) split into `submit()`/
 `collect()` rather than one call — **forced by the chosen vendor, not a
 style choice**. Skip-trace and DNC are both Tracerfy, same account
-(`TRACERFY_API_KEY`, preferred; `DNC_VENDOR_API_KEY` is read as a
-deprecated fallback by the same settings property — a PR-review finding,
-confirmed real, that a hard rename with no fallback would silently disable
-DNC/skip-trace on any deployment this codebase doesn't control that still
-only sets the old name; **note `Field(env=...)` alone does NOT implement
-this kind of fallback** — pydantic-settings 2.x silently ignores that
-pydantic-v1-only kwarg, matching the env var by Python field name instead,
-so the fallback field uses `validation_alias=` — see `config/settings.py`'s
-own comment, caught by writing a test that actually set the two env vars
-rather than trusting the field declaration), and Tracerfy's API is
-submit-then-poll (up to 10 minutes — see `src/services/tracerfy_client.py`).
+(`TRACERFY_API_KEY`, renamed from `DNC_VENDOR_API_KEY` since it is now
+dual-purpose — no fallback to the old name; this is the only deployment of
+this codebase, so there is nothing else the rename could break), and
+Tracerfy's API is submit-then-poll (up to 10 minutes — see
+`src/services/tracerfy_client.py`).
 The submit/collect split is what lets the caller
 (`src/tasks/enrichment_verification.py`) commit each chunk's
 `enrichment_attempts` bump *between* the two calls: a submit-stage failure
