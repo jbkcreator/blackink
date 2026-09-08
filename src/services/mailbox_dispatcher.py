@@ -64,14 +64,23 @@ class MailboxAssignment:
 
 
 def _resolve_daily_send_cap(session: Session, client_id: str) -> int:
-    """Per-client rolling-24h send cap, sourced from clients.daily_send_ceiling.
+    """Resolve the PER-MAILBOX rolling-24h send cap for this client.
 
-    clients.daily_send_ceiling is the source of truth (per mailbox). It defaults
-    to 0, which we treat as "unset" and fall back to DEFAULT_DAILY_SEND_CAP so a
-    freshly-provisioned client is never accidentally floored to zero sends. A
-    positive ceiling lowers the cap, but is bounded above by MAX_DAILY_SEND_CAP —
-    a ceiling of 100 can't raise the per-mailbox limit past the platform max and
-    burn its warmed reputation.
+    This is a per-mailbox limit, NOT a per-client total — deliberately, per the
+    blueprint (§653 "Strict daily ceiling of 30–50 cold emails per mailbox/day
+    with automated rotation across the client's 6 assigned mailboxes"; §1277
+    "enforces per-mailbox rate limits (30–50 sends/day)"). A client with N warmed
+    mailboxes sending up to the cap on each is the intended rotation model — the
+    spec defines no aggregate per-client volume ceiling. `daily_send_ceiling`
+    lets a cautious client throttle EACH of its mailboxes below the platform max;
+    it is not a client-wide budget. (A future per-client aggregate cap, if the
+    product ever wants one, would be a separate check counted by client_id.)
+
+    clients.daily_send_ceiling defaults to 0, treated as "unset" → fall back to
+    DEFAULT_DAILY_SEND_CAP so a freshly-provisioned client is never floored to
+    zero sends. A positive value lowers the per-mailbox cap but is bounded above
+    by MAX_DAILY_SEND_CAP — a misconfigured 100 can't raise a mailbox past the
+    platform max and burn its warmed reputation.
     """
     ceiling = session.execute(
         text("SELECT daily_send_ceiling FROM clients WHERE client_id = :client_id"),
