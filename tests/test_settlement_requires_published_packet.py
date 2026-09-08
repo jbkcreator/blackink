@@ -37,11 +37,16 @@ class _FakeResult:
 class _FakeSession:
 	def __init__(self, row):
 		self.row = row
+		self.updates = []
 
 	def execute(self, stmt, params=None):
 		sql = str(stmt)
 		if "FROM settlement_transactions t" in sql:
 			return _FakeResult(self.row)
+		if "evidence_packet_sha256" in sql:
+			return _FakeResult(None)  # _publish_evidence_packet's own status UPDATE
+		if "installment_1_status" in sql or "installment_2_status" in sql:
+			self.updates.append(params)  # mark_installment / defer_installment's UPDATE
 		return _FakeResult(None)
 
 	def rollback(self):
@@ -102,3 +107,17 @@ def test_unpublished_packet_blocks_with_zero_gateway_calls():
 	assert outcome.status == "BLOCKED"
 	assert outcome.reason == "EVIDENCE_PACKET_UNPUBLISHED"
 	assert gw.calls == []
+
+
+def test_unpublished_packet_is_deferred_not_terminal(monkeypatch):
+	"""PR #30 review finding 1: BLOCKED/EVIDENCE_PACKET_UNPUBLISHED must carry
+	a reason code and a next_retry_at so claim_installment_1/2 can re-select
+	it later — the old code left the row terminally BLOCKED forever."""
+	session = _FakeSession(_ROW)
+	outcome = charge_installment(session, 1, 1, as_of=_AS_OF, gateway=_RecordingGateway(), store=_NullStore())
+	assert outcome.status == "BLOCKED"
+	assert len(session.updates) == 1
+	params = session.updates[0]
+	assert params["status"] == "BLOCKED"
+	assert params["blocked_reason"] == "EVIDENCE_PACKET_UNPUBLISHED"
+	assert params["next_retry_at"] is not None

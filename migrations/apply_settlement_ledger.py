@@ -217,6 +217,28 @@ DDL = [
 	"CREATE INDEX IF NOT EXISTS ix_settlement_inst1_claim ON settlement_transactions(installment_1_status, inst1_next_retry_at)",
 	"CREATE INDEX IF NOT EXISTS ix_settlement_inst2_claim ON settlement_transactions(installment_2_status, installment_2_scheduled_for)",
 	"CREATE INDEX IF NOT EXISTS ix_settlement_agreement ON settlement_transactions(pms_agreement_id)",
+	# ── BLOCKED reason codes (PR #30 review findings 1 & 2) ──────────────────
+	# BLOCKED used to be excluded from both claim queries unconditionally, so
+	# any installment blocked by a transient cause (an Evidence Packet upload
+	# failure, a day-60 PMS outage) was lost forever — the wired StubPmsProvider
+	# always returns None, so this was the fate of EVERY installment 2 row.
+	# These columns let ledger.claim_installment_1/2 distinguish a *retryable*
+	# BLOCKED (EVIDENCE_PACKET_UNPUBLISHED, PMS_VERIFICATION_UNAVAILABLE) from a
+	# structurally parked one (SYNTHETIC_AGREEMENT_IN_LIVE_MODE must never be
+	# reclaimed — trg_settlement_guard_transition rejects that charge outright,
+	# so reclaiming it would only make the claim UPDATE itself raise and take
+	# the sweep's per-row savepoint with it). No CHECK on the value set
+	# deliberately — a new reason code should not require a migration edit.
+	"ALTER TABLE settlement_transactions ADD COLUMN IF NOT EXISTS inst1_blocked_reason VARCHAR(40)",
+	"ALTER TABLE settlement_transactions ADD COLUMN IF NOT EXISTS inst2_blocked_reason VARCHAR(40)",
+	"""
+	CREATE INDEX IF NOT EXISTS ix_settlement_inst1_blocked_retry
+		ON settlement_transactions(installment_1_status, inst1_blocked_reason, inst1_next_retry_at)
+	""",
+	"""
+	CREATE INDEX IF NOT EXISTS ix_settlement_inst2_blocked_retry
+		ON settlement_transactions(installment_2_status, inst2_blocked_reason, inst2_next_retry_at)
+	""",
 	"""
 	CREATE UNIQUE INDEX IF NOT EXISTS uq_settlement_inst1_invoice
 		ON settlement_transactions(inst1_stripe_invoice_id) WHERE inst1_stripe_invoice_id IS NOT NULL

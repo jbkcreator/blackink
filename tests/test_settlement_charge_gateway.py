@@ -140,3 +140,22 @@ def test_idempotency_keys_have_no_timestamp_or_attempt_counter():
 	for key in gw.idempotency_keys:
 		assert key.startswith("settlement-")
 		assert "|1|1" in key  # transaction_id=1, installment=1 only — no volatile suffix
+
+
+def test_idempotency_key_identical_across_a_deferred_retry():
+	"""PR #30 review, 'no duplicate charge across retries': a row deferred
+	once (e.g. an evidence-packet-publish failure on attempt 1) and re-claimed
+	on attempt 2 must produce byte-identical idempotency keys on the
+	eventual successful charge — the key is derived only from
+	transaction_id/installment, never inst{N}_attempts, so a retried sweep
+	re-derives the same key and Stripe dedupes rather than double-charging."""
+	row_first_attempt = SimpleNamespace(**{**vars(_ROW), "inst1_attempts": 0})
+	row_second_attempt = SimpleNamespace(**{**vars(_ROW), "inst1_attempts": 1})
+
+	gw1 = _FakeGateway([PayOutcome(status="paid")])
+	charge_installment(_FakeSession(row_first_attempt), 1, 1, as_of=_AS_OF, gateway=gw1, store=_StubStore())
+
+	gw2 = _FakeGateway([PayOutcome(status="paid")])
+	charge_installment(_FakeSession(row_second_attempt), 1, 1, as_of=_AS_OF, gateway=gw2, store=_StubStore())
+
+	assert gw1.idempotency_keys == gw2.idempotency_keys

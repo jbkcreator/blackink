@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 _CLAIM_LEASE_MINUTES = 10
 _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT = 3
 
+# BLOCKED reasons the claim queries will re-select once inst{N}_next_retry_at
+# has passed — transient causes only (PR #30 review findings 1 & 2).
+# SYNTHETIC_AGREEMENT_IN_LIVE_MODE is deliberately NOT here: it is a
+# structural refusal, not a transient one, and trg_settlement_guard_transition
+# (migrations/apply_settlement_ledger.py) rejects the CHARGING transition for
+# that case outright — reclaiming it would make the claim UPDATE itself raise
+# and take the sweep's per-row savepoint down with it.
+_RETRYABLE_BLOCKED_REASONS = ("EVIDENCE_PACKET_UNPUBLISHED", "PMS_VERIFICATION_UNAVAILABLE")
+
+# Deferred-BLOCKED backoff cap (minutes) — a day-60 PMS outage or a Stripe
+# Files outage should retry with growing spacing, never instantly and never
+# unboundedly far out.
+_MAX_BLOCKED_BACKOFF_MINUTES = 360
+
+# Emit exactly one settlement_charge_failed alert once a retryable-BLOCKED
+# installment has failed this many consecutive attempts — visible in `events`
+# without spamming one per sweep tick (PR #30 review: "five failures generate
+# one alert without stopping retries").
+_ALERT_AFTER_ATTEMPTS = 5
+
 
 def load_offer_terms(session: Session, offer_code: str) -> Optional[OfferTerms]:
 	row = session.execute(
@@ -250,6 +270,9 @@ def claim_installment_1(session: Session, *, claim_time: datetime, limit: int = 
 					OR (installment_1_status = 'FAILED' AND inst1_next_retry_at <= :claim_time)
 					OR (installment_1_status = 'CHARGING'
 						AND inst1_claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
+					OR (installment_1_status = 'BLOCKED'
+						AND inst1_blocked_reason = ANY(:retryable_reasons)
+						AND inst1_next_retry_at IS NOT NULL AND inst1_next_retry_at <= :claim_time)
 				ORDER BY transaction_id
 				FOR UPDATE SKIP LOCKED
 				LIMIT :limit
@@ -257,7 +280,7 @@ def claim_installment_1(session: Session, *, claim_time: datetime, limit: int = 
 			RETURNING transaction_id
 			"""
 		),
-		{"claim_time": claim_time, "limit": limit},
+		{"claim_time": claim_time, "limit": limit, "retryable_reasons": list(_RETRYABLE_BLOCKED_REASONS)},
 	).all()
 	return [r.transaction_id for r in rows]
 
@@ -276,6 +299,10 @@ def claim_installment_2(session: Session, *, claim_time: datetime, limit: int = 
 					OR (installment_2_status = 'FAILED' AND inst2_next_retry_at <= :claim_time)
 					OR (installment_2_status = 'CHARGING'
 						AND inst2_claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
+					OR (installment_2_status = 'BLOCKED'
+						AND inst2_blocked_reason = ANY(:retryable_reasons)
+						AND installment_2_scheduled_for <= :claim_time
+						AND inst2_next_retry_at IS NOT NULL AND inst2_next_retry_at <= :claim_time)
 				ORDER BY transaction_id
 				FOR UPDATE SKIP LOCKED
 				LIMIT :limit
@@ -283,7 +310,7 @@ def claim_installment_2(session: Session, *, claim_time: datetime, limit: int = 
 			RETURNING transaction_id
 			"""
 		),
-		{"claim_time": claim_time, "limit": limit},
+		{"claim_time": claim_time, "limit": limit, "retryable_reasons": list(_RETRYABLE_BLOCKED_REASONS)},
 	).all()
 	return [r.transaction_id for r in rows]
 
@@ -299,10 +326,17 @@ def mark_installment(
 	charged_at: Optional[datetime] = None,
 	stripe_invoice_id: Optional[str] = None,
 	rail: Optional[str] = None,
+	blocked_reason: Optional[str] = None,
 ) -> None:
+	"""blocked_reason is only meaningful alongside status='BLOCKED' — any
+	other status clears the column, so a stale reason can never survive a
+	later, unrelated transition (e.g. BLOCKED -> CHARGING -> CHARGED must not
+	leave an old EVIDENCE_PACKET_UNPUBLISHED reason sitting on a charged row)."""
 	prefix = "inst1" if installment == 1 else "inst2"
 	status_col = f"installment_{installment}_status"
 	charged_col = f"installment_{installment}_charged_at"
+	blocked_reason_col = f"{prefix}_blocked_reason"
+	effective_blocked_reason = blocked_reason if status == "BLOCKED" else None
 	session.execute(
 		text(
 			f"UPDATE settlement_transactions SET "
@@ -312,12 +346,14 @@ def mark_installment(
 			f"  {charged_col} = COALESCE(:charged_at, {charged_col}), "
 			f"  {prefix}_stripe_invoice_id = COALESCE(:stripe_invoice_id, {prefix}_stripe_invoice_id), "
 			f"  {prefix}_rail = COALESCE(:rail, {prefix}_rail), "
+			f"  {blocked_reason_col} = :blocked_reason, "
 			f"  updated_at = NOW() "
 			f"WHERE transaction_id = :transaction_id"
 		),
 		{
 			"status": status, "error": error, "next_retry_at": next_retry_at, "charged_at": charged_at,
 			"stripe_invoice_id": stripe_invoice_id, "rail": rail, "transaction_id": transaction_id,
+			"blocked_reason": effective_blocked_reason,
 		},
 	)
 
@@ -325,7 +361,14 @@ def mark_installment(
 def mark_installment_failed(session: Session, transaction_id: int, installment: int, attempts: int, error: str) -> None:
 	"""Bounded retry, same convention as self_serve_audit_worker.py: 2**attempts
 	minutes backoff until _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT, then a
-	terminal status excluded from the claim query forever."""
+	terminal status excluded from the claim query forever.
+
+	Distinct from defer_installment() below: this path is for a genuine FAILED
+	charge attempt (Stripe declined, transport error mid-charge) where giving
+	up after bounded retries is correct. Never use this for a BLOCKED-for-a-
+	transient-reason row (a Stripe Files outage, a day-60 PMS timeout) — those
+	retry indefinitely, because forfeiting 50% of a bounty is strictly worse
+	than a row retrying quietly (PR #30 review findings 1 & 2)."""
 	from datetime import timedelta, timezone
 
 	if attempts >= _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT:
@@ -333,3 +376,39 @@ def mark_installment_failed(session: Session, transaction_id: int, installment: 
 	else:
 		next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=2 ** attempts)
 		mark_installment(session, transaction_id, installment, "FAILED", error=error, next_retry_at=next_retry_at)
+
+
+def defer_installment(
+	session: Session,
+	transaction_id: int,
+	installment: int,
+	*,
+	reason: str,
+	error: str,
+	as_of: datetime,
+	attempts: int,
+) -> bool:
+	"""Marks an installment BLOCKED for a TRANSIENT reason (must be one of
+	_RETRYABLE_BLOCKED_REASONS, or claim_installment_1/2 will never re-select
+	it) with an exponential-backoff next_retry_at, capped at
+	_MAX_BLOCKED_BACKOFF_MINUTES. Unlike mark_installment_failed(), this NEVER
+	escalates to FAILED_PERMANENT — a transient block, however long it
+	persists, stays reclaimable (PR #30 review: forfeiting 50% of a bounty on
+	a PMS/Stripe outage is unacceptable).
+
+	as_of is an explicit parameter, not datetime.now() — same discipline as
+	every other settlement entry point, so the backoff window is
+	fast-forwardable in tests without clock mocking.
+
+	Returns whether this call crossed the alert threshold (attempts ==
+	_ALERT_AFTER_ATTEMPTS) — the caller emits settlement_charge_failed
+	exactly once on that edge, not on every subsequent tick."""
+	from datetime import timedelta
+
+	backoff_minutes = min(2 ** attempts, _MAX_BLOCKED_BACKOFF_MINUTES)
+	next_retry_at = as_of + timedelta(minutes=backoff_minutes)
+	mark_installment(
+		session, transaction_id, installment, "BLOCKED",
+		error=error, next_retry_at=next_retry_at, blocked_reason=reason,
+	)
+	return attempts == _ALERT_AFTER_ATTEMPTS

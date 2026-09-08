@@ -13,12 +13,20 @@ for the other five layers of this same property).
 Two preflight refusals happen before any Stripe object is created, both
 returning a BLOCKED outcome rather than raising:
   - EVIDENCE_PACKET_UNPUBLISHED — the packet must be compiled AND published
-    first. If store.publish() returns None or raises, nothing is invoiced.
+    first. If store.publish() returns None (no store configured) or raises
+    EvidencePacketPublishError (a genuine Stripe Files failure), nothing is
+    invoiced. This BLOCKED is TRANSIENT: the row is deferred via
+    ledger.defer_installment() with exponential backoff and stays reclaimable
+    by claim_installment_1/2 — it used to be marked terminally BLOCKED,
+    which meant a Stripe Files outage (or the store simply misconfigured,
+    see PR #30 review finding 1) forfeited the charge forever.
   - SYNTHETIC_AGREEMENT_IN_LIVE_MODE — a non-PMS_SYNC agreement (i.e. the
     DoD's synthetic door_signed test path) may only back a charge when the
     configured Stripe secret key is a sk_test_ key. In live mode this
     refuses outright, so a synthetic agreement is structurally unable to
-    bill a real client in production.
+    bill a real client in production. This BLOCKED is STRUCTURAL, not
+    transient — it stays terminal and is never reclaimed (see
+    ledger._RETRYABLE_BLOCKED_REASONS's own comment for why).
 """
 from __future__ import annotations
 
@@ -36,8 +44,12 @@ from src.services.events import log_event
 from src.services.settlement.evidence import assemble_evidence_packet
 from src.services.settlement.evidence_pdf import compile_packet
 from src.services.settlement.gateway import LiveStripeGateway, StripeGateway
-from src.services.settlement.ledger import mark_installment, mark_installment_failed
-from src.services.settlement.store import EvidencePacketStore, get_evidence_packet_store
+from src.services.settlement.ledger import defer_installment, mark_installment, mark_installment_failed
+from src.services.settlement.store import (
+	EvidencePacketPublishError,
+	EvidencePacketStore,
+	get_evidence_packet_store,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,20 +93,31 @@ def _publish_evidence_packet(
 	session: Session, row, installment: int, store: EvidencePacketStore
 ) -> Optional[str]:
 	"""Compiles + publishes the packet, storing sha256/bytes/url on the row
-	BEFORE any Stripe object is created. Returns the URL, or None if
-	publishing failed/was refused."""
+	BEFORE any Stripe object is created. Returns the URL, or None if the
+	store simply isn't configured (StubEvidencePacketStore).
+
+	A genuine transport/API failure (EvidencePacketPublishError) is recorded
+	on the row the same as a None, then RE-RAISED — the caller
+	(charge_installment) needs the actual Stripe error message to put in
+	instN_last_error, and defer_installment() (not this function) decides the
+	retry schedule. Swallowing it into a bare None here (the pre-fix
+	behavior) is what made every real Stripe Files failure indistinguishable
+	from "no store configured", and silently permanent (PR #30 review
+	finding 1)."""
 	packet = assemble_evidence_packet(session, transaction_id=row.transaction_id, installment=installment)
 	pdf_bytes = compile_packet(packet)
 	sha256 = hashlib.sha256(pdf_bytes).hexdigest()
 
+	publish_exc: Optional[EvidencePacketPublishError] = None
 	try:
 		url = store.publish(transaction_id=row.transaction_id, installment=installment, pdf_bytes=pdf_bytes)
-	except Exception:
+	except EvidencePacketPublishError as exc:
 		logger.exception(
-			"settlement.charge: evidence packet publish raised (transaction=%s installment=%s)",
-			row.transaction_id, installment,
+			"settlement.charge: evidence packet publish failed (transaction=%s installment=%s): %s",
+			row.transaction_id, installment, exc,
 		)
 		url = None
+		publish_exc = exc
 
 	session.execute(
 		text(
@@ -119,6 +142,8 @@ def _publish_evidence_packet(
 		},
 		session=session,
 	)
+	if publish_exc is not None:
+		raise publish_exc
 	return url
 
 
@@ -140,7 +165,13 @@ def charge_installment(
 	# ── Preflight refusal: synthetic agreement outside Stripe test mode ──
 	allow_synthetic = row.agreement_source == "PMS_SYNC" or _is_stripe_test_mode()
 	if not allow_synthetic:
-		mark_installment(session, transaction_id, installment, "BLOCKED", error="SYNTHETIC_AGREEMENT_IN_LIVE_MODE")
+		# Structural, not transient — blocked_reason is intentionally set to a
+		# value NOT in ledger._RETRYABLE_BLOCKED_REASONS, so this row is never
+		# reclaimed no matter how long it sits (see that constant's comment).
+		mark_installment(
+			session, transaction_id, installment, "BLOCKED",
+			error="SYNTHETIC_AGREEMENT_IN_LIVE_MODE", blocked_reason="SYNTHETIC_AGREEMENT_IN_LIVE_MODE",
+		)
 		return ChargeOutcome(status="BLOCKED", reason="SYNTHETIC_AGREEMENT_IN_LIVE_MODE")
 	if row.agreement_source != "PMS_SYNC":
 		session.execute(
@@ -149,11 +180,35 @@ def charge_installment(
 		)
 
 	# ── Preflight refusal: evidence packet must be published first ──
+	# BLOCKED here is TRANSIENT (a Stripe Files outage, or no store configured
+	# yet) — defer_installment() keeps the row reclaimable with backoff rather
+	# than the old terminal mark_installment(), which silently forfeited every
+	# charge behind SETTLEMENT_EVIDENCE_PACKET_STORE=stripe_files forever
+	# (PR #30 review finding 1).
 	url = row.evidence_packet_url
+	publish_error = None
 	if url is None:
-		url = _publish_evidence_packet(session, row, installment, store or get_evidence_packet_store())
+		try:
+			url = _publish_evidence_packet(session, row, installment, store or get_evidence_packet_store())
+		except EvidencePacketPublishError as exc:
+			publish_error = str(exc)
 	if url is None:
-		mark_installment(session, transaction_id, installment, "BLOCKED", error="EVIDENCE_PACKET_UNPUBLISHED")
+		reason = publish_error or "no evidence packet store configured"
+		crossed_alert_threshold = defer_installment(
+			session, transaction_id, installment,
+			reason="EVIDENCE_PACKET_UNPUBLISHED", error=reason, as_of=as_of, attempts=attempts,
+		)
+		if crossed_alert_threshold:
+			log_event(
+				row.client_id, "settlement_charge_failed", entity_type="settlement_transaction",
+				entity_id=str(transaction_id),
+				payload={
+					"transaction_id": transaction_id, "installment": installment,
+					"error_code": "EVIDENCE_PACKET_UNPUBLISHED", "error_message": reason,
+					"attempts": attempts,
+				},
+				session=session,
+			)
 		return ChargeOutcome(status="BLOCKED", reason="EVIDENCE_PACKET_UNPUBLISHED")
 
 	if not row.stripe_customer_id:
