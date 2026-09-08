@@ -54,6 +54,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py
           PYTHONPATH=. python migrations/apply_area_code_timezones.py
           PYTHONPATH=. python migrations/apply_clients.py
+          PYTHONPATH=. python migrations/apply_clients_stl_fields.py
           PYTHONPATH=. python migrations/apply_relay_halts.py
           PYTHONPATH=. python migrations/apply_companies.py
           PYTHONPATH=. python migrations/apply_contacts.py
@@ -92,6 +93,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_inbound_messages.py
           PYTHONPATH=. python migrations/apply_inbound_messages_sla.py
           PYTHONPATH=. python migrations/apply_respond_routing_gaps.py
+          PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py
           PYTHONPATH=. python migrations/apply_winback_imports.py
           PYTHONPATH=. python migrations/apply_winback_touch_sequence.py
           PYTHONPATH=. python migrations/apply_rls_policies.py

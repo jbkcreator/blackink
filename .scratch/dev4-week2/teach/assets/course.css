@@ -1,0 +1,28 @@
+:root { --ink:#1a1a1a; --muted:#6b6b6b; --rule:#e4e0d8; --accent:#7a1f1f; --accent2:#1f4d7a;
+        --bg:#fbfaf7; --code:#f0ede6; }
+* { box-sizing:border-box; }
+body { background:var(--bg); color:var(--ink); font:17px/1.6 Georgia,"Iowan Old Style",serif;
+       max-width:48rem; margin:0 auto; padding:3rem 1.4rem 6rem; }
+h1 { font-size:1.9rem; line-height:1.2; margin:0 0 .3rem; }
+h2 { font-size:1.25rem; margin:2.4rem 0 .6rem; border-bottom:1px solid var(--rule); padding-bottom:.3rem; }
+h3 { font-size:1.02rem; margin:1.4rem 0 .3rem; color:var(--accent); }
+.sub { color:var(--muted); font-style:italic; margin:0 0 1.4rem; }
+code { background:var(--code); padding:.08em .35em; border-radius:3px; font:14px/1.4 "SF Mono",Menlo,Consolas,monospace; }
+pre { background:var(--code); padding:.9rem 1rem; border-radius:6px; overflow-x:auto; font:13px/1.5 "SF Mono",Menlo,Consolas,monospace; }
+.card { background:#fff; border:1px solid var(--rule); border-radius:8px; padding:1rem 1.2rem; margin:1rem 0; }
+.flow { font:13.5px/1.7 "SF Mono",Menlo,Consolas,monospace; white-space:pre; background:#fff; border:1px solid var(--rule);
+        border-radius:8px; padding:1rem; overflow-x:auto; }
+.flow b { color:var(--accent); font-weight:600; }
+.flow i { color:var(--accent2); font-style:normal; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:15px; }
+th,td { text-align:left; padding:.45rem .6rem; border-bottom:1px solid var(--rule); vertical-align:top; }
+th { color:var(--muted); font-weight:normal; font-style:italic; }
+.cite { font-size:13px; color:var(--muted); }
+.cite code { font-size:12px; }
+.note { background:#fff7e6; border:1px solid #f0d999; border-radius:6px; padding:.7rem 1rem; margin:1rem 0; font-size:15px; }
+.built { color:#1e7a3d; font-weight:600; }
+.todo { color:var(--accent); font-weight:600; }
+.tag { display:inline-block; font:11px/1 "SF Mono",monospace; padding:.25em .5em; border-radius:4px; vertical-align:middle; color:#fff; }
+.tag.built { background:#1e7a3d; } .tag.todo { background:var(--accent); }
+footer { margin-top:3rem; padding-top:1rem; border-top:1px solid var(--rule); font-size:14px; color:var(--muted); }
+a { color:var(--accent); }

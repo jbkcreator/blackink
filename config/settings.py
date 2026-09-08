@@ -120,6 +120,14 @@ class AppSettings(BaseSettings):
 	email_reply_to: Optional[str] = Field(default=None, env="EMAIL_REPLY_TO")
 	email_bcc: Optional[str] = Field(default=None, env="EMAIL_BCC")
 
+	# ── Mailgun inbound (Task 4.2.1 Path B) ───────────────────────────────────
+	# HMAC signing key for Mailgun Routes inbound webhooks. Unset → the Path B
+	# handler rejects every delivery (fail closed), never processes an unsigned
+	# one. Set from the Mailgun account's webhook signing key.
+	mailgun_webhook_signing_key: Optional[str] = Field(default=None, env="MAILGUN_WEBHOOK_SIGNING_KEY")
+	# Slack channel for Speed-to-Lead closer-alert cards.
+	slack_closer_alert_channel: str = Field(default="#blackink-setter", env="SLACK_CLOSER_ALERT_CHANNEL")
+
 	# ── Slack ────────────────────────────────────────────────────────────────
 	slack_bot_token: Optional[SecretStr] = Field(default=None, env="SLACK_BOT_TOKEN")
 	slack_signing_secret: Optional[SecretStr] = Field(default=None, env="SLACK_SIGNING_SECRET")
