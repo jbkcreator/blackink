@@ -302,12 +302,34 @@ def test_dispute_credit_at_flagged_at_no_second_credit_at_resolved(billing_tenan
 	contact_id = billing_tenant["contact_id"]
 	scheduled_for = datetime.now(timezone.utc) - timedelta(hours=1)
 	with get_system_db_context() as s:
+		create_client_entitlement(s, client_id=client_id, offer_code="owner_growth")
 		now_iso = scheduled_for.isoformat()
+		# Consume the free first sit with a throwaway appointment first, so
+		# the disputed appointment below bills at the standard $99 rate —
+		# there is something to credit. resolve_sit_charge() would otherwise
+		# correctly price THIS appointment as the client's free $0 first sit
+		# (see test_disputed_free_first_sit_produces_no_credit for that case).
+		first_sit_appt = _insert_appointment(
+			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED",
+			scheduled_for=scheduled_for, c24=now_iso, c3=now_iso,
+		)
+		resolve_sit_charge(s, client_id=client_id, appointment_id=str(first_sit_appt.appointment_id), as_of=scheduled_for)
+
 		appt = _insert_appointment(
 			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
 			opportunity_id=str(uuid.uuid4()), state="ATTENDED",
 			scheduled_for=scheduled_for, c24=now_iso, c3=now_iso,
 		)
+		# credit_dispute_on_flag() reads the sit's ACTUAL recorded charge
+		# (appointments.billed_amount_cents) rather than re-deriving it — a
+		# dispute flagged before resolve_sit_charge() has ever run has
+		# nothing to read and correctly raises MissingBilledAmountError
+		# (PR #37 review fix). Every real dispute is against an appointment
+		# that already billed, so stamp that here first, same as this
+		# file's other dispute-credit tests.
+		charge = resolve_sit_charge(s, client_id=client_id, appointment_id=str(appt.appointment_id), as_of=scheduled_for)
+		assert charge.amount_cents == 9900, "this test needs a non-zero charge to actually credit"
 		flagged_at = scheduled_for + timedelta(hours=2)
 		dispute = s.execute(
 			text(
