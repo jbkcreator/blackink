@@ -20,8 +20,10 @@ uvicorn src.api.main:app --reload --port 8000
 # Migrations (idempotent scripts, no Alembic) — run in this order:
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
+PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py   # Subtask 3.1.1 — Akrash staging feed, not tenant-bearing, any time after counties
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
+PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
 PYTHONPATH=. python migrations/apply_relay_halts.py   # not tenant-bearing, any time after clients
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py
@@ -55,11 +57,25 @@ PYTHONPATH=. python migrations/apply_no_show_recovery_jobs.py      # Subtask 3.2
 PYTHONPATH=. python migrations/apply_self_serve_audit_submissions.py  # Subtask 3.2.3 — Owner Score Self-Serve Landing Page
 PYTHONPATH=. python migrations/apply_meeting_outcome_prompt_jobs.py   # Addendum 3.2.1 — "Log Outcome" trigger card (needs bookings + calendar_connections; before RLS)
 PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — appointments/confirmation_logs/dispositions/disputes + state enum (needs clients+companies+contacts; before RLS)
+PYTHONPATH=. python migrations/apply_payment_auth_capture.py   # Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture columns + config/webhook-idempotency tables (needs companies; before RLS)
+PYTHONPATH=. python migrations/apply_pms_agreements.py      # Subtask 1.2.2 — door_signed data source (needs clients+companies+owner_contacts; before RLS)
+PYTHONPATH=. python migrations/apply_settlement_ledger.py   # Subtask 1.2.2 — 50/50 settlement split + 60-day clawback ledger (needs pms_agreements+companies; before RLS)
+PYTHONPATH=. python migrations/apply_settlement_reopen_count.py   # PR #37 re-review fix — inst{1,2}_reopen_count, so a reopened FAILED_PERMANENT retry gets a fresh pay idempotency key instead of replaying the stale cached decline (after apply_settlement_ledger.py, before RLS)
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
+PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
+PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
+PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py  # re-adds ghost_submitted_at + ghost_work_order_id to contacts (Ghost Shopper reactivated); before RLS
+PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py       # audit log for IMAP listener inbound replies + timeouts; not tenant-bearing, no RLS
+PYTHONPATH=. python migrations/apply_ghost_form_submissions.py      # node-level idempotency for fill_and_submit (prevents double form POST on retry); not tenant-bearing, no RLS
+PYTHONPATH=. python migrations/apply_ovs_data_coverage.py          # Subtask 2.1.2 — adds data_coverage_pct SMALLINT to owner_visibility_scores; before RLS
+PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py  # Task 4.2.1 — Speed-to-Lead columns on inbound_messages (additive; after the three inbound_messages migrations, before RLS)
+PYTHONPATH=. python migrations/apply_stl_cadence.py  # Task 4.2.2 — STL cadence stop-latch columns + stl_cadence_dispatches table (after apply_inbound_messages_lead_fields.py, before RLS)
+PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
+PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2 — Three-Touch Win-Back Sequence (winback_touch_dispatches, stop columns, calendar_connections.is_default_owner_booking; after apply_winback_imports.py and apply_calendar_connections.py, before RLS)
+PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
-# NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
 # Background jobs
@@ -75,59 +91,29 @@ python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
+python -m src.agents.cora.worker           # Cora draft-generation worker (LLM sequence + Slack card)
+python -m src.agents.relay.worker          # Relay dispatch worker (Instantly / SMTP send)
 python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
 python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
+python -m src.tasks.imap_listener          # Ghost Shopper IMAP listener — monitors audit-bot inbox; requires IMAP_ENABLED=True
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
-python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
+python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
+python -m src.tasks.billing_sweep               # Subtask 1.2.3 — $50 miss-credit, dispute-credit, 60-day-guarantee sweeps
+python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches (one client)
+python -m src.tasks.work_order_execution_sweep  # Task 4.2.2 — all-tenant APPROVED work-order dispatcher (runs cmd_sweep per client); wired into the deployed background workers
+python -m src.tasks.enrichment_verification --client-id <id> [--import-id <id>] [--limit 10]  # Subtask 3.2.1 — owner-enrichment (skip-trace) sweep; must run before a Win-Back import can be armed, posts the pre-pilot summary to #blackink-qa
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
 pytest tests/test_tenant_isolation.py  # requires a live Postgres with migrations applied
 ```
 
-## Local development database
+## Local development
 
-Schema/migration work must be developed and verified against a disposable
-local Postgres, never against the live server — there is no separate
-staging database yet, so the server's database is effectively production.
-
-Which env file gets loaded is controlled by the `ENV_FILE` shell variable
-(`config/settings.py`, default `.env`) — **never overwrite your real `.env`
-to test locally.** Create a permanent `.env.local` once (gitignored via
-`.env*` in `.gitignore`) and point `ENV_FILE` at it for the duration of
-your shell session instead. This eliminates the backup/restore-`.env`
-dance entirely — there's nothing to accidentally leave in the wrong state.
-
-```bash
-# One-time: create .env.local with the Docker test values
-cat > .env.local <<'EOF'
-DATABASE_URL=postgresql://postgres:localdevpass@localhost:5433/blackink
-DATABASE_URL_APP=postgresql://blackink_app:app_local_pw@localhost:5433/blackink
-DATABASE_URL_SYSTEM=postgresql://blackink_system:system_local_pw@localhost:5433/blackink
-DATABASE_URL_AKRASH=postgresql://akrash_ingest:akrash_local_pw@localhost:5433/blackink
-BLACKINK_APP_DB_PASSWORD=app_local_pw
-BLACKINK_SYSTEM_DB_PASSWORD=system_local_pw
-AKRASH_INGEST_DB_PASSWORD=akrash_local_pw
-EOF
-
-# Start a disposable local Postgres (port 5433, not 5432 — avoids clashing
-# with a native Postgres install some dev machines already have on 5432)
-docker compose up -d postgres-test
-
-# Point this shell at .env.local for the rest of the session (PowerShell:
-# $env:ENV_FILE=".env.local"; bash: export ENV_FILE=.env.local)
-export ENV_FILE=.env.local
-
-# Then run the full migration sequence from Common Commands above, and:
-pytest tests/
-
-# Tear down when finished:
-docker compose down -v postgres-test
-unset ENV_FILE   # or just open a fresh shell for real-.env work
-```
-
-Only once a change is verified this way should it be applied to the real
-server (manual sync today — no CI/CD deploy pipeline exists yet).
+Settings load from `.env` by default (`config/settings.py`, controlled by
+the `ENV_FILE` shell variable). Keep `.env` populated with the real
+connection strings. Run migrations and tests directly against the live
+server — there is no separate staging database.
 
 ## Cloud Run deployment (test)
 
@@ -175,6 +161,11 @@ Manager-backed env vars, never baked into the image):
   would make every previously-encrypted token undecryptable).
 - `CALENDAR_OAUTH_STATE_SECRET` — any random secret string, signs
   connect-link/state JWTs.
+- `EMAIL_UNSUBSCRIBE_SECRET` — any random secret string, signs one-click
+  unsubscribe JWTs (`src/services/email_unsubscribe.py`). Its own
+  dedicated secret, never a reuse of `ADMIN_JWT_SECRET` — a missing value
+  means every outbound cold/win-back send fails loudly at dispatch time
+  rather than shipping without the mandatory unsubscribe mechanism.
 - `CALENDAR_WEBHOOK_BASE_URL` — the Cloud Run service's own public
   `https://...run.app` URL (or a mapped custom domain), used to build
   both the OAuth redirect URI and the webhook URLs handed to Google/
@@ -182,13 +173,23 @@ Manager-backed env vars, never baked into the image):
 - `EMAIL_SENDING_ENABLED` — leave `False`/unset unless real SMTP
   credentials for a validated sending domain exist; see
   `src/services/email_dispatch.py`.
+- `IMAP_ENABLED`, `IMAP_HOST`, `IMAP_PORT`, `IMAP_USER`, `IMAP_PASSWORD` —
+  Ghost Shopper IMAP listener (`src/tasks/imap_listener.py`). `IMAP_ENABLED`
+  defaults `False` (fail-closed); set `True` only when the `audit-bot@audit-blackink.com`
+  mailbox is provisioned and `IMAP_PASSWORD` is a real app password.
+  `imap_listener` runs as a **separate process** (not in the API lifespan);
+  deploy it as its own Cloud Run Job or alongside the Ink worker.
+  `GHOST_REPLY_TIMEOUT_HOURS` controls how long the listener waits before
+  sending a null resume signal (default 24).
 - `OVS_PDF_ALLOWED_HOSTS` — comma-separated exact hostnames the 30-minute
   pre-demo reminder is allowed to fetch `contacts.ovs_pdf_url` from (e.g.
   the real object-storage host once Dev 2's storage step exists); leave
   unset until then — every such reminder job stays `BLOCKED` rather than
   fetching from an unapproved host. See
   `src/services/show_rate_reminders._fetch_ovs_pdf`.
-- `AKRASH_INGEST_JWT_SECRET`, `DNC_VENDOR_API_KEY`, etc. — the existing
+- `AKRASH_INGEST_JWT_SECRET`, `TRACERFY_API_KEY` (renamed from
+  `DNC_VENDOR_API_KEY` — Subtask 3.2.1 made it dual-purpose: DNC scrub and
+  skip-trace owner enrichment, same Tracerfy account), etc. — the existing
   Week 1 settings, only needed if those code paths are actually
   exercised in this test deployment.
 
@@ -251,6 +252,31 @@ silently dropped: every row that doesn't promote carries a
   (`PASS/FAIL/ABSTAIN`, tri-state — `ABSTAIN` always blocks, no
   override). Both share the `DncProvider`/`EmailVerificationProvider`
   interfaces (no vendor contracted yet — stub implementations only).
+
+### Outbound email — mandatory one-click unsubscribe (non-negotiable)
+**Every cold/win-back outbound email MUST carry a working, self-service
+one-click unsubscribe — no exceptions, no sequence ships without it.** This
+is a client-stated hard requirement (confirmed 2026-09-07), ported from
+`ForcedAction-System/Forced-action-`'s pattern
+(`src/services/email_unsubscribe.py`, `src/api/email_unsubscribe_router.py`,
+`docs/adr/0028-cross-channel-suppression-block-all.md` in that repo): a
+stateless signed token (PyJWT — this repo's existing library, not
+`python-jose`), minted once per send, embedded as both a `List-Unsubscribe`
+/ `List-Unsubscribe-Post: List-Unsubscribe=One-Click` header pair (RFC 8058
+— also required by Gmail/Yahoo's 2024 bulk-sender rules) and a visible link
+in the email body, landing on a public unauthenticated endpoint
+(`src/api/unsubscribe_router.py`, `GET`/`POST /api/v1/public/unsubscribe`)
+that suppresses the recipient immediately and idempotently. The click sets
+`contacts.is_opted_out = TRUE` and/or `winback_rows.stopped_at`/
+`stop_reason = 'OPT_OUT'` depending which table the email matches for that
+`client_id` — both are already hard gates in `compliance_gate.py` and the
+win-back touch gate respectively, so no new send-blocking logic is needed
+once the column is set, only the mechanism to set it. `EmailSender.send()`
+takes this as a `list_unsubscribe_url` parameter so both the cold 5-touch
+sequence (`sequence_orchestrator.py`) and any future outbound sequence get
+it from the same shared sending layer — do not reimplement per-sequence.
+See `docs/plans/2026-09-07-subtask-3.1.2-three-touch-winback-sequence.md`
+§3.7 for the full design.
 
 ### Deliverability infrastructure
 DNS/SPF/DKIM/DMARC setup and mailbox warmup are a **manual runbook**, not
@@ -606,6 +632,598 @@ Slack workspace over Socket Mode. Note that **Interactivity must be toggled
 on** in the Slack app config even under Socket Mode — Socket Mode only
 replaces the Request URL; it does not enable interactivity, and a card's
 button renders with a warning until it is on.
+
+### Owner Enrichment / Skip-Trace (Week 2 Subtask 3.2.1 — note the number
+collides with Week 1's unrelated "Inbound booking engine" section above;
+these are two different subtasks that happen to share a number across
+sprints)
+
+Client mandate: *"Confirm the enrichment step (owner → phone/email) for
+every signal... If it isn't, it's a blocker for everything in §3"*
+(`blackink-client-comments-04-09-2026.md:77`). Skip-tracing is also written
+into the Win-Back Recipe's own definition (Blueprint v2:659 — *"Runs
+automated skip-tracing and DNC/suppression screening"*), so this is not
+solely a client-comments-derived requirement.
+
+`src/services/owner_enrichment.py` is the one place enrichment logic lives:
+an `OwnerEnrichmentProvider` ABC (mirroring `compliance_gate.py`'s
+`DncProvider`/`EmailVerificationProvider` pattern) split into `submit()`/
+`collect()` rather than one call — **forced by the chosen vendor, not a
+style choice**. Skip-trace and DNC are both Tracerfy, same account
+(`TRACERFY_API_KEY`, renamed from `DNC_VENDOR_API_KEY` since it is now
+dual-purpose — no fallback to the old name; this is the only deployment of
+this codebase, so there is nothing else the rename could break), and
+Tracerfy's API is submit-then-poll (up to 10 minutes — see
+`src/services/tracerfy_client.py`).
+The submit/collect split is what lets the caller
+(`src/tasks/enrichment_verification.py`) commit each chunk's
+`enrichment_attempts` bump *between* the two calls: a submit-stage failure
+(bad key, rate limit) means nothing was queued or billed, so it costs zero
+retry budget; a collect-stage (poll) failure happens after the vendor may
+already be processing, so the bump must already be committed to survive a
+crash without risking a silent re-charge on the next sweep.
+`StubOwnerEnrichmentProvider` is the no-key fallback — it passes a row's
+CSV-supplied `phone`/`email` through unchanged, so a row that already has
+one keeps exactly the sequenceability it has today (the Win-Back gate below
+cannot regress the moment it lands).
+
+**Claim lease (`enrichment_claimed_at`, `_CLAIM_LEASE_MINUTES=15`) —
+another PR-review finding, confirmed real by tracing the code.** The
+`FOR UPDATE SKIP LOCKED` row lock from the claim query is released the
+moment `run_sweep()` commits the `enrichment_attempts` bump — well before
+`enrichment_timestamp` is ever set (that happens only after
+`provider.collect()` returns, up to ~10 minutes later for a real poll), so
+without a durable lease a second, concurrent sweep could re-claim and
+re-submit the same rows. The lease is stamped and committed immediately
+after claiming, in the same transaction that still holds the row lock, so
+there is no gap. A lease that genuinely expires (a crash mid-poll, not
+ordinary concurrent execution) makes the row re-claimable again — freshly
+**re-submitted**, not resumed from its stored `enrichment_queue_id` (kept
+only for operational visibility, checking Tracerfy's own dashboard for a
+stuck batch) — a deliberate scope decision matching
+`self_serve_audit_worker.py`'s own lease pattern, which accepts the same
+bounded-duplicate-on-crash tradeoff rather than building full
+resume-an-abandoned-poll machinery.
+
+**`TracerfyEnrichmentProvider` is fully implemented** (2026-09-08),
+cross-checked against Tracerfy's own API docs and the working, production
+ForcedAction-System reference integration (same vendor, same account
+type — `ForcedAction-System/Forced-action-/src/services/tracerfy_batch.py`).
+Skip-trace is a *different* Tracerfy product from the DNC scrub with its
+own contract: `POST /v1/api/trace/` as **multipart/form-data** (not JSON),
+a `queue_id` response key, and `GET /v1/api/queue/{id}` returning the
+result array **directly** (not DNC's `{"pending","download_url"}`
+wrapper) — completion is a stability window (row count steady across
+several polls, plus a minimum settle time), since Tracerfy streams results
+in; see `tracerfy_client.py`'s `poll_skiptrace_queue()`. Two gaps Tracerfy's
+API creates, both handled in `owner_enrichment.py`, not the transport layer:
+no submitted-row ID is echoed back in the result (matching is by normalized
+street address, reusing `winback_ingest.normalize_address()`), and `city`
+is a required separate request field while `winback_rows` only stores one
+freeform address string (`_split_address()` parses the confirmed
+`"STREET, CITY, ST[ ZIP]"` convention only — an address that doesn't match
+is excluded from that sweep's submission rather than guessed, and simply
+retried next sweep; upgrade path if real CSVs need more formats is the
+`usaddress`-based parser already proven in the ForcedAction-System sibling
+repo). `_split_owner_name()` is a deliberately simple first-token/rest split
+— Win-Back's `owner_name` is a client CSV column for an individual owner,
+not a corporate registry needing ForcedAction's own entity-detection
+machinery.
+
+`winback_rows` carries the enrichment state (`email_status`,
+`email_previous`, `phone_verified`, `requires_enrichment_review`,
+`enrichment_provider`, `enrichment_timestamp`, `enrichment_attempts` —
+`migrations/apply_winback_enrichment.py`; no `TENANT_POLICIES` entry
+needed, RLS is column-agnostic on an already-registered table).
+`requires_enrichment_review = (no usable email) AND (no verified phone)` —
+deliberately **not** `email_status != 'VERIFIED'`, which would recreate the
+exact trap `contacts.email_status` is already in (nothing in this repo
+ever writes `VERIFIED` except by hand in `scripts/e2e_approval_gate.py`, so
+`compliance_gate._check_deterministic_columns` hard-`FAIL`s on every cold
+contact today — a pre-existing gap this subtask deliberately does not
+import into Win-Back, though it is the same missing enrichment step and
+should be raised as a follow-up against Week 1's compliance gate).
+
+`src/tasks/enrichment_verification.py` sweeps
+self-heal → claim → enrich → scrub → log → post, `--client-id` never
+defaulted (an unscoped sweep would silently no-op under RLS otherwise —
+same posture as `work_orders`' own CLI). Self-heal runs first: a row whose
+`enrichment_attempts` hits `OWNER_ENRICHMENT_MAX_ATTEMPTS` without ever
+getting an answer is terminally marked
+(`enrichment_timestamp`/`requires_enrichment_review=TRUE`) — without this,
+`requires_enrichment_review`'s `NOT NULL DEFAULT FALSE` makes a
+never-enriched row indistinguishable from a happily-enriched one, exactly
+the trap `_flag_unscrubbed()`'s own docstring already warns about one
+column over. Newly-discovered phones are DNC-scrubbed through
+`winback_ingest.dnc_scrub_rows()` (a public wrapper around the existing
+`_run_dnc_scrub`), preserving Subtask 3.1.1's "DNC scrub before any
+sequence can arm" ordering for numbers that didn't exist at import time.
+Posts the pre-pilot summary to `#blackink-qa` (its first *periodic*
+producer — the channel already carries three fire-and-forget error alerts)
+and exits non-zero if that post didn't land, so a missing
+`BLACKINK_QA_SLACK_CHANNEL`/bot-not-in-channel can never be mistaken for a
+passing gate.
+
+`src/services/winback_sequencer.py`'s `evaluate_winback_touch_gate` gates
+on `enrichment_timestamp IS NOT NULL` **before** checking
+`requires_enrichment_review` — the same "must have run, not merely have
+failed to object" reasoning as self-heal above. The `/arm` endpoint's SQL
+(`src/api/winback_router.py`) carries the identical predicate, because
+`arm_winback_run` inserts the `agent_work_orders` row and posts the Slack
+approval card *before* any touch gate runs — a gate-only implementation
+would still post an approval card for an un-enriched row.
+
+**Subtask 3.1.1's ingest was also fixed here**: `winback_ingest.py`'s
+`_REQUIRED_CSV_COLUMNS` no longer includes `phone`/`email` — that
+five-column "minimum required" list traced only to the derived
+`Week2_Tasks_Dev_Split_v1.md:236`, never to the client, and requiring phone
+meant a client export with no phone column produced zero sequenceable
+rows, defeating this subtask's own purpose. An owner with `phone=None` is
+not DNC-scrubbed (nothing to scrub, not suppressed) — distinct from a
+phone value present but ungradeable (`"n/a"`), which stays fail-closed
+exactly as before.
+
+Enrichment does **not** cover Speed-to-Lead's inbound leads
+(`src/services/inbound_lead_orchestrator.py`, Task 4.2.1) — those are
+inbound-initiated (a webhook/email the owner sent *to us*), so by
+construction almost every row already carries a real contact method.
+`owner_enrichment.EnrichmentInput`/`apply_result` are the contract whoever
+picks up that rare no-contact case would call, with
+`signal_source="SPEED_TO_LEAD"`. Same for the deed engine's homestead-drop
+and same-owner-match signals (client comments:28-29, deferred this sprint
+per `Week2_Tasks_Dev_Split_v1.md:11`) —
+`owner_enrichment.enrich_homestead_drop_signals()` is a documented no-op
+hook, called from the sweep so it is on the real code path, not orphaned.
+
+### Appointment operations & the billing gate (Subtask 1.1.1)
+
+`migrations/apply_appointment_ops.py` deploys the settlement-billing
+substrate: the `appointment_state_enum` (nine states) and four tables —
+`appointments`, `confirmation_logs`, `appointment_dispositions`,
+`appointment_disputes`. This is schema + state machine only; the full
+4-rule ownership/intent/ICP/duration qualification bar lands Week 4.
+
+**Deliberate adaptation of the blueprint DDL** (Source D p5's
+`009_appointment_ops.sql`): the printed DDL types `company_id`/`contact_id`
+as UUIDs and declares `client_id UUID REFERENCES companies(company_id)` —
+none of which is true in this repo (`companies.company_id` is a VARCHAR(64)
+sha256, `contacts.contact_id` is BIGSERIAL, and `client_id` is the
+VARCHAR(40) paying-tenant key that is the RLS boundary). Source D's own
+caveats flag exactly this ("Printed DDL is not a complete application
+schema"). The conflated `client_id → companies` is split into two real
+columns: **`client_id VARCHAR(40) → clients`** (the tenant / RLS boundary)
+and **`company_id VARCHAR(64) → companies`** (the company the appointment is
+with), plus **`contact_id BIGINT → contacts`**. `opportunity_id UUID` is
+preserved across reschedules exactly as the blueprint intends.
+
+All four tables carry their own `client_id` and are registered in
+`config/tenant_policies.py` as `{"mode": "direct", "column": "client_id"}`
+(child tables scoped directly, not via a parent join — a mis-scoped INSERT
+is rejected at the row it is written on). DELETE is REVOKEd from **both**
+runtime roles: an appointment / audit row is status-transitioned, never
+removed at runtime — so tests clean up via the table-owner role, not
+`blackink_system`.
+
+`appointments.is_billable` is a **STORED generated column** — `TRUE` only
+when `state = 'ATTENDED' AND confirmed_24h_timestamp IS NOT NULL AND
+confirmed_3h_timestamp IS NOT NULL`. It is the schema-level slice of the
+gate, **not** the sole billing truth (it recomputes to `false` the moment
+state leaves ATTENDED, e.g. → DISPOSITIONED). `idx_opportunity_dedupe` is a
+**non-unique** index on purpose: one `opportunity_id` legitimately spans
+many appointment rows across reschedule / no-show-recovery / rebook chains;
+exactly-once billing idempotency is enforced at settlement, not by this
+index. The nine-state transition rules — reschedule capped at 2 (the third
+forces `LOST`), `opportunity_id` retained across reschedule and no-show
+recovery — are pure functions in `src/services/appointment_state.py` (a
+generated column can express a value but not a transition guard), applied by
+the single production write path `src/services/appointments.py`
+(`reschedule_appointment()` / `begin_no_show_recovery_for_appointment()`) —
+every reschedule MUST go through it, or a real third reschedule only hits the
+migration trigger's `reschedule_count > 2` backstop and errors instead of
+landing in `LOST`. The trigger's INSERT-time company/contact
+ownership check is a one-time creation snapshot, never re-validated on
+UPDATE — `county_allocation_reassessment.py` reassigns
+`companies.owning_client_id` as normal operation, so a live re-check would
+permanently block the original tenant from updating its own pre-existing
+appointment rows after a routine reassignment. `client_id`/`company_id`/
+`contact_id` are immutable once set instead, closing the same tenant-hop
+without that live re-check.
+
+### Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1)
+
+Greenfield Stripe integration — no Stripe usage existed anywhere in this
+repo before this subtask. Captures a client's card (backup) and ACH
+Direct Debit mandate (primary billing rail) via a Stripe Elements modal
+during onboarding, with a temporary $1 uncaptured authorization proving
+card validity before it's explicitly cancelled.
+
+**Offer-scoped, never a universal rule.** The Source of Truth is explicit
+that zero-upfront billing is not blanket policy — self-serve Respond/
+bundle signups charge at signup via Stripe Checkout with an order bump, a
+separate flow entirely. `payment_auth_offer_config` (one row per
+`offer_code`, `zero_deposit_enabled` defaulting `FALSE`) is the gate every
+endpoint checks (`src/services/payment_auth.py::is_zero_deposit_enabled`)
+before any Stripe call — an operator flips it only for a client-confirmed
+offer, never a hardcoded offer-name branch.
+
+**Two SetupIntents, not one.** A single Stripe SetupIntent cannot capture
+both a card and a bank account, so `POST /api/v1/onboarding/payment-auth/setup-intents`
+creates one of each (`create_card_setup_intent`/`create_ach_setup_intent`),
+presented together in one onboarding step. Full request/response contract:
+`docs/api/payment_auth_contract.md`. **The actual embedded Stripe Elements
+modal is a separate frontend task, not complete under this backend work**
+— `GET /api/v1/onboarding/payment-auth/test-harness` is a standalone,
+clearly-labeled test page available only in local/dev/test environments
+and returning 404 whenever `ENVIRONMENT=production` (see `is_production`),
+for manual Stripe test-mode verification only, not the production
+frontend.
+
+**No client-portal login system exists yet, so every endpoint
+authenticates via a signed, expiring onboarding token**
+(`src/services/payment_auth_token.py`) rather than trusting a bare
+`client_id`/`company_id`/`offer_code` in the request — those three values
+come exclusively from the token's own signed claims, never a request
+field, so a request can never operate on a company (or claim a different
+offer for one) it wasn't issued a token for. This token is deliberately
+temporary integration-testing scaffolding (`scripts/dev_mint_payment_auth_token.py`
+mints one for dev/test use) — the future authenticated onboarding portal
+is expected to supply its own tenant context once it exists, same
+resolved gap as the calendar-connect link in the booking-engine section
+above.
+
+**Server-side verification only — never trusts a client-submitted
+PaymentMethod id.** `POST .../confirm` takes SetupIntent *ids* only;
+`verify_setup_intent_server_side()` always re-fetches each SetupIntent
+from Stripe and asserts its `.customer`/`.payment_method.type`/`.status`
+before anything is persisted. ACH verification is genuinely asynchronous
+(a SetupIntent can sit `processing` for minutes) — `SetupIntentNotReady`
+is not an error, just "not done yet"; `payment_auth_completed_at` on
+`companies` is only ever set once **both** rails independently reach
+`succeeded`, most often via `src/api/stripe_webhook_router.py`'s
+`setup_intent.succeeded` handler rather than the synchronous confirm call.
+`stripe_webhook_events` is the idempotency ledger for Stripe's own webhook
+redeliveries; every outbound Stripe call additionally carries its own
+`idempotency_key` (keyed by `company_id` + purpose) so a retried request
+can't create a duplicate Customer/SetupIntent/hold.
+
+**The $1 hold is a real, uncaptured `capture_method='manual'` PaymentIntent**
+— a temporary pending authorization that may briefly appear on the
+customer's statement (never promised to be invisible, since Stripe doesn't
+guarantee that). It is explicitly cancelled (`cancel_auth_hold()`) the
+moment both rails verify, rather than relying on Stripe's ~7-day automatic
+expiry as the primary release mechanism.
+
+`stripe_customer_id`/`card_payment_method_id_encrypted`/
+`ach_payment_method_id_encrypted`/`ach_mandate_id_encrypted` live on
+`companies`, encrypted via the existing `src/core/token_crypto.py`
+(`encrypt_token`/`decrypt_token`, Fernet) — the same primitive already
+used for calendar OAuth tokens and SMTP passwords, not a second encryption
+helper. `record_payment_auth_completed()` deliberately touches only
+`companies` + `events` — payment-method capture must never itself flip
+any billing/entitlement row; that belongs to a separate, later
+settlement-pipeline ticket (the 50/50 split, 60-day clawback monitor, and
+Evidence Packet PDF compiler described in the blueprint's Settlement
+Engine section are not built here).
+
+### 50/50 Settlement Split Engine & 60-Day Clawback Monitor (Subtask 1.2.2)
+
+Builds the settlement pipeline Subtask 1.2.1 deferred: 50% of a bounty
+charged when a signed management agreement is confirmed (`door_signed`),
+50% at day 60 — voided if the agreement was terminated inside that window
+— with a 4-section Evidence Packet PDF attached to every charge.
+
+**`pms_agreements`, not `client_pm_books`, is the data source for
+`door_signed` and the day-60 re-check.** `client_pm_books` is the
+*permanent, no-TTL* non-poach lock `is_claimed_by_other_client()` reads;
+giving it a `terminated_at` column would risk a future `AND terminated_at
+IS NULL` predicate silently turning that permanent lock into an expiring
+one. `record_door_signed()` (`src/services/settlement/ledger.py`) writes
+the new `pms_agreements` row and upserts the `client_pm_books` claim in one
+transaction; `record_agreement_terminated()` touches only `pms_agreements`
+— the claim row is never touched, so non-poach semantics don't change (see
+`tests/test_settlement_live.py::test_non_poach_claim_survives_agreement_termination`).
+No PMS integration is contracted: `src/services/pms_sync.py`'s
+`PmsProvider` ABC follows the `compliance_gate.py` tri-state stub
+convention, and its only implementation, `StubPmsProvider`, returns `None`
+("couldn't determine") for everything — so out of the box nothing opens
+from a real sync and nothing charges or claws back on a guess at day 60.
+
+**`settlement_transactions`** (`migrations/apply_settlement_ledger.py`) is
+the ledger. Both pricing bases from the blueprint are supported —
+`pricing_basis` is `PER_DOOR` or `FLAT_PER_AGREEMENT` on
+`settlement_offer_config`, since the blueprint's own printed settlement DDL
+bills per door while its pricing registry prices `appt_standard` as a flat
+fee "Any door count" — a contradiction this repo does not resolve by
+picking one; `settlement_enabled` ships `FALSE` with no amount set on
+either basis. Terminal status is **`CHARGED`, not `PAID`** (matching the
+subtask's own Definition of Done wording literally); a distinct
+`SETTLING` value carries ACH's asynchronous pending-settlement window so
+`CHARGED` always means Stripe confirmed money moved. `is_clawed_back` is a
+STORED generated column off `installment_2_status = 'VOIDED_CLAWBACK'`, so
+it can never independently disagree with the status explaining it.
+
+**Zero-dollars-upfront and every fail-closed rule are enforced at the
+schema/trigger layer, not by convention** (six independent layers — see
+the migration's own docstring for the full list): `door_signed_at` /
+`pms_agreement_id` are `NOT NULL` with a composite same-tenant FK (the
+`apply_appointment_ops.py` trick); `trg_settlement_guard_transition`
+rejects a charge unless the agreement is `ACTIVE` (installment 1) or not
+clawed-back-eligible (installment 2), rejects it while
+`evidence_packet_url IS NULL` (**no "compiled but unpublished, proceed
+anyway" path exists**), and rejects it for a non-`PMS_SYNC` agreement
+unless `allow_synthetic_charge = TRUE` — a flag `src/services/settlement/
+charge.py` only ever sets when the configured Stripe key is `sk_test_`, so
+the DoD's synthetic `door_signed` test path can exercise the full pipeline
+in Stripe test mode and is structurally unable to bill a real client in
+production. `charge_installment()` is the *only* function in the repo
+permitted to call a money-moving Stripe API — it re-reads the row/agreement
+and re-derives the amount and every precondition from the DB rather than
+trusting its caller, and `tests/test_no_upfront_charge_paths.py` walks
+`src/` asserting that structurally.
+
+**Exactly-once billing** — the promise `appointments`' own docstring
+deferred here — lives on the ledger via `UNIQUE (client_id,
+opportunity_id)` (many appointment rows legitimately share one
+`opportunity_id` across reschedules; `idx_opportunity_dedupe` on
+`appointments` is deliberately non-unique for that reason) plus `UNIQUE
+(client_id, pms_agreement_id)`. A partial unique index excluding `VOIDED`
+rows was considered and rejected — it would let a voided-then-reinserted
+row re-bill the same opportunity; the accepted failure direction is always
+under-billing, never double-billing.
+
+ACH settles asynchronously via Stripe Invoices (no attachment field of
+their own, so the Evidence Packet is published via **Stripe Files +
+FileLink** and linked in invoice metadata — the zero-new-infrastructure
+option, since no general-purpose object storage has ever been built in
+this repo). Card fallback is attempted **only on a definite decline** — a
+timeout or transport error is recorded `UNCERTAIN` with no card attempt,
+because retrying the other rail after an indeterminate ACH result is
+exactly how a double-charge happens. Idempotency keys are pinned to
+`settlement-<step>|{transaction_id}|{installment}` with no timestamp or
+attempt counter, so a retried sweep re-derives the same key rather than
+creating a second Stripe object.
+
+The **Evidence Packet** (`src/services/settlement/evidence.py` +
+`evidence_pdf.py`) assembles its 4 blueprint-required sections from
+whatever this repo's tables genuinely contain — a missing value renders
+`NOT RECORDED` with its source table printed underneath, never a blank or
+a plausible default. Real gaps are stated verbatim rather than papered
+over: no DNC vendor is contracted (§1 prints `ABSTAIN`), no open/click/
+reply tracking exists (§2), the 4-rule ownership/intent/ICP/duration
+qualification bar does not exist — only the two-tier confirmation +
+`ATTENDED` state is asserted (§3, the section most likely to be disputed
+by a client if it fabricated "qualified: yes"), and a non-`PMS_SYNC`
+agreement prints `SOURCE: SYNTHETIC — NOT PMS-VERIFIED` (§4).
+
+Three sweeps (`src/tasks/settlement_sweep.py`, registered in
+`src/api/main.py`) — door-signed poll, installment 1 claim/charge,
+installment 2 claim/clawback — all under `get_system_db_context()`
+(BYPASSRLS), each taking an explicit `claim_time`/`as_of` rather than SQL
+`NOW()`, which is what makes the 60-day clock fast-forwardable in tests
+without clock mocking. The DoD's synthetic `door_signed` event enters via
+a new operator-only, fail-closed-gated route,
+`POST /api/v1/settlement/door-signed` (`src/api/settlement_router.py`) —
+the honest way to exercise the DoD's "test outcome transaction" without
+pretending a nightly PMS sync exists.
+
+**Status, stated plainly:** completable against a synthetic `door_signed`
+in Stripe test mode: installment 1 charge (`CHARGED`), installment 2
+scheduled 60 days out on a real committed row, day-60 charge and
+day-60 clawback-void with `settlement_clawback_executed` logged, the
+4-section packet with its URL on the invoice, and zero-dollars-upfront.
+**Pending, blocked on the nightly PMS read-sync** — which does not exist
+in this repo and is not built here: verification against a *real*
+`door_signed` event and a real day-60 re-verification decision (today
+`StubPmsProvider` returns `None` and correctly refuses to charge or void).
+Landing a real PMS integration is an implementation of the `PmsProvider`
+ABC, not a schema or pipeline change.
+
+### Six Billing Rules (Subtask 1.2.3)
+
+Sept-04 client comments introduced six billing rules the offer sheet now
+depends on (docs/client_responses.md §6b, docs/Sept04_New_Items_Triage.md,
+docs/Week2_Tasks_Dev_Split_v1.md — pulled onto this branch from commit
+`f3bca69` where they were first committed). None of the substrate the spec
+assumes existed beforehand: no `entitlement_offers`, no per-client
+entitlement row, no credit/invoice ledger, no `monthly_cap`, no
+`companies.founding`, no ack-latency columns on `inbound_messages`, and no
+table backing the "proof ledger" the docs mention seven times without ever
+defining. `migrations/apply_entitlements_billing.py` builds all of it;
+`src/services/billing/` and `src/tasks/billing_sweep.py` enforce the six
+rules as config rows and billing-job conditions — never a hardcoded price or
+cap compiled into application branches, per the spec's own Description.
+
+**Deviations from the printed spec, each traced to a real contradiction**
+(never a silent gap, per this repo's standing rule):
+
+- `founding` lives on `clients`, not `companies`. The spec's own phrase is
+  "`companies` table (client rows)" — but in this schema `companies` is the
+  prospected PM-firm pool (`owning_client_id` reassigned every 30 days by
+  `county_allocation_reassessment.py`), not the paying tenant; `clients` is.
+  Exactly the `client_id UUID REFERENCES companies` conflation Subtask 1.1.1
+  already resolved for `appointments`.
+- `offer_code`, not `offer_id`, matching `settlement_offer_config` /
+  `payment_auth_offer_config`.
+- `appt_first` is seeded at `price_cents = 0` (`billing_model = 'FREE'`), not
+  the blueprint matrix's $49 — the only reading under which rule 2 ("first
+  sit... charges $0") and rule 5 (`monthly_cap` NULL on `appt_first`) hold
+  simultaneously.
+- `entitlement_offers.eligibility_predicate` / `trigger_condition` are
+  DOCUMENTATION-ONLY columns — kept for schema fidelity with the printed
+  DDL, but nothing in this codebase ever `text()`s the stored predicate
+  string (storing and evaluating operator-authored SQL is a code-execution
+  surface this subtask does not open).
+- `per_sit_cents` is new: Owner Growth ($749/mo + $99/sit) and Full County
+  ($1,197/mo + $99/sit) are two-part tariffs the printed one-column DDL
+  cannot express.
+- **Proof ledger = `events`.** Named seven times across the Sept-04 docs,
+  defined zero times, backed by no table anywhere in this repo or its
+  history. Interpreted as `events` — the blueprint's own designated "shared
+  ledger of record" and the single existing audit-trail write path
+  (`log_event()`) — rather than a fifth, undefined ledger alongside
+  `settlement_ledger` / the consent ledger / the cost ledger / the referral
+  ledger. Flagged to the client as an open question, not asserted as settled
+  fact.
+- **DB-only subscription override, no real Stripe Subscription yet.** Rule
+  3's "$0 subscription override for the next billing cycle" is implemented
+  as a `subscription_overrides` row a billing job is expected to honor — no
+  Stripe Price object exists for any SKU (the archived source-of-truth
+  references `price_founding_hillsborough_base` / `price_founding_sit_meter`,
+  never created), so real Stripe Subscription creation/price-swap is a
+  separate, later ticket. Every charge this subtask actually verifies in
+  Stripe test mode is a one-off Invoice through the existing `StripeGateway`
+  ABC (`src/services/settlement/gateway.py`) — no second gateway.
+
+**Rule-to-code map:**
+
+1. **$50 miss credit** — `inbound_messages.acked_at` is a NEW clock,
+   deliberately distinct from the pre-existing `claimed_at` (the 30-minute
+   human-SLA claim clock the Reply Triage Agent's own sweep uses). Both must
+   hold at once — the commit that carries the Sept-04 docs is itself named
+   "30-min SLA sweep" — so acked_at is the AUTOMATED first-response
+   timestamp, not the human claim. `ack_latency_seconds` is a STORED
+   generated column (`EXTRACT(EPOCH FROM (acked_at - received_at))`), NULL
+   until `acked_at` is set — so a message NEVER auto-acknowledged (the
+   worst-case SLA breach, strictly worse than a late one) can never satisfy
+   `ack_latency_seconds > 60` on its own; `claim_missed_acks()`'s WHERE
+   clause carries a second OR branch (`acked_at IS NULL AND received_at`
+   old enough) specifically for that case — an earlier version of this
+   query only covered the late-but-eventually-acked case, silently missing
+   the worse one. `src/services/billing/miss_credit.py` claims rows past
+   the 60-second threshold (`SKIP LOCKED`) and writes a `$50` `MISS_CREDIT`
+   row via `src/services/billing/credits.py::issue_credit()`. No
+   human-approval step exists in the path — asserted structurally, not by
+   code review, in `tests/test_billing_structural.py`.
+2. **First sit free** — `client_entitlements.first_sit_consumed`.
+   `src/services/billing/sit_billing.py::resolve_sit_charge()` flips the
+   flag and returns the `appt_first`/$0 charge in the SAME transaction as the
+   flag flip; a concurrent race loses to whichever UPDATE lands first and
+   falls through to `appt_standard`, never double-granting the free sit.
+   Every return path stamps the ACTUAL charge onto
+   `appointments.billed_offer_code`/`billed_amount_cents` — rule 4 (below)
+   reads this back rather than re-deriving "what would this have cost",
+   which is unreliable after the fact (see rule 4).
+3. **60-day guarantee** — eligible only for `owner_growth` / `full_county`
+   entitlements (Respond excluded); `src/services/billing/guarantee.py`
+   counts `ATTENDED AND is_billable` appointments in the 60 days from
+   `client_entitlements.activated_at`; `< 4` inserts one
+   `subscription_overrides` row and flips `guarantee_applied` — both
+   `UNIQUE`-constrained so a re-run can never apply a second override.
+4. **Dispute credit on flagging** — `appointment_disputes.flagged_at` /
+   `outcome DEFAULT 'CREDITED_AUTOMATIC'` already existed
+   (`apply_appointment_ops.py`, Subtask 1.1.1, whose own docstring named this
+   as deferred Week-2 billing logic). `credit_status` (`PENDING` / `CREDITED`
+   / `EXPIRED`) is this rule's own claim-state column, separate from
+   `outcome` — without it, `src/tasks/billing_sweep.py`'s dispute sweep
+   re-selected an EXPIRED (past-window) dispute every tick forever, since
+   nothing marked it terminal; the fix is NOT wrapped in the sweep's usual
+   per-row `session.begin_nested()`, since a savepoint rolled back on the
+   very exception (`DisputeWindowExpiredError`) that signals "mark this
+   EXPIRED" would undo that same write.
+   `src/services/billing/dispute_credit.py::credit_dispute_on_flag()`
+   enforces the 48-hour window from `appointments.scheduled_for` (triage
+   item 10 explicitly overrides the blueprint's superseded "5-business-day"
+   window) and issues the credit for the sit's ACTUAL charge — read from
+   `appointments.billed_amount_cents` (stamped by rule 2's
+   `resolve_sit_charge()`), never re-derived from `entitlement_offers` at
+   dispute time. Re-deriving it was a real bug: it always priced a disputed
+   sit as `appt_standard` ($99), even when the disputed appointment was
+   actually the client's free first sit (billed $0) — `first_sit_consumed`
+   may have already flipped for an unrelated LATER appointment by the time a
+   dispute lands, so there is no reliable way to reconstruct the original
+   charge without having recorded it. A disputed $0 sit now correctly
+   produces no credit row (`billing_credits.amount_cents` is `CHECK > 0`)
+   and is still marked `CREDITED` (the rule was correctly evaluated — there
+   was simply nothing owed). `billing_credits`' own
+   `UNIQUE(client_id, credit_type, source_table, source_id)` is the
+   structural guarantee that a later `resolved_at` update writes nothing.
+5. **No monthly ceiling** — `entitlement_offers.monthly_cap` ships NULL on
+   `appt_standard` and `appt_first`; `sit_billing.py` contains no
+   `COUNT(*) >= cap` predicate of any kind, asserted structurally in
+   `tests/test_billing_structural.py`.
+6. **`founding` flag** — `clients.founding`, and (as of a review fix)
+   `client_entitlements.locked_price_cents` — a real per-account price,
+   snapshotted from `entitlement_offers.price_cents` at provisioning time
+   (`src/services/billing/offers.py::create_client_entitlement()`). An
+   earlier version of `apply_rate_migration()` updated only the single
+   shared `entitlement_offers.price_cents` row and merely COUNTED founding
+   vs. non-founding accounts for logging — there was no per-account price
+   anywhere for a founding row's price to actually stay unchanged AT, so
+   "founding accounts never move" was unverifiable and, per-account, false.
+   `apply_rate_migration()` now updates the shared list price (for future
+   signups) AND every non-founding ACTIVE entitlement's `locked_price_cents`
+   `WHERE NOT c.founding` — a founding row's `locked_price_cents` is never
+   touched again by any migration.
+
+Four sweeps in `src/tasks/billing_sweep.py`
+(`run_miss_credit_sweep` / `run_dispute_credit_sweep` / `run_guarantee_sweep` /
+`run_sit_invoice_sweep`), each `BYPASSRLS` via `get_system_db_context()`, each
+taking an explicit `claim_time`/`as_of` (never SQL `NOW()`) so the 60-second
+and 60-day clocks are fast-forwardable in tests — same discipline as the
+settlement engine. Registered in `src/api/main.py::_start_background_workers`,
+so the same Cloud Run min-instances ≥ 1 caveat that already applies to every
+other background worker in this repo applies here too.
+
+`src/services/billing/invoice_apply.py` applies `PENDING` `billing_credits`
+rows — filtered to the invoice's own `billing_period`, never every still-PENDING
+row regardless of period — to an already-created Stripe invoice as a
+negative-amount invoice item, through the existing
+`StripeGateway.add_invoice_item()` (which now returns the created invoice
+ITEM's own id, stored in `billing_credits.stripe_invoice_item_id` — the
+parent invoice id alone can't identify one line once an invoice carries more
+than one item).
+
+**PR #37 review fixes — closing the "database-only, never reaches Stripe"
+gap.** The first review of this subtask found that `resolve_sit_charge()` and
+`apply_pending_credits_to_invoice()` were both fully implemented but never
+called by any production path — rules 1/2/4/5 only ever produced database
+rows, never a real invoice. The reason: `clients` (the paying tenant) carried
+no Stripe identity anywhere in this repo — `companies.stripe_customer_id`
+(Subtask 1.2.1) is the PROSPECTED PM firm a client is pitching, a different
+entity entirely, and reusing it would invoice the wrong party.
+`migrations/apply_client_billing_account.py` adds the minimal
+`clients.stripe_customer_id` (nullable — no onboarding flow populates it yet,
+same class of gap as the payment-auth onboarding token) and
+`appointments.billing_blocked_reason`. `src/services/billing/sit_invoice.py`'s
+`charge_sit_for_appointment()` is the real wiring: for a client WITH a
+`stripe_customer_id`, it creates a real Stripe invoice (falling back to
+Stripe's `send_invoice` collection when there's no payment method on file,
+rather than a `charge_automatically` attempt with nothing to charge),
+applies this month's pending credits onto it, and finalizes it; for a client
+WITHOUT one, the appointment is marked `billing_blocked_reason =
+'NO_STRIPE_CUSTOMER'` and excluded from the claim query — never crashed on,
+never guessed. `run_sit_invoice_sweep` claims `ATTENDED`, billable, unbilled,
+unblocked appointments and calls it.
+
+Other fixes from that review: `resolve_sit_charge()` is now IDEMPOTENT per
+appointment — once `appointments.billed_offer_code` is set, every later call
+returns that recorded charge unconditionally rather than re-evaluating
+`first_sit_consumed` (a retried call could otherwise silently rebill a free
+first sit as $99). `issue_credit()` now detects a duplicate via
+`INSERT ... ON CONFLICT DO NOTHING RETURNING` instead of catching every
+`IntegrityError` — a real FK/CHECK violation now propagates and retries
+instead of being mistaken for "already credited." `run_miss_credit_sweep`
+fails CLOSED behind `settings.billing_miss_credit_sweep_enabled` (default
+`False`) until a real automated-ack sender actually writes
+`inbound_messages.acked_at` somewhere — before this fix, every unclassified
+email older than 60 seconds looked identical to a genuine miss.
+`_resolve_disputed_sit_amount_cents()` no longer falls back to
+`appt_standard`'s current price when `billed_amount_cents` is missing — it
+raises `MissingBilledAmountError` and marks the dispute
+`credit_status = 'BLOCKED'` (a new value alongside PENDING/CREDITED/EXPIRED),
+since guessing had silently overcredited a disputed FREE first sit.
+`evaluate_sixty_day_guarantee()` now takes a `SELECT ... FOR UPDATE` lock on
+the entitlement row and checks the `guarantee_applied` UPDATE's `rowcount`
+before proceeding (closing a race between two concurrent evaluations of the
+same client), and its override's `billing_period` is anchored on the
+entitlement's own `activated_at` day-of-month (a real subscription
+anniversary) rather than unconditionally the 1st of the next calendar month.
+Founding accounts are provisioned via the new
+`src/services/clients.py::provision_client()` — the one write path for a
+`clients` row, with `founding` a REQUIRED keyword argument (no default), so a
+future onboarding flow cannot silently default a real founding client to
+`False`; `tests/test_billing_structural.py` asserts both the missing default
+and that no other production code path INSERTs into `clients`.
 
 ## Tooling Rules
 

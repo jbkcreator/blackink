@@ -1,0 +1,33 @@
+[Unit]
+Description=Blackink API — FastAPI/Uvicorn (also runs every in-process background sweep — see src/api/main.py's lifespan)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/blackink
+Environment="PYTHONPATH=/root/blackink"
+EnvironmentFile=/root/blackink/.env
+
+# Single process, single worker — deliberate, not a placeholder. main.py's
+# lifespan() starts the Slack Socket Mode connection and every sweep thread
+# (booking, reminders, no-show, settlement, speed-to-lead, respond) inside
+# THIS process. Running more than one worker/process would duplicate every
+# one of those threads (double sends, double Slack sockets) — do not add
+# --workers or run a second instance without first splitting those threads
+# out into their own services.
+ExecStart=/root/blackink/venv/bin/python3 -m uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blackink-api
+
+[Install]
+WantedBy=multi-user.target

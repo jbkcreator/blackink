@@ -1,22 +1,107 @@
-"""Tests for the LinkedIn (Touch 4) path in src/tasks/sequence_sweep.py.
+"""Tests for src/tasks/sequence_sweep.py.
 
-The sweep now posts LINKEDIN_TASK cards on their day-7 due_at, gated by
-evaluate_touch_gate: on a compliance block (incl. global opt-out) it skips the
-post and records a touch_skipped_compliance event instead. Dial (Touch 2) is
-NOT swept — it is event-driven — so there is no dial path to test here.
+Two independent pieces covered here:
+  1. The Win-Back gate-before-posting fix (Subtask 3.1.2) — the DoD requires
+     a Touch 2/3 card never be QUEUED after a stop, not just blocked when
+     someone later clicks Approve.
+  2. The LinkedIn (Touch 4) path — the sweep posts LINKEDIN_TASK cards on
+     their day-7 due_at, gated by evaluate_touch_gate: on a compliance block
+     (incl. global opt-out) it skips the post and records a
+     touch_skipped_compliance event instead. Dial (Touch 2) is NOT swept —
+     it is event-driven — so there is no dial path to test here.
 
-FakeSession + AsyncMock for Slack; no live DB.
+No live DB or Slack; work_orders and the gates are stubbed.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import src.tasks.sequence_sweep as sweep
+from src.tasks import sequence_sweep
+from src.tasks import sequence_sweep as sweep
 
+
+# ---------------------------------------------------------------------------
+# Win-Back gate-before-posting (Subtask 3.1.2)
+# ---------------------------------------------------------------------------
+
+def _winback_order(action_class="DISPATCH_WINBACK_TOUCH", winback_row_id=1, slack_message_ts=None):
+	return SimpleNamespace(
+		action_id="action-1",
+		client_id="client_a",
+		entity_id=str(winback_row_id),
+		action_class=action_class,
+		slack_message_ts=slack_message_ts,
+		payload={"winback_row_id": winback_row_id, "touch_step": 2},
+	)
+
+
+def _gate(ready: bool):
+	return SimpleNamespace(ready=ready, blocked_reasons=[] if ready else ["not_stopped: FAIL - stop_reason=REPLY"])
+
+
+def test_stopped_winback_touch_is_skipped_not_posted():
+	order = _winback_order()
+	with (
+		patch.object(sequence_sweep.wo, "due_batch", return_value=[order]),
+		patch("src.services.winback_sequencer.evaluate_winback_touch_gate", return_value=_gate(False)),
+		patch("src.core.database.get_db_context") as mock_ctx,
+		patch.object(sequence_sweep.wo, "record_decision") as mock_decision,
+		patch("src.tasks.sequence_sweep._post_due_card") as mock_post,
+	):
+		mock_ctx.return_value.__enter__.return_value.execute.return_value.fetchone.return_value = SimpleNamespace(disposition="STILL_OWNS_STILL_RENTING")
+		posted = sequence_sweep.run_sweep()
+	assert posted == 0
+	mock_decision.assert_called_once_with("client_a", "action-1", decision="SKIPPED", decided_by="system:winback_gate")
+	mock_post.assert_not_called()
+
+
+def test_ready_winback_touch_is_posted():
+	order = _winback_order()
+	with (
+		patch.object(sequence_sweep.wo, "due_batch", return_value=[order]),
+		patch("src.services.winback_sequencer.evaluate_winback_touch_gate", return_value=_gate(True)),
+		patch("src.core.database.get_db_context") as mock_ctx,
+		patch.object(sequence_sweep.wo, "record_decision") as mock_decision,
+	):
+		mock_ctx.return_value.__enter__.return_value.execute.return_value.fetchone.return_value = SimpleNamespace(disposition="STILL_OWNS_STILL_RENTING")
+		with patch("asyncio.run", return_value=True) as mock_run:
+			posted = sequence_sweep.run_sweep()
+	assert posted == 1
+	mock_decision.assert_not_called()
+	mock_run.assert_called_once()
+
+
+def test_non_winback_order_is_unaffected_by_gate_check():
+	order = _winback_order(action_class="DISPATCH_EMAIL_TOUCH")
+	with (
+		patch.object(sequence_sweep.wo, "due_batch", return_value=[order]),
+		patch("src.services.winback_sequencer.evaluate_winback_touch_gate") as mock_gate,
+	):
+		with patch("asyncio.run", return_value=True):
+			posted = sequence_sweep.run_sweep()
+	assert posted == 1
+	mock_gate.assert_not_called()
+
+
+def test_already_posted_card_is_never_re_evaluated():
+	order = _winback_order(slack_message_ts="1700000000.000100")
+	with (
+		patch.object(sequence_sweep.wo, "due_batch", return_value=[order]),
+		patch("src.services.winback_sequencer.evaluate_winback_touch_gate") as mock_gate,
+	):
+		posted = sequence_sweep.run_sweep()
+	assert posted == 0
+	mock_gate.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# LinkedIn (Touch 4) path
+# ---------------------------------------------------------------------------
 
 def _order(action_class="LINKEDIN_TASK", contact_id="55", client_id="client-x", ts=None):
     return SimpleNamespace(
@@ -74,8 +159,6 @@ def test_linkedin_card_skipped_and_logged_when_gate_blocks():
 
 
 # ── PR #26 finding 3: blocked LinkedIn tasks must not loop forever ────────────
-
-from datetime import datetime, timedelta, timezone
 
 
 def _order_with_created(created_at, contact_id="55", client_id="client-x"):

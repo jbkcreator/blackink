@@ -87,15 +87,21 @@ def _quarantine_and_swap(session: Session, domain_row, trip: Trip) -> None:
 		},
 	)
 
-	# Reserve domains have cluster_label IS NULL in the current inventory —
-	# they are global, not cluster-bound. Filtering by cluster would match
-	# nothing and silently skip promotion every time. Pick any available reserve.
+	# Promote a reserve from the SAME cluster AND the SAME tenant only. A
+	# client's degraded domain must be replaced from within that client's own
+	# 3-domain cluster — grabbing a reserve from another cluster/tenant would
+	# bleed one tenant's warmed reputation into another (Task 4.1 isolation).
+	# client_id is compared with IS NOT DISTINCT FROM so the internal pool
+	# (client_id IS NULL) matches its own reserves rather than any tenant's.
 	reserve = session.execute(
 		text(
 			"SELECT id FROM sending_domains WHERE is_reserve = TRUE "
-			"AND quarantine_state = 'reserve' LIMIT 1 FOR UPDATE SKIP LOCKED"
+			"AND quarantine_state = 'reserve' "
+			"AND cluster_label IS NOT DISTINCT FROM :cluster_label "
+			"AND client_id IS NOT DISTINCT FROM :client_id "
+			"LIMIT 1 FOR UPDATE SKIP LOCKED"
 		),
-		{},
+		{"cluster_label": domain_row.cluster_label, "client_id": domain_row.client_id},
 	).fetchone()
 
 	if reserve is not None:
@@ -106,13 +112,13 @@ def _quarantine_and_swap(session: Session, domain_row, trip: Trip) -> None:
 			{"id": reserve.id},
 		)
 		logger.warning(
-			"deliverability_sentinel: quarantined %s, promoted reserve domain id=%s in cluster %s",
+			"deliverability_sentinel: quarantined %s, promoted same-cluster reserve domain id=%s in cluster %s",
 			domain_row.domain, reserve.id, domain_row.cluster_label,
 		)
 	else:
 		logger.error(
-			"deliverability_sentinel: quarantined %s, NO RESERVE DOMAIN available in cluster %s",
-			domain_row.domain, domain_row.cluster_label,
+			"deliverability_sentinel: quarantined %s, NO RESERVE DOMAIN available in cluster %s (client_id=%s)",
+			domain_row.domain, domain_row.cluster_label, domain_row.client_id,
 		)
 
 
@@ -123,7 +129,7 @@ def run_sentinel_sweep() -> int:
 
 	with get_system_db_context() as session:
 		domains = session.execute(
-			text("SELECT id, domain, cluster_label FROM sending_domains WHERE quarantine_state = 'active'")
+			text("SELECT id, domain, cluster_label, client_id FROM sending_domains WHERE quarantine_state = 'active'")
 		).fetchall()
 
 		for domain_row in domains:

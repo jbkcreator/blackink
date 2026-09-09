@@ -1,0 +1,26 @@
+[Unit]
+Description=Blackink Cora — draft-generation worker (reads draft.requested off Redis Stream, composes 5-touch sequences via Claude)
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/blackink
+Environment="PYTHONPATH=/root/blackink"
+EnvironmentFile=/root/blackink/.env
+
+ExecStart=/root/blackink/venv/bin/python3 -m src.agents.cora.worker
+
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=blackink-cora
+
+[Install]
+WantedBy=multi-user.target

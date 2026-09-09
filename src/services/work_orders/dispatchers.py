@@ -85,6 +85,53 @@ def dispatch_email_touch(order: WorkOrder) -> dict:
 	return receipt
 
 
+def dispatch_winback_touch(order: WorkOrder) -> dict:
+	"""DISPATCH_WINBACK_TOUCH — Subtask 3.1.2. Same shape as
+	dispatch_email_touch above, but against winback_rows/winback_sequencer
+	instead of contacts/sequence_orchestrator — winback owners are never
+	linked to contacts (see 3.1.1's own deliberate decision)."""
+	from sqlalchemy import text
+
+	from src.core.database import get_db_context
+	from src.services.winback_sequencer import dispatch_winback_touch as _dispatch
+
+	touch_step = int(order.payload.get("touch_step", 0))
+	winback_row_id = int(order.entity_id)
+	subject = order.payload.get("subject")
+	body = order.payload.get("body")
+	template_version = order.payload.get("template_version", "")
+
+	with get_db_context(client_id=order.client_id) as session:
+		row = session.execute(
+			text("SELECT * FROM winback_rows WHERE winback_row_id = :id"),
+			{"id": winback_row_id},
+		).fetchone()
+		if row is None:
+			logger.error("dispatch_winback_touch: winback_row_id=%s not found", winback_row_id)
+			return {"outcome": "WINBACK_ROW_NOT_FOUND", "winback_row_id": winback_row_id, "fail": True}
+
+		result = _dispatch(
+			session, row, order.client_id, touch_step=touch_step,
+			subject=subject, body=body, template_version=template_version,
+		)
+
+	logger.info(
+		"dispatch_winback_touch: action_id=%s winback_row_id=%s touch=%d outcome=%s",
+		order.action_id, winback_row_id, touch_step, result.outcome,
+	)
+	receipt = {
+		"outcome": result.outcome,
+		"winback_row_id": winback_row_id,
+		"touch_step": touch_step,
+		"message_id": result.message_id,
+	}
+	if result.outcome in _DEFER_OUTCOMES:
+		receipt["defer"] = True
+	elif result.outcome in _FAIL_OUTCOMES:
+		receipt["fail"] = True
+	return receipt
+
+
 def dispatch_manual_task(order: WorkOrder) -> dict:
 	"""DIAL_TASK / LINKEDIN_TASK — human-performed touches (phone, LinkedIn).
 
@@ -104,8 +151,32 @@ def dispatch_manual_task(order: WorkOrder) -> dict:
 _DEFER_OUTCOMES = {"VOLUME_CAP", "NO_MAILBOX"}          # transient availability — retry
 _FAIL_OUTCOMES = {"SEND_FAILED", "RECLAIMED", "NO_CONTENT"}  # ambiguous/failed — reconcile
 
+def dispatch_stl_cadence_touch_wrapper(order: WorkOrder) -> dict:
+	"""DISPATCH_STL_CADENCE_TOUCH — Task 4.2.2 Speed-to-Lead cadence follow-up.
+
+	Delegates to stl_cadence.dispatch_stl_cadence_touch, which handles the
+	pre-send gate check, at-most-once claim, SMTP send, and post-send write.
+	PostSendError (email sent but status write failed) returns a fail receipt
+	rather than re-sending, matching the same discipline as speed_to_lead_sweep."""
+	from src.services.stl_cadence import (
+		_PostSendError,
+		dispatch_stl_cadence_touch,
+	)
+
+	try:
+		return dispatch_stl_cadence_touch(order)
+	except _PostSendError as exc:
+		logger.error(
+			"dispatch_stl_cadence_touch: post-send write failed action_id=%s: %s — marking fail for reconciliation",
+			order.action_id, exc,
+		)
+		return {"outcome": "POST_SEND_WRITE_FAILED", "message_id": order.entity_id, "fail": True}
+
+
 DISPATCHERS: Dict[str, Callable[[WorkOrder], dict]] = {
 	"noop": noop_dispatch,
 	"setter": dispatch_email_touch,
 	"manual": dispatch_manual_task,
+	"winback": dispatch_winback_touch,
+	"stl_cadence": dispatch_stl_cadence_touch_wrapper,    # Task 4.2.2
 }

@@ -120,7 +120,7 @@ def test_persist_multiple_contacts_same_phone():
 
 def test_run_skips_when_no_api_key():
     with patch("src.tasks.dnc_refresh.get_settings") as mock_settings:
-        mock_settings.return_value.dnc_vendor_api_key = None
+        mock_settings.return_value.tracerfy_api_key = None
         result = run_dnc_refresh()
     assert result["skipped"] is True
 
@@ -128,11 +128,11 @@ def test_run_skips_when_no_api_key():
 def test_run_dry_run_no_api_call():
     with patch("src.tasks.dnc_refresh.get_settings") as mock_settings, \
          patch("src.tasks.dnc_refresh.get_system_db_context") as mock_ctx, \
-         patch("src.tasks.dnc_refresh._submit_batch") as mock_submit:
+         patch("src.tasks.dnc_refresh.submit_batch") as mock_submit:
 
         mock_key = MagicMock()
         mock_key.get_secret_value.return_value = "fake-key"
-        mock_settings.return_value.dnc_vendor_api_key = mock_key
+        mock_settings.return_value.tracerfy_api_key = mock_key
         mock_settings.return_value.dnc_recheck_days = 30
 
         mock_session = MagicMock()
@@ -154,7 +154,7 @@ def test_run_returns_zero_when_no_contacts():
 
         mock_key = MagicMock()
         mock_key.get_secret_value.return_value = "fake-key"
-        mock_settings.return_value.dnc_vendor_api_key = mock_key
+        mock_settings.return_value.tracerfy_api_key = mock_key
         mock_settings.return_value.dnc_recheck_days = 30
 
         mock_session = MagicMock()

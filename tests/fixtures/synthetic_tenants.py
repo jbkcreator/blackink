@@ -14,7 +14,7 @@ CI/isolated-test-DB only.
 import pytest
 from sqlalchemy import text
 
-from src.core.database import get_system_db_context
+from src.core.database import get_owner_db_context, get_system_db_context
 from src.core.models import Client, Company, Contact
 from src.loaders.base import BaseIngestLoader
 
@@ -53,6 +53,17 @@ def canary_tenants():
 			created[cid] = {"company_id": company.company_id, "contact_id": contact.contact_id, "domain": domain}
 
 	yield created
+
+	# events is append-only — DELETE is REVOKEd from blackink_app AND
+	# blackink_system (same posture as appointments/settlement_transactions),
+	# so this one statement needs the table-owner role. Subtask 1.2.2 tests
+	# are the first callers through this fixture that log an event
+	# (door_signed) against a canary client_id — without this, events'
+	# client_id FK blocks the DELETE below and leaves the canary
+	# company/client stuck for every subsequent test run.
+	with get_owner_db_context() as session:
+		for cid in (CANARY_A, CANARY_B):
+			session.execute(text("DELETE FROM events WHERE client_id = :cid"), {"cid": cid})
 
 	with get_system_db_context() as session:
 		for cid in (CANARY_A, CANARY_B):

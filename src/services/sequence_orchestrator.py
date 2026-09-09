@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.services.compliance_gate import evaluate_touch_gate
 from src.services.email_sender import EmailSender, build_email_sender
+from src.services.email_unsubscribe import append_unsubscribe_footer, unsubscribe_url
 from src.services.mailbox_dispatcher import (
     AllMailboxesCapped,
     NoMailboxAvailable,
@@ -134,15 +135,22 @@ def dispatch_touch(
     session.commit()
     _reassert_tenant(session, client_id)
 
+    # CLAUDE.md's mandatory one-click unsubscribe invariant — computed at
+    # send time (not enrollment time) so it always reflects the address
+    # actually being mailed to.
+    unsub_url = unsubscribe_url(client_id, contact.email)
+    body_with_footer = append_unsubscribe_footer(body, unsub_url)
+
     # send → UPDATE SENT/FAILED, each in the fresh (post-claim-commit) txn.
     try:
         result = sender.send(
             from_address=mailbox.mailbox_address,
             to_address=contact.email,
             subject=subject,
-            body=body,
+            body=body_with_footer,
             sending_domain=mailbox.sending_domain,
             in_reply_to=in_reply_to,
+            list_unsubscribe_url=unsub_url,
         )
     except Exception as exc:  # noqa: BLE001 — any send failure resolves the row
         mark_failed(session, client_id, dispatch_id, str(exc))

@@ -21,4 +21,46 @@
 # of activity from the events table and posts a 7-metric summary to Slack.
 0 8 * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.daily_digest >> /root/blackink/logs/daily_digest.log 2>&1
 
+# ── Ingestion promotion sweep ────────────────────────────────────────────
+# Every 5 min. Promotes cleared rows from raw_prospect_* staging into
+# companies/contacts — the ingestion pipeline is stalled without this.
+*/5 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.promotion_sweep >> /root/blackink/logs/promotion_sweep.log 2>&1
+
+# ── Deliverability sentinel ──────────────────────────────────────────────
+# Hourly. Quarantines a sending domain / promotes a reserve on a bounce or
+# spam-complaint-rate trip over the rolling 48h window.
+0 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.deliverability_sentinel >> /root/blackink/logs/deliverability_sentinel.log 2>&1
+
+# ── County-allocation reassessment ───────────────────────────────────────
+# Daily. Re-evaluates the 30-day prospect-pool outreach-rights window per
+# county; refreshes companies.owning_client_id.
+0 3 * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.county_allocation_reassessment >> /root/blackink/logs/county_allocation_reassessment.log 2>&1
+
+# ── Hunter nightly sweep ─────────────────────────────────────────────────
+# Nightly. Entity-resolution pass — dedupes llc_portfolio_owner companies
+# into canonical owner_entities via rapidfuzz clustering.
+0 2 * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.hunter_nightly_sweep >> /root/blackink/logs/hunter_nightly_sweep.log 2>&1
+
+# ── Cold-sequence approval-card sweep ────────────────────────────────────
+# Every 5 min. Posts Slack approval cards for due QUEUED email-touch orders
+# in agent_work_orders — a card-less due row is never surfaced to a human.
+*/5 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.sequence_sweep >> /root/blackink/logs/sequence_sweep.log 2>&1
+
+# ── Work-orders execution sweep (all active clients) ─────────────────────
+# Every 5 min. Drives APPROVED work orders through EXECUTING -> DONE.
+# --client-id is required by the underlying CLI (RLS-scoped, no unscoped
+# sweep allowed) — see scripts/cron_work_orders_sweep_all_clients.py.
+*/5 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m scripts.cron_work_orders_sweep_all_clients >> /root/blackink/logs/work_orders_sweep.log 2>&1
+
+# ── DNC re-scrub ──────────────────────────────────────────────────────────
+# 1st and 15th of the month. Keeps contacts.dnc_clean fresh within the
+# FTC's 31-day safe-harbor window — a once-monthly run risks a >31-day gap
+# in 31-day months, so twice-monthly is the deliberate choice (see
+# ForcedAction's own dnc_refresh cron comment for the same reasoning).
+0 4 1,15 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.dnc_refresh >> /root/blackink/logs/dnc_refresh.log 2>&1
+
+# ── Owner Visibility Score monthly sweep ─────────────────────────────────
+# 1st of the month. Scores every active company for the current month.
+0 5 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.owner_visibility_sweep >> /root/blackink/logs/owner_visibility_sweep.log 2>&1
+
 # ── Add future scheduled jobs below this line ───────────────────────────
