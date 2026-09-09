@@ -29,32 +29,47 @@ def make_node_ghost_shopper(ghost_shopper_graph):
     (state → dict) while giving it access to the nested graph instance.
     """
     def node_ghost_shopper(state: GlobalState) -> dict:
+        import time
         from sqlalchemy import text
 
+        from config.settings import get_settings
         from src.agents.ink.subagents.ghost_shopper.runner import run as gs_run
+        from src.agents.ink.subagents.ghost_shopper.state import GhostResult
         from src.core.database import get_db_context
 
-        # Look up website_url from companies table
-        with get_db_context(client_id=state["client_id"]) as db:
-            row = db.execute(
-                text("SELECT website FROM companies WHERE company_id = :cid"),
-                {"cid": state["company_id"]},
-            ).fetchone()
-        website_url = row.website if row and row.website else None
-
-        if not website_url:
-            logger.warning(
-                "ink.nodes: ghost_shopper — no website_url for company_id=%s, skipping",
+        # Mock mode — skip real crawl for local/E2E testing
+        if get_settings().ghost_shopper_mock:
+            logger.info(
+                "ink.nodes: ghost_shopper MOCK — returning SUBMITTED immediately company_id=%s",
                 state["company_id"],
             )
-            return {"ghost_result": "FORM_NOT_FOUND", "stage": InkStage.FAILED}
+            result = GhostResult(
+                outcome="SUBMITTED",
+                submitted_at=int(time.time() * 1000),
+                error=None,
+            )
+        else:
+            # Look up website_url from companies table
+            with get_db_context(client_id=state["client_id"]) as db:
+                row = db.execute(
+                    text("SELECT website FROM companies WHERE company_id = :cid"),
+                    {"cid": state["company_id"]},
+                ).fetchone()
+            website_url = row.website if row and row.website else None
 
-        result = gs_run(
-            graph=ghost_shopper_graph,
-            company_id=state["company_id"],
-            work_order_id=state["work_order_id"],
-            website_url=website_url,
-        )
+            if not website_url:
+                logger.warning(
+                    "ink.nodes: ghost_shopper — no website_url for company_id=%s, skipping",
+                    state["company_id"],
+                )
+                return {"ghost_result": "FORM_NOT_FOUND", "stage": InkStage.FAILED}
+
+            result = gs_run(
+                graph=ghost_shopper_graph,
+                company_id=state["company_id"],
+                work_order_id=state["work_order_id"],
+                website_url=website_url,
+            )
         logger.info(
             "ink.nodes: ghost_shopper finished — company_id=%s outcome=%s submitted_at=%s",
             state["company_id"], result.outcome, result.submitted_at,
@@ -453,6 +468,8 @@ def node_relay_dispatch(state: GlobalState) -> dict:
         video_id=state.get("video_id"),
         landing_url=state.get("landing_url"),
         gif_url=state.get("gif_url"),
+        latency_sec=state.get("latency_sec"),
+        loss_est=state.get("loss_est"),
     )
     logger.info(
         "ink.nodes: relay_dispatch published — work_order_id=%s relay_message_id=%s",

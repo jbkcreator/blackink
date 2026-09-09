@@ -35,6 +35,8 @@ class SendMessage:
     video_id:         Optional[str]
     landing_url:      Optional[str]
     gif_url:          Optional[str]
+    latency_sec:      Optional[int] = None
+    loss_est:         Optional[int] = None
     delivery_count:   int = 1
 
 
@@ -57,6 +59,8 @@ def publish(
     video_id:         Optional[str] = None,
     landing_url:      Optional[str] = None,
     gif_url:          Optional[str] = None,
+    latency_sec:      Optional[int] = None,
+    loss_est:         Optional[int] = None,
 ) -> Optional[str]:
     """Enqueue an approved send. Returns the Redis message id."""
     ensure_group()
@@ -70,6 +74,8 @@ def publish(
         "video_id":         video_id or "",
         "landing_url":      landing_url or "",
         "gif_url":          gif_url or "",
+        "latency_sec":      str(latency_sec) if latency_sec is not None else "",
+        "loss_est":         str(loss_est) if loss_est is not None else "",
     }
     try:
         return get_redis_client().xadd(STREAM_KEY, fields)
@@ -82,6 +88,13 @@ def publish(
 
 
 def _parse(message_id: str, fields: dict, delivery_count: int = 1) -> SendMessage:
+    def _int(key: str) -> Optional[int]:
+        v = fields.get(key)
+        try:
+            return int(v) if v else None
+        except (TypeError, ValueError):
+            return None
+
     return SendMessage(
         message_id=message_id,
         work_order_id=fields.get("work_order_id", ""),
@@ -93,6 +106,8 @@ def _parse(message_id: str, fields: dict, delivery_count: int = 1) -> SendMessag
         video_id=fields.get("video_id") or None,
         landing_url=fields.get("landing_url") or None,
         gif_url=fields.get("gif_url") or None,
+        latency_sec=_int("latency_sec"),
+        loss_est=_int("loss_est"),
         delivery_count=delivery_count,
     )
 

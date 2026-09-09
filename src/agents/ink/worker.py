@@ -68,10 +68,14 @@ def _read_resume_signals() -> list[dict]:
     signals = []
     for stream_id in ("0", ">"):
         try:
+            # PEL re-delivery ("0"): non-blocking — an empty PEL must return
+            # immediately so the worker proceeds to _process_new_work_orders().
+            # New messages (">"): bounded wait handled by _process_new_work_orders'
+            # own read_batch call, so stay non-blocking here too.
             result = r.xreadgroup(
                 RESUME_GROUP_NAME, CONSUMER_NAME,
                 {RESUME_STREAM_KEY: stream_id},
-                count=10, block=0,
+                count=10,
             )
         except Exception as exc:
             logger.debug("ink.worker: resume_signals read failed id=%s: %s", stream_id, exc)

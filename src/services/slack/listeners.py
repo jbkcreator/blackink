@@ -1686,6 +1686,14 @@ async def _handle_ink_campaign_decision(
         logger.warning("ink.listeners: ink campaign button missing work_order_id")
         return
 
+    from src.services.slack.auth import approver_authorized
+    if not approver_authorized(user_id):
+        logger.warning(
+            "ink.listeners: unauthorized campaign decision attempt work_order_id=%s user_id=%s",
+            work_order_id, user_id,
+        )
+        return
+
     try:
         from src.api.ink_webhook_router import publish_resume_signal
         publish_resume_signal(work_order_id=work_order_id, approved=approved, approved_by=user_id)
@@ -1697,10 +1705,36 @@ async def _handle_ink_campaign_decision(
         return
 
     decision_label = "Approved" if approved else "Rejected"
+    icon = ":white_check_mark:" if approved else ":x:"
     logger.info(
         "ink.listeners: campaign %s work_order_id=%s by user_id=%s",
         decision_label, work_order_id, user_id,
     )
+
+    # Update the card in place so the buttons are replaced with a status line
+    try:
+        channel = body.get("channel", {}).get("id")
+        ts      = body.get("message", {}).get("ts")
+        original_blocks = body.get("message", {}).get("blocks", [])
+        # Keep header + metrics blocks, replace actions block with status
+        display_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+        display_blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{icon} *{decision_label}* by <@{user_id}>",
+            },
+        })
+        if channel and ts:
+            from src.services.slack.bolt_app import get_bolt_app
+            await get_bolt_app().client.chat_update(
+                channel=channel,
+                ts=ts,
+                blocks=display_blocks,
+                text=f"{decision_label} by <@{user_id}>",
+            )
+    except Exception as exc:
+        logger.warning("ink.listeners: card update failed work_order_id=%s: %s", work_order_id, exc)
 
     # Decrement Cora's approval backlog counter
     from src.agents.cora.throttle import notify_approval_resolved

@@ -87,7 +87,7 @@ def _process_draft(msg: "queue.DraftMessage") -> None:
     contact_name = "there"
 
     try:
-        with get_db_context(client_id=client_id) as db:
+        with get_system_db_context() as db:
             co_row = db.execute(
                 text(
                     "SELECT c.company_name, co.county_name, c.door_count_est, "
@@ -95,7 +95,7 @@ def _process_draft(msg: "queue.DraftMessage") -> None:
                     "FROM   companies c "
                     "LEFT JOIN counties co ON co.county_slug = c.county_slug "
                     "LEFT JOIN contacts ct ON ct.company_id = c.company_id "
-                    "   AND ct.contact_role_type = 'DECISION_MAKER' "
+                    "   AND ct.contact_role_type IN ('DECISION_MAKER','OWNER_BROKER_MD') "
                     "WHERE  c.company_id = :cid "
                     "LIMIT 1"
                 ),
@@ -153,7 +153,15 @@ def _process_draft(msg: "queue.DraftMessage") -> None:
             from slack_sdk import WebClient
             slack_client = WebClient(token=settings.slack_bot_token.get_secret_value() if settings.slack_bot_token else "")
             touch1   = steps[0]
-            preview_body = touch1["body"][:300] + ("..." if len(touch1["body"]) > 300 else "")
+            preview_body = (touch1["body"]
+                .replace("{first_name}",   first_name)
+                .replace("{client_firm}",  client_display_name)
+                .replace("{company}",      company_name)
+                .replace("{audit_speed}",  audit_speed)
+                .replace("{loss_dollars}", loss_dollars)
+                .replace("{video_url}",    "[video link]")
+            )
+            preview_body = preview_body[:600] + ("..." if len(preview_body) > 600 else "")
             btn_value = _json.dumps({"work_order_id": work_order_id, "campaign_id": payload.get("campaign_id", "")})
             blocks = [
                 {"type": "header", "text": {"type": "plain_text", "text": f"Campaign Draft — {company_name}"}},

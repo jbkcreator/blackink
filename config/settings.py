@@ -359,6 +359,7 @@ class AppSettings(BaseSettings):
 	# submissions. Fail-closed: if imap_enabled is False the listener logs a
 	# warning and exits immediately — active Ghost Shopper campaigns will stay
 	# suspended at WAIT_REPLY until manually resumed or until imap_enabled is set.
+	ghost_shopper_mock: bool = Field(default=False, env="GHOST_SHOPPER_MOCK")
 	imap_enabled: bool = Field(default=False, env="IMAP_ENABLED")
 	imap_host: str = Field(default="imap.gmail.com", env="IMAP_HOST")
 	imap_port: int = Field(default=993, env="IMAP_PORT")
