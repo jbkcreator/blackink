@@ -134,10 +134,30 @@ def run_arm_check(order) -> None:
         if received_at.tzinfo is None:
             received_at = received_at.replace(tzinfo=timezone.utc)
 
-        session.execute(
-            text("UPDATE inbound_messages SET cadence_state = 'ARMED' WHERE id = :id"),
+        # Guarded transition: only NULL (un-armed) -> ARMED. A concurrent
+        # opt-out / reply / booking may latch STOPPED between the state read
+        # above and this write; without the WHERE cadence_state IS NULL guard
+        # this UPDATE would clobber that stop and queue touches for a lead who
+        # already opted out (compliance risk). RETURNING id tells us whether we
+        # actually won the transition — enqueue touches only if we did.
+        armed = session.execute(
+            text(
+                "UPDATE inbound_messages SET cadence_state = 'ARMED' "
+                "WHERE id = :id AND cadence_state IS NULL RETURNING id"
+            ),
             {"id": int(message_id)},
-        )
+        ).fetchone()
+        if armed is None:
+            logger.info(
+                "[stl_cadence] arm_check: message_id=%s state changed concurrently "
+                "(stopped/armed between read and arm) — not enqueuing touches",
+                message_id,
+            )
+            wo.record_decision(
+                client_id, order.action_id,
+                decision="SKIPPED", decided_by="stl_cadence:lost_arm_race",
+            )
+            return
 
         for step, day_offset in _TOUCH_DAY_OFFSETS.items():
             touch_due = received_at + timedelta(days=day_offset)
@@ -444,7 +464,7 @@ def stl_cadence_touch_still_ready(order) -> bool:
             if touch_step > 1:
                 prior = session.execute(
                     text(
-                        "SELECT status FROM stl_cadence_dispatches "
+                        "SELECT status, sent_at FROM stl_cadence_dispatches "
                         "WHERE message_id = :mid AND touch_step = :prior_step"
                     ),
                     {"mid": message_id, "prior_step": touch_step - 1},
@@ -458,6 +478,42 @@ def stl_cadence_touch_still_ready(order) -> bool:
                     # Do NOT mark SKIPPED — leave QUEUED so the sweep re-evaluates
                     # next run once the prior touch clears.
                     return False
+
+                # Spacing gate: touch N must be at least 24h after touch N-1
+                # ACTUALLY sent, not just after N-1's original schedule. A late
+                # approval for the prior touch means this touch's due_at (fixed
+                # at arm time as an offset from received_at) is already in the
+                # past, so without this it would post immediately — back-to-back
+                # sends minutes apart, driving unsubscribes/complaints. Hold and
+                # push due_at forward to prior.sent_at + 24h so the daily gap is
+                # preserved regardless of approval latency.
+                prior_sent_at = prior.sent_at
+                if prior_sent_at is not None:
+                    if prior_sent_at.tzinfo is None:
+                        prior_sent_at = prior_sent_at.replace(tzinfo=timezone.utc)
+                    earliest = prior_sent_at + timedelta(hours=24)
+                    if datetime.now(timezone.utc) < earliest:
+                        logger.info(
+                            "[stl_cadence] gate_check: touch %s HELD — prior touch %s sent %s, "
+                            "next allowed %s; deferring message_id=%s",
+                            touch_step, touch_step - 1, prior_sent_at.isoformat(),
+                            earliest.isoformat(), message_id,
+                        )
+                        # Push due_at forward so the sweep stops re-selecting this
+                        # QUEUED order every tick until the 24h gap elapses. Never
+                        # pull an already-later due_at earlier (GREATEST), and guard
+                        # to QUEUED so a concurrently-actioned order is untouched.
+                        session.execute(
+                            text(
+                                "UPDATE agent_work_orders "
+                                "SET due_at = GREATEST(due_at, :earliest), updated_at = NOW() "
+                                "WHERE action_id = :action_id AND client_id = :client_id "
+                                "  AND status = 'QUEUED'"
+                            ),
+                            {"earliest": earliest, "action_id": order.action_id,
+                             "client_id": order.client_id},
+                        )
+                        return False
     except Exception:
         logger.exception("[stl_cadence] gate_check: DB error for message_id=%s — skipping", message_id)
         wo.record_decision(order.client_id, order.action_id, decision="SKIPPED", decided_by="stl_cadence:gate_error")

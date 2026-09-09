@@ -98,6 +98,8 @@ def test_arm_check_arms_and_enqueues_5_touches():
                 result.fetchone.return_value = msg
             elif call_count[0] == 2:
                 result.fetchone.return_value = None  # no stop event
+            elif call_count[0] == 3:
+                result.fetchone.return_value = MagicMock()  # arm UPDATE won (RETURNING id)
             else:
                 result.fetchone.return_value = None
             return result
@@ -112,6 +114,47 @@ def test_arm_check_arms_and_enqueues_5_touches():
     assert len(touch_calls) == 5
     steps = [c["payload"]["touch_step"] for c in touch_calls]
     assert sorted(steps) == [1, 2, 3, 4, 5]
+
+
+def test_arm_check_loses_race_does_not_enqueue():
+    """PR#40 issue 1 fix: if an opt-out/reply/booking latches STOPPED between
+    the state read and the arm UPDATE, the guarded transition
+    (WHERE cadence_state IS NULL) matches no row. Must NOT enqueue touches and
+    must record SKIPPED, so a lead who opted out never receives follow-ups."""
+    from src.services import stl_cadence
+    order = _fake_order(action_class="STL_CADENCE_ARM")
+    msg = _msg_row(cadence_state=None)  # NULL at read time...
+
+    enqueue_calls = []
+    decisions = []
+
+    with patch("src.services.stl_cadence.get_db_context") as ctx, \
+         patch.object(stl_cadence.wo, "enqueue", side_effect=lambda **kw: enqueue_calls.append(kw)), \
+         patch.object(stl_cadence.wo, "record_decision",
+                      side_effect=lambda *a, **kw: decisions.append(kw)), \
+         patch("src.services.stl_cadence.log_event"):
+        sess = MagicMock()
+        call_count = [0]
+        def _execute(q, params=None):
+            call_count[0] += 1
+            result = MagicMock()
+            if call_count[0] == 1:
+                result.fetchone.return_value = msg    # message row (NULL state)
+            elif call_count[0] == 2:
+                result.fetchone.return_value = None   # no stop event in ledger
+            else:
+                result.fetchone.return_value = None   # arm UPDATE matched 0 rows (lost race)
+            return result
+        sess.execute.side_effect = _execute
+        ctx.return_value.__enter__ = lambda s: sess
+        ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+        stl_cadence.run_arm_check(order)
+
+    touch_calls = [c for c in enqueue_calls if c.get("action_class") == "DISPATCH_STL_CADENCE_TOUCH"]
+    assert touch_calls == []          # zero touches enqueued
+    assert decisions and decisions[-1].get("decision") == "SKIPPED"
+    assert decisions[-1].get("decided_by") == "stl_cadence:lost_arm_race"
 
 
 # ── stl_cadence_touch_still_ready ─────────────────────────────────────────────
@@ -172,6 +215,8 @@ def test_touch_still_ready_allows_when_prior_sent():
     msg = _msg_row(cadence_state="ARMED")
     prior_row = MagicMock()
     prior_row.status = "SENT"
+    # Prior touch sent well over 24h ago, so the spacing gate is satisfied.
+    prior_row.sent_at = datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
 
     call_count = [0]
 
@@ -194,6 +239,51 @@ def test_touch_still_ready_allows_when_prior_sent():
         result = stl_cadence.stl_cadence_touch_still_ready(order)
 
     assert result is True
+
+
+def test_touch_still_ready_holds_when_prior_sent_under_24h():
+    """PR#40 issue 2 fix: touch N must wait 24h after touch N-1 was ACTUALLY
+    sent, not just after N-1's original schedule. A late prior approval leaves
+    this touch's due_at in the past; without the spacing gate it would post
+    immediately, back-to-back. Expect HELD (False) + due_at pushed forward."""
+    from datetime import timedelta
+    from src.services import stl_cadence
+    order = _fake_order(payload={"message_id": "100", "touch_step": 2})
+    msg = _msg_row(cadence_state="ARMED")
+    prior_row = MagicMock()
+    prior_row.status = "SENT"
+    # Prior touch sent only 1h ago — inside the 24h gap.
+    prior_row.sent_at = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    executed = []
+    call_count = [0]
+
+    def _execute(q, params=None):
+        call_count[0] += 1
+        executed.append((str(q), params))
+        result = MagicMock()
+        if call_count[0] == 1:
+            result.fetchone.return_value = msg       # message row
+        elif call_count[0] == 2:
+            result.fetchone.return_value = prior_row  # prior dispatch: SENT 1h ago
+        else:
+            result.fetchone.return_value = None       # due_at UPDATE
+        return result
+
+    with patch("src.services.stl_cadence.get_db_context") as ctx, \
+         patch.object(stl_cadence.wo, "record_decision") as mock_decision:
+        sess = MagicMock()
+        sess.execute.side_effect = _execute
+        ctx.return_value.__enter__ = lambda s: sess
+        ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = stl_cadence.stl_cadence_touch_still_ready(order)
+
+    assert result is False
+    # Not terminal — stays QUEUED for re-evaluation once the gap elapses.
+    mock_decision.assert_not_called()
+    # due_at must be pushed forward via a guarded UPDATE on agent_work_orders.
+    assert any("UPDATE agent_work_orders" in q and "due_at" in q for q, _ in executed)
 
 
 def test_stop_active_stl_cadences_stops_pre_arm_rows():
