@@ -118,6 +118,9 @@ TENANT_POLICIES = {
 	# contact_id column is a hard FK to contacts, which a winback_row_id can
 	# never satisfy correctly.
 	"winback_gate_checks": {"mode": "direct", "column": "client_id"},
+	# Task 4.2.2 — Six-Attempt STL Cadence at-most-once send guard.
+	# Direct client_id column, same pattern as winback_touch_dispatches.
+	"stl_cadence_dispatches": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

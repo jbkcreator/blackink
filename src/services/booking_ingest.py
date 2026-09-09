@@ -651,6 +651,11 @@ def _process_event(
 			if event.owner_email:
 				from src.services.winback_sequencer import stop_active_winback_runs
 				stop_active_winback_runs(session, connection.client_id, event.owner_email, "MEETING_BOOKED")
+				# Task 4.2.2 — a Speed-to-Lead lead who books must stop their
+				# inbound cadence too. Contactless like winback owners, so keyed
+				# purely on email against ARMED STL cadences (additive lookup).
+				from src.services.stl_cadence import stop_active_stl_cadences
+				stop_active_stl_cadences(session, connection.client_id, event.owner_email, "BOOKED")
 
 		eligible_for_confirmation = not is_baseline_suppressed
 		if eligible_for_confirmation:

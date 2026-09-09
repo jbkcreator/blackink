@@ -400,6 +400,45 @@ def _winback_touch_content_blocks(order: "wo.WorkOrder") -> list:
 	]
 
 
+def _stl_cadence_touch_content_blocks(order: "wo.WorkOrder") -> list:
+	"""Approval card for DISPATCH_STL_CADENCE_TOUCH (Task 4.2.2).
+
+	Shape mirrors _winback_touch_content_blocks: header, prospect/step fields,
+	subject preview, body preview, context line. 'Step N of 5' for the 5-day
+	follow-up cadence. message_id shown instead of run_id/winback_row_id."""
+	payload = order.payload if isinstance(order.payload, dict) else {}
+	touch_step = payload.get("touch_step", "?")
+	message_id = payload.get("message_id", "?")
+	prospect_name = payload.get("prospect_name") or "Unknown"
+	prospect_email = payload.get("prospect_email") or order.recipient or "n/a"
+	subject = payload.get("subject") or f"Follow-up {touch_step} — Speed-to-Lead"
+	body = payload.get("body") or "_Approved copy missing — this card should not have been posted._"
+	# Strip HTML tags for the preview (simple regex — same as speed_to_lead_sweep)
+	import re
+	preview_text = re.sub(r"<[^>]+>", "", body)[:300]
+	quoted = "\n".join(f"> {ln}" for ln in preview_text.splitlines()[:5]) or f"> {preview_text}"
+
+	return [
+		{"type": "header", "text": {"type": "plain_text", "text": f"⚡ STL Follow-Up Touch {touch_step} · Approval needed", "emoji": True}},
+		{
+			"type": "section",
+			"fields": [
+				{"type": "mrkdwn", "text": f"*Prospect*\n{prospect_name} — {prospect_email}"},
+				{"type": "mrkdwn", "text": f"*Touch*\nStep {touch_step} of 5"},
+			],
+		},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Subject*\n{subject}"}},
+		{"type": "section", "text": {"type": "mrkdwn", "text": f"*Preview*\n{quoted}"}},
+		{
+			"type": "context",
+			"elements": [
+				{"type": "mrkdwn", "text": f"\U0001F4E8 message `{message_id}`  ·  `{order.action_id[:8]}`"},
+			],
+		},
+		{"type": "divider"},
+	]
+
+
 def _simple_action_button_blocks(order: "wo.WorkOrder", *, label: str) -> list:
 	"""A single 'Mark Done' button — for informational task cards (DIAL_TASK,
 	LINKEDIN_TASK) that need only one outcome and no approve/reject/snooze."""
@@ -578,6 +617,8 @@ def _card_text_blocks(order: "wo.WorkOrder") -> list:
 		return _email_touch_content_blocks(order) + _card_button_blocks(order)
 	if order.action_class == "DISPATCH_WINBACK_TOUCH":
 		return _winback_touch_content_blocks(order) + _card_button_blocks(order)
+	if order.action_class == "DISPATCH_STL_CADENCE_TOUCH":    # Task 4.2.2
+		return _stl_cadence_touch_content_blocks(order) + _card_button_blocks(order)
 	if order.action_class == "DIAL_TASK":
 		return _dial_task_content_blocks(order) + _simple_action_button_blocks(order, label="Mark Called ✓")
 	if order.action_class == "LINKEDIN_TASK":
