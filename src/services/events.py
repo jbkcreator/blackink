@@ -80,6 +80,15 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"speed_to_lead_response_sent": frozenset({"message_id", "ack_latency_seconds"}),
 	"closer_alert_posted": frozenset({"message_id", "slack_channel"}),
 	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
+	# Subtask 1.2.3 — Six Billing Rules. "Proof ledger" (named repeatedly in
+	# the Sept-04 client docs but never defined or backed by a table anywhere)
+	# is interpreted as this events stream — see
+	# migrations/apply_entitlements_billing.py's module docstring.
+	"respond_ack_missed": frozenset({"inbound_message_id", "ack_latency_seconds", "channel"}),
+	"billing_credit_issued": frozenset({"credit_id", "credit_type", "amount_cents", "billing_period"}),
+	"first_sit_consumed": frozenset({"client_id", "appointment_id", "offer_code"}),
+	"sixty_day_guarantee_applied": frozenset({"client_id", "attended_sit_count", "billing_period"}),
+	"rate_migration_applied": frozenset({"offer_code", "new_price_cents", "clients_updated", "founding_skipped"}),
 	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Per-disposition-bucket counts,
 	# not just a total, so the proof-ledger-style visibility the spec asks
 	# for ("winback_import_completed event written with row counts for each

@@ -14,6 +14,7 @@ _AS_OF = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _ROW = SimpleNamespace(
 	transaction_id=1, client_id="acme", company_id="co1", opportunity_id="opp-1", door_count=3,
 	installment_1_cents=5_000, installment_2_cents=5_000, inst1_attempts=0, inst2_attempts=0,
+	inst1_reopen_count=0, inst2_reopen_count=0,
 	evidence_packet_url=None,  # not yet published
 	door_signed_at=_AS_OF, pms_agreement_id=1, agreement_source="PMS_SYNC", agreement_status="ACTIVE",
 	stripe_customer_id="cus_123", ach_payment_method_id_encrypted="enc-ach", card_payment_method_id_encrypted="enc-card",
@@ -59,6 +60,14 @@ class _RecordingGateway(StripeGateway):
 
 	def create_invoice(self, **kw):
 		self.calls.append("create_invoice")
+		raise AssertionError("must not be called when the evidence packet is unpublished")
+
+	def find_invoice_by_metadata(self, **kw):
+		self.calls.append("find_invoice_by_metadata")
+		return None
+
+	def retrieve_invoice(self, **kw):
+		self.calls.append("retrieve_invoice")
 		raise AssertionError("must not be called when the evidence packet is unpublished")
 
 	def add_invoice_item(self, **kw):

@@ -60,9 +60,12 @@ PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — ap
 PYTHONPATH=. python migrations/apply_payment_auth_capture.py   # Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture columns + config/webhook-idempotency tables (needs companies; before RLS)
 PYTHONPATH=. python migrations/apply_pms_agreements.py      # Subtask 1.2.2 — door_signed data source (needs clients+companies+owner_contacts; before RLS)
 PYTHONPATH=. python migrations/apply_settlement_ledger.py   # Subtask 1.2.2 — 50/50 settlement split + 60-day clawback ledger (needs pms_agreements+companies; before RLS)
+PYTHONPATH=. python migrations/apply_settlement_reopen_count.py   # PR #37 re-review fix — inst{1,2}_reopen_count, so a reopened FAILED_PERMANENT retry gets a fresh pay idempotency key instead of replaying the stale cached decline (after apply_settlement_ledger.py, before RLS)
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
+PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
+PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
 PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py  # Task 4.2.1 — Speed-to-Lead columns on inbound_messages (additive; after the three inbound_messages migrations, before RLS)
 PYTHONPATH=. python migrations/apply_stl_cadence.py  # Task 4.2.2 — STL cadence stop-latch columns + stl_cadence_dispatches table (after apply_inbound_messages_lead_fields.py, before RLS)
 PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
@@ -89,6 +92,7 @@ python -m src.agents.respond.worker        # Reply Triage Agent classifier worke
 python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
+python -m src.tasks.billing_sweep               # Subtask 1.2.3 — $50 miss-credit, dispute-credit, 60-day-guarantee sweeps
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches (one client)
 python -m src.tasks.work_order_execution_sweep  # Task 4.2.2 — all-tenant APPROVED work-order dispatcher (runs cmd_sweep per client); wired into the deployed background workers
 python -m src.tasks.enrichment_verification --client-id <id> [--import-id <id>] [--limit 10]  # Subtask 3.2.1 — owner-enrichment (skip-trace) sweep; must run before a Win-Back import can be armed, posts the pre-pilot summary to #blackink-qa
@@ -1036,6 +1040,213 @@ in this repo and is not built here: verification against a *real*
 `StubPmsProvider` returns `None` and correctly refuses to charge or void).
 Landing a real PMS integration is an implementation of the `PmsProvider`
 ABC, not a schema or pipeline change.
+
+### Six Billing Rules (Subtask 1.2.3)
+
+Sept-04 client comments introduced six billing rules the offer sheet now
+depends on (docs/client_responses.md §6b, docs/Sept04_New_Items_Triage.md,
+docs/Week2_Tasks_Dev_Split_v1.md — pulled onto this branch from commit
+`f3bca69` where they were first committed). None of the substrate the spec
+assumes existed beforehand: no `entitlement_offers`, no per-client
+entitlement row, no credit/invoice ledger, no `monthly_cap`, no
+`companies.founding`, no ack-latency columns on `inbound_messages`, and no
+table backing the "proof ledger" the docs mention seven times without ever
+defining. `migrations/apply_entitlements_billing.py` builds all of it;
+`src/services/billing/` and `src/tasks/billing_sweep.py` enforce the six
+rules as config rows and billing-job conditions — never a hardcoded price or
+cap compiled into application branches, per the spec's own Description.
+
+**Deviations from the printed spec, each traced to a real contradiction**
+(never a silent gap, per this repo's standing rule):
+
+- `founding` lives on `clients`, not `companies`. The spec's own phrase is
+  "`companies` table (client rows)" — but in this schema `companies` is the
+  prospected PM-firm pool (`owning_client_id` reassigned every 30 days by
+  `county_allocation_reassessment.py`), not the paying tenant; `clients` is.
+  Exactly the `client_id UUID REFERENCES companies` conflation Subtask 1.1.1
+  already resolved for `appointments`.
+- `offer_code`, not `offer_id`, matching `settlement_offer_config` /
+  `payment_auth_offer_config`.
+- `appt_first` is seeded at `price_cents = 0` (`billing_model = 'FREE'`), not
+  the blueprint matrix's $49 — the only reading under which rule 2 ("first
+  sit... charges $0") and rule 5 (`monthly_cap` NULL on `appt_first`) hold
+  simultaneously.
+- `entitlement_offers.eligibility_predicate` / `trigger_condition` are
+  DOCUMENTATION-ONLY columns — kept for schema fidelity with the printed
+  DDL, but nothing in this codebase ever `text()`s the stored predicate
+  string (storing and evaluating operator-authored SQL is a code-execution
+  surface this subtask does not open).
+- `per_sit_cents` is new: Owner Growth ($749/mo + $99/sit) and Full County
+  ($1,197/mo + $99/sit) are two-part tariffs the printed one-column DDL
+  cannot express.
+- **Proof ledger = `events`.** Named seven times across the Sept-04 docs,
+  defined zero times, backed by no table anywhere in this repo or its
+  history. Interpreted as `events` — the blueprint's own designated "shared
+  ledger of record" and the single existing audit-trail write path
+  (`log_event()`) — rather than a fifth, undefined ledger alongside
+  `settlement_ledger` / the consent ledger / the cost ledger / the referral
+  ledger. Flagged to the client as an open question, not asserted as settled
+  fact.
+- **DB-only subscription override, no real Stripe Subscription yet.** Rule
+  3's "$0 subscription override for the next billing cycle" is implemented
+  as a `subscription_overrides` row a billing job is expected to honor — no
+  Stripe Price object exists for any SKU (the archived source-of-truth
+  references `price_founding_hillsborough_base` / `price_founding_sit_meter`,
+  never created), so real Stripe Subscription creation/price-swap is a
+  separate, later ticket. Every charge this subtask actually verifies in
+  Stripe test mode is a one-off Invoice through the existing `StripeGateway`
+  ABC (`src/services/settlement/gateway.py`) — no second gateway.
+
+**Rule-to-code map:**
+
+1. **$50 miss credit** — `inbound_messages.acked_at` is a NEW clock,
+   deliberately distinct from the pre-existing `claimed_at` (the 30-minute
+   human-SLA claim clock the Reply Triage Agent's own sweep uses). Both must
+   hold at once — the commit that carries the Sept-04 docs is itself named
+   "30-min SLA sweep" — so acked_at is the AUTOMATED first-response
+   timestamp, not the human claim. `ack_latency_seconds` is a STORED
+   generated column (`EXTRACT(EPOCH FROM (acked_at - received_at))`), NULL
+   until `acked_at` is set — so a message NEVER auto-acknowledged (the
+   worst-case SLA breach, strictly worse than a late one) can never satisfy
+   `ack_latency_seconds > 60` on its own; `claim_missed_acks()`'s WHERE
+   clause carries a second OR branch (`acked_at IS NULL AND received_at`
+   old enough) specifically for that case — an earlier version of this
+   query only covered the late-but-eventually-acked case, silently missing
+   the worse one. `src/services/billing/miss_credit.py` claims rows past
+   the 60-second threshold (`SKIP LOCKED`) and writes a `$50` `MISS_CREDIT`
+   row via `src/services/billing/credits.py::issue_credit()`. No
+   human-approval step exists in the path — asserted structurally, not by
+   code review, in `tests/test_billing_structural.py`.
+2. **First sit free** — `client_entitlements.first_sit_consumed`.
+   `src/services/billing/sit_billing.py::resolve_sit_charge()` flips the
+   flag and returns the `appt_first`/$0 charge in the SAME transaction as the
+   flag flip; a concurrent race loses to whichever UPDATE lands first and
+   falls through to `appt_standard`, never double-granting the free sit.
+   Every return path stamps the ACTUAL charge onto
+   `appointments.billed_offer_code`/`billed_amount_cents` — rule 4 (below)
+   reads this back rather than re-deriving "what would this have cost",
+   which is unreliable after the fact (see rule 4).
+3. **60-day guarantee** — eligible only for `owner_growth` / `full_county`
+   entitlements (Respond excluded); `src/services/billing/guarantee.py`
+   counts `ATTENDED AND is_billable` appointments in the 60 days from
+   `client_entitlements.activated_at`; `< 4` inserts one
+   `subscription_overrides` row and flips `guarantee_applied` — both
+   `UNIQUE`-constrained so a re-run can never apply a second override.
+4. **Dispute credit on flagging** — `appointment_disputes.flagged_at` /
+   `outcome DEFAULT 'CREDITED_AUTOMATIC'` already existed
+   (`apply_appointment_ops.py`, Subtask 1.1.1, whose own docstring named this
+   as deferred Week-2 billing logic). `credit_status` (`PENDING` / `CREDITED`
+   / `EXPIRED`) is this rule's own claim-state column, separate from
+   `outcome` — without it, `src/tasks/billing_sweep.py`'s dispute sweep
+   re-selected an EXPIRED (past-window) dispute every tick forever, since
+   nothing marked it terminal; the fix is NOT wrapped in the sweep's usual
+   per-row `session.begin_nested()`, since a savepoint rolled back on the
+   very exception (`DisputeWindowExpiredError`) that signals "mark this
+   EXPIRED" would undo that same write.
+   `src/services/billing/dispute_credit.py::credit_dispute_on_flag()`
+   enforces the 48-hour window from `appointments.scheduled_for` (triage
+   item 10 explicitly overrides the blueprint's superseded "5-business-day"
+   window) and issues the credit for the sit's ACTUAL charge — read from
+   `appointments.billed_amount_cents` (stamped by rule 2's
+   `resolve_sit_charge()`), never re-derived from `entitlement_offers` at
+   dispute time. Re-deriving it was a real bug: it always priced a disputed
+   sit as `appt_standard` ($99), even when the disputed appointment was
+   actually the client's free first sit (billed $0) — `first_sit_consumed`
+   may have already flipped for an unrelated LATER appointment by the time a
+   dispute lands, so there is no reliable way to reconstruct the original
+   charge without having recorded it. A disputed $0 sit now correctly
+   produces no credit row (`billing_credits.amount_cents` is `CHECK > 0`)
+   and is still marked `CREDITED` (the rule was correctly evaluated — there
+   was simply nothing owed). `billing_credits`' own
+   `UNIQUE(client_id, credit_type, source_table, source_id)` is the
+   structural guarantee that a later `resolved_at` update writes nothing.
+5. **No monthly ceiling** — `entitlement_offers.monthly_cap` ships NULL on
+   `appt_standard` and `appt_first`; `sit_billing.py` contains no
+   `COUNT(*) >= cap` predicate of any kind, asserted structurally in
+   `tests/test_billing_structural.py`.
+6. **`founding` flag** — `clients.founding`, and (as of a review fix)
+   `client_entitlements.locked_price_cents` — a real per-account price,
+   snapshotted from `entitlement_offers.price_cents` at provisioning time
+   (`src/services/billing/offers.py::create_client_entitlement()`). An
+   earlier version of `apply_rate_migration()` updated only the single
+   shared `entitlement_offers.price_cents` row and merely COUNTED founding
+   vs. non-founding accounts for logging — there was no per-account price
+   anywhere for a founding row's price to actually stay unchanged AT, so
+   "founding accounts never move" was unverifiable and, per-account, false.
+   `apply_rate_migration()` now updates the shared list price (for future
+   signups) AND every non-founding ACTIVE entitlement's `locked_price_cents`
+   `WHERE NOT c.founding` — a founding row's `locked_price_cents` is never
+   touched again by any migration.
+
+Four sweeps in `src/tasks/billing_sweep.py`
+(`run_miss_credit_sweep` / `run_dispute_credit_sweep` / `run_guarantee_sweep` /
+`run_sit_invoice_sweep`), each `BYPASSRLS` via `get_system_db_context()`, each
+taking an explicit `claim_time`/`as_of` (never SQL `NOW()`) so the 60-second
+and 60-day clocks are fast-forwardable in tests — same discipline as the
+settlement engine. Registered in `src/api/main.py::_start_background_workers`,
+so the same Cloud Run min-instances ≥ 1 caveat that already applies to every
+other background worker in this repo applies here too.
+
+`src/services/billing/invoice_apply.py` applies `PENDING` `billing_credits`
+rows — filtered to the invoice's own `billing_period`, never every still-PENDING
+row regardless of period — to an already-created Stripe invoice as a
+negative-amount invoice item, through the existing
+`StripeGateway.add_invoice_item()` (which now returns the created invoice
+ITEM's own id, stored in `billing_credits.stripe_invoice_item_id` — the
+parent invoice id alone can't identify one line once an invoice carries more
+than one item).
+
+**PR #37 review fixes — closing the "database-only, never reaches Stripe"
+gap.** The first review of this subtask found that `resolve_sit_charge()` and
+`apply_pending_credits_to_invoice()` were both fully implemented but never
+called by any production path — rules 1/2/4/5 only ever produced database
+rows, never a real invoice. The reason: `clients` (the paying tenant) carried
+no Stripe identity anywhere in this repo — `companies.stripe_customer_id`
+(Subtask 1.2.1) is the PROSPECTED PM firm a client is pitching, a different
+entity entirely, and reusing it would invoice the wrong party.
+`migrations/apply_client_billing_account.py` adds the minimal
+`clients.stripe_customer_id` (nullable — no onboarding flow populates it yet,
+same class of gap as the payment-auth onboarding token) and
+`appointments.billing_blocked_reason`. `src/services/billing/sit_invoice.py`'s
+`charge_sit_for_appointment()` is the real wiring: for a client WITH a
+`stripe_customer_id`, it creates a real Stripe invoice (falling back to
+Stripe's `send_invoice` collection when there's no payment method on file,
+rather than a `charge_automatically` attempt with nothing to charge),
+applies this month's pending credits onto it, and finalizes it; for a client
+WITHOUT one, the appointment is marked `billing_blocked_reason =
+'NO_STRIPE_CUSTOMER'` and excluded from the claim query — never crashed on,
+never guessed. `run_sit_invoice_sweep` claims `ATTENDED`, billable, unbilled,
+unblocked appointments and calls it.
+
+Other fixes from that review: `resolve_sit_charge()` is now IDEMPOTENT per
+appointment — once `appointments.billed_offer_code` is set, every later call
+returns that recorded charge unconditionally rather than re-evaluating
+`first_sit_consumed` (a retried call could otherwise silently rebill a free
+first sit as $99). `issue_credit()` now detects a duplicate via
+`INSERT ... ON CONFLICT DO NOTHING RETURNING` instead of catching every
+`IntegrityError` — a real FK/CHECK violation now propagates and retries
+instead of being mistaken for "already credited." `run_miss_credit_sweep`
+fails CLOSED behind `settings.billing_miss_credit_sweep_enabled` (default
+`False`) until a real automated-ack sender actually writes
+`inbound_messages.acked_at` somewhere — before this fix, every unclassified
+email older than 60 seconds looked identical to a genuine miss.
+`_resolve_disputed_sit_amount_cents()` no longer falls back to
+`appt_standard`'s current price when `billed_amount_cents` is missing — it
+raises `MissingBilledAmountError` and marks the dispute
+`credit_status = 'BLOCKED'` (a new value alongside PENDING/CREDITED/EXPIRED),
+since guessing had silently overcredited a disputed FREE first sit.
+`evaluate_sixty_day_guarantee()` now takes a `SELECT ... FOR UPDATE` lock on
+the entitlement row and checks the `guarantee_applied` UPDATE's `rowcount`
+before proceeding (closing a race between two concurrent evaluations of the
+same client), and its override's `billing_period` is anchored on the
+entitlement's own `activated_at` day-of-month (a real subscription
+anniversary) rather than unconditionally the 1st of the next calendar month.
+Founding accounts are provisioned via the new
+`src/services/clients.py::provision_client()` — the one write path for a
+`clients` row, with `founding` a REQUIRED keyword argument (no default), so a
+future onboarding flow cannot silently default a real founding client to
+`False`; `tests/test_billing_structural.py` asserts both the missing default
+and that no other production code path INSERTs into `clients`.
 
 ## Tooling Rules
 

@@ -292,7 +292,25 @@ def _handle_settlement_event(event: dict) -> dict:
 			)
 		elif event_type == "invoice.payment_failed":
 			last_error = (obj.get("last_finalization_error") or {}).get("message", "invoice.payment_failed")
-			mark_installment_failed(session, transaction_id, installment, attempts=0, error=last_error)
+			# PR #37 third review finding #2: this used to hardcode
+			# attempts=0, so a webhook-driven ACH failure could never cross
+			# mark_installment_failed's _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT
+			# threshold — an ACH decline retried forever instead of the same
+			# 3-attempt budget a synchronous card decline gets.
+			# inst{N}_attempts is set by claim_installment_1/2's own claim
+			# UPDATE for the attempt this webhook reports the outcome of,
+			# never incremented again here — read it FOR UPDATE so a
+			# concurrent claim/reopen can't race this read.
+			attempts_col = f"inst{installment}_attempts"
+			attempts_row = session.execute(
+				text(
+					f"SELECT {attempts_col} AS attempts FROM settlement_transactions "
+					f"WHERE transaction_id = :tid FOR UPDATE"
+				),
+				{"tid": transaction_id},
+			).first()
+			attempts = attempts_row.attempts if attempts_row is not None else 0
+			mark_installment_failed(session, transaction_id, installment, attempts=attempts, error=last_error)
 		elif event_type == "invoice.voided":
 			row = session.execute(
 				text(
