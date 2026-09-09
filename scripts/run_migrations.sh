@@ -65,10 +65,18 @@ MIGRATIONS=(
   apply_payment_auth_capture
   apply_pms_agreements
   apply_settlement_ledger
+  apply_settlement_reopen_count
   apply_inbound_messages
   apply_inbound_messages_sla
   apply_respond_routing_gaps
+  apply_entitlements_billing
+  apply_client_billing_account
+  apply_ghost_shopper_reactivation
+  apply_ghost_shopper_replies
+  apply_ghost_form_submissions
+  apply_ovs_data_coverage
   apply_inbound_messages_lead_fields
+  apply_stl_cadence
   apply_winback_imports
   apply_winback_touch_sequence
   apply_winback_enrichment
