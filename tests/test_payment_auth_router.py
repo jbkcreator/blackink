@@ -191,6 +191,17 @@ def test_status_rejects_missing_authorization_header():
 	assert resp.status_code == 401
 
 
+def test_status_rejects_query_string_token():
+	"""PR #36 review finding 2 — a query-string onboarding_token must never
+	be honored again, since query strings are routinely retained in browser
+	history / proxy / observability logs. Missing the header entirely (no
+	matter what's in the query string) must 422/401, never authenticate."""
+	resp = client.get(
+		"/api/v1/onboarding/payment-auth/status", params={"onboarding_token": _token()}
+	)
+	assert resp.status_code in (401, 422)
+
+
 def test_status_404_for_unknown_company(monkeypatch, _db_session):
 	_db_session.execute.return_value.first.return_value = None
 	resp = client.get(

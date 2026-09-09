@@ -312,11 +312,13 @@ def payment_auth_status(authorization: Optional[str] = Header(default=None)) -> 
 	other two endpoints, but carried in the Authorization header rather
 	than a URL query parameter. A query-string token is routinely retained
 	in browser history, reverse-proxy/access logs, and observability
-	systems — none of which should see a live onboarding credential (PR #37
-	review finding #7, recovering a fix first written under PR #36's review
-	on a since-abandoned branch). Lets the frontend poll after an
-	"ach_pending" confirm response to learn when the webhook has finished
-	the ACH rail, without re-deriving state itself."""
+	systems — none of which should see a live onboarding credential (fixed
+	independently on two stacked branches: PR #36 review finding 2, and PR
+	#37 review finding #7). Declared `Optional[...] = Header(default=None)`
+	rather than `Header(...)` so a missing header hits our own 401 branch
+	below instead of FastAPI's generic 422 validation error. Lets the
+	frontend poll after an "ach_pending" confirm response to learn when the
+	webhook has finished the ACH rail, without re-deriving state itself."""
 	if not authorization or not authorization.startswith("Bearer "):
 		raise HTTPException(status_code=401, detail="Expected 'Authorization: Bearer <onboarding_token>'")
 	onboarding_token = authorization[len("Bearer "):]
