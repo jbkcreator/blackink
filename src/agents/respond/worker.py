@@ -186,9 +186,9 @@ def _route(
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
     sla_due_at   = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
 
-    # QUESTION: run KB matcher to determine requires_human_review.
-    # High-confidence match (>=0.90) → draft card queued, no human review needed yet.
-    # Low-confidence or no match → requires_human_review=TRUE, card still posted.
+    # QUESTION: run KB matcher; requires_human_review is gated on LLM classification
+    # confidence (>= 0.90 means the intent is trusted enough for auto-response).
+    # The KB card type (high/low/no-match) is determined separately by kb_match.
     kb_match = None
     requires_human_review = False
     if result.intent == Intent.QUESTION:
@@ -196,10 +196,7 @@ def _route(
             kb_match = match_kb(db, _load_body(db, db_id))
         except Exception:
             logger.exception("respond.worker: kb match failed for db_id=%s", db_id)
-        if kb_match and kb_match.match_confidence >= 0.90:
-            requires_human_review = False
-        else:
-            requires_human_review = True
+        requires_human_review = result.confidence < 0.90
 
     # Pre-commit side-effects that must be atomic with the status write.
     if result.intent == Intent.UNSUBSCRIBE:
