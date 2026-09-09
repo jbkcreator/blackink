@@ -1,14 +1,9 @@
 """Application configuration powered by Pydantic settings.
 
-Mirrors Forced Action's config/settings.py convention (single AppSettings,
-env_file=".env", Field(..., env="...") per var, @lru_cache singleton) —
-see C:\\Users\\HEU-Vishnu\\Forced-action-\\config\\settings.py.
-
-Which file gets loaded is controlled by the ENV_FILE shell environment
-variable (not itself read from any .env file — set it before running a
-command), defaulting to ".env". Local Docker-Postgres testing should use a
-permanent, gitignored ".env.local" instead of overwriting the real ".env" —
-see CLAUDE.md's "Local development database" section:
+Single AppSettings class, env_file=".env", Field(..., env="...") per var,
+@lru_cache singleton. Which file gets loaded is controlled by the ENV_FILE
+shell environment variable (not itself read from any .env file — set it
+before running a command), defaulting to ".env".
 
     $env:ENV_FILE=".env.local"
     python migrations/apply_db_roles.py
