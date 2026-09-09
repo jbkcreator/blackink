@@ -372,6 +372,51 @@ class AppSettings(BaseSettings):
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
+	# ── Stripe — Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1) ─
+	# Greenfield integration — no Stripe usage existed anywhere in this repo
+	# before this subtask. Test-mode keys only until the applicable offers are
+	# confirmed with the client (see payment_auth_offer_config — this flow is
+	# explicitly NOT a universal zero-upfront rule; self-serve Respond/bundle
+	# signups charge at signup via Stripe Checkout, unrelated to this flow).
+	stripe_secret_key: Optional[SecretStr] = Field(default=None, env="STRIPE_SECRET_KEY")
+	stripe_publishable_key: Optional[str] = Field(default=None, env="STRIPE_PUBLISHABLE_KEY")
+	# Signs inbound Stripe webhook payloads (stripe.Webhook.construct_event) —
+	# same fail-closed posture as every other secret here: unset means the
+	# webhook route rejects everything rather than trusting an unsigned body.
+	stripe_webhook_secret: Optional[SecretStr] = Field(default=None, env="STRIPE_WEBHOOK_SECRET")
+	# Signs the short-lived onboarding token that stands in for the not-yet-
+	# built authenticated onboarding portal (see src/services/payment_auth_token.py).
+	# Deliberately its own secret, not a reuse of calendar_oauth_state_secret
+	# or no_show_token_secret — same rationale as those: unrelated token
+	# families must be able to rotate independently.
+	payment_auth_onboarding_token_secret: Optional[SecretStr] = Field(
+		default=None, env="PAYMENT_AUTH_ONBOARDING_TOKEN_SECRET"
+	)
+
+	# ── Settlement engine — 50/50 split + 60-day clawback (Subtask 1.2.2) ────
+	# Which store publishes the Evidence Packet PDF and links it on the
+	# Stripe invoice. Unset -> src/services/settlement/store.py falls back to
+	# StubEvidencePacketStore, which always returns None — the same
+	# fail-closed posture as EMAIL_SENDING_ENABLED / OVS_PDF_ALLOWED_HOSTS: a
+	# charge cannot be recorded without a published packet (see
+	# ck_settlement_evidence_packet_required / trg_settlement_guard_transition
+	# in migrations/apply_settlement_ledger.py), so with no store configured
+	# the pipeline compiles packets and bills nothing.
+	settlement_evidence_packet_store: Optional[str] = Field(
+		default=None, env="SETTLEMENT_EVIDENCE_PACKET_STORE"
+	)
+	# Only "stripe_files" is implemented today (Stripe Files + FileLink —
+	# Invoices have no attachment field of their own, so this is the
+	# zero-new-infrastructure option). Any other value is treated as unset.
+
+	# Gates src/api/settlement_router.py's synthetic door_signed ingest —
+	# the DoD's own test path, since no nightly PMS sync exists. Unset means
+	# every request to that route is rejected (HTTP 503), same fail-closed
+	# posture as every other secret-gated route in this file.
+	settlement_operator_api_key: Optional[SecretStr] = Field(
+		default=None, env="SETTLEMENT_OPERATOR_API_KEY"
+	)
+
 	# ── Respond Reply Triage Agent ───────────────────────────────────────────
 	# Fail-closed: if ANTHROPIC_API_KEY is unset the classifier returns the
 	# NURTURE fallback on every non-deterministic message rather than raising.
