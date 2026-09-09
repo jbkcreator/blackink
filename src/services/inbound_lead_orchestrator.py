@@ -145,6 +145,15 @@ def _run(session: Session, lead: InboundLead) -> PipelineResult:
         # durable record; the card is best-effort.
         logger.exception("[inbound] closer alert failed for message_id=%s", message_id)
 
+    # ── 6. Arm cadence: enqueue +24h check for the 5-touch follow-up ──────
+    # Task 4.2.2 — best-effort, never blocks the pipeline. A failure here
+    # is logged; the arm-check work order can always be re-enqueued manually.
+    try:
+        from src.services.stl_cadence import arm_cadence
+        arm_cadence(session, lead.client_id, message_id, now_utc)
+    except Exception:
+        logger.exception("[inbound] cadence arm failed for message_id=%s", message_id)
+
     return PipelineResult(message_id=message_id, outcome="written")
 
 

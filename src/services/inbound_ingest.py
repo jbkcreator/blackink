@@ -31,6 +31,7 @@ from src.services.inbound_attribution import (
 from src.services.ovs_lookup import fetch_latest_ovs, ovs_card_lines
 from src.services.slack import post as slack_post
 from src.services.slack.listeners import sales_reply_content_blocks
+from src.services.stl_cadence import stop_active_stl_cadences
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,19 @@ async def ingest_inbound_reply(parsed: InboundParsed) -> dict:
         if client_id is None:
             logger.warning("[inbound_ingest] unknown alias=%s — discarding", parsed.to_alias)
             return {"status": "discarded", "reason": "unknown_alias"}
+
+        # Task 4.2.2 — a Speed-to-Lead lead who replies must stop their inbound
+        # cadence. STL leads are contactless (contact_id NULL), so the cold
+        # attribution below can never latch them; this is a separate, additive
+        # stop keyed purely on the sender email against ARMED STL cadences.
+        #
+        # Committed up front, in its own transaction, on purpose: the cold-reply
+        # persistence below (owned by Task 3.1.3) targets an older inbound_messages
+        # shape and is independently broken on the current deployed schema — the
+        # STL stop must not be coupled to it. Email-matched, so a BCC echo (from
+        # our own mailbox, not the prospect) can never match a prospect's cadence.
+        stop_active_stl_cadences(session, client_id, from_address, "REPLY")
+        session.commit()
 
         if is_bcc_echo(session, parsed.inbound_message_id):
             logger.info(

@@ -80,6 +80,15 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"speed_to_lead_response_sent": frozenset({"message_id", "ack_latency_seconds"}),
 	"closer_alert_posted": frozenset({"message_id", "slack_channel"}),
 	"context_card_generated": frozenset({"intent_class", "sla_due_at"}),
+	# Subtask 1.2.3 — Six Billing Rules. "Proof ledger" (named repeatedly in
+	# the Sept-04 client docs but never defined or backed by a table anywhere)
+	# is interpreted as this events stream — see
+	# migrations/apply_entitlements_billing.py's module docstring.
+	"respond_ack_missed": frozenset({"inbound_message_id", "ack_latency_seconds", "channel"}),
+	"billing_credit_issued": frozenset({"credit_id", "credit_type", "amount_cents", "billing_period"}),
+	"first_sit_consumed": frozenset({"client_id", "appointment_id", "offer_code"}),
+	"sixty_day_guarantee_applied": frozenset({"client_id", "attended_sit_count", "billing_period"}),
+	"rate_migration_applied": frozenset({"offer_code", "new_price_cents", "clients_updated", "founding_skipped"}),
 	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Per-disposition-bucket counts,
 	# not just a total, so the proof-ledger-style visibility the spec asks
 	# for ("winback_import_completed event written with row counts for each
@@ -93,6 +102,16 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 			"unknown_count",
 			"suppressed_count",
 		}
+	),
+	# Subtask 3.2.1 — Enrichment Pipeline Wiring Verification. `provider` is
+	# required because the DoD names it explicitly ("event logged with
+	# provider field populated"). `signal_source` ("WINBACK_IMPORT" today,
+	# "HOMESTEAD_DROP" / "SPEED_TO_LEAD" once those pipelines produce
+	# signals of their own — see src/services/owner_enrichment.py's
+	# enrich_homestead_drop_signals) is what makes the client's "for every
+	# signal" requirement auditable per source, not just in aggregate.
+	"owner_enrichment_completed": frozenset(
+		{"provider", "signal_source", "email_found", "phone_found", "requires_review"}
 	),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_

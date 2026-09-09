@@ -151,9 +151,32 @@ def dispatch_manual_task(order: WorkOrder) -> dict:
 _DEFER_OUTCOMES = {"VOLUME_CAP", "NO_MAILBOX"}          # transient availability — retry
 _FAIL_OUTCOMES = {"SEND_FAILED", "RECLAIMED", "NO_CONTENT"}  # ambiguous/failed — reconcile
 
+def dispatch_stl_cadence_touch_wrapper(order: WorkOrder) -> dict:
+	"""DISPATCH_STL_CADENCE_TOUCH — Task 4.2.2 Speed-to-Lead cadence follow-up.
+
+	Delegates to stl_cadence.dispatch_stl_cadence_touch, which handles the
+	pre-send gate check, at-most-once claim, SMTP send, and post-send write.
+	PostSendError (email sent but status write failed) returns a fail receipt
+	rather than re-sending, matching the same discipline as speed_to_lead_sweep."""
+	from src.services.stl_cadence import (
+		_PostSendError,
+		dispatch_stl_cadence_touch,
+	)
+
+	try:
+		return dispatch_stl_cadence_touch(order)
+	except _PostSendError as exc:
+		logger.error(
+			"dispatch_stl_cadence_touch: post-send write failed action_id=%s: %s — marking fail for reconciliation",
+			order.action_id, exc,
+		)
+		return {"outcome": "POST_SEND_WRITE_FAILED", "message_id": order.entity_id, "fail": True}
+
+
 DISPATCHERS: Dict[str, Callable[[WorkOrder], dict]] = {
 	"noop": noop_dispatch,
 	"setter": dispatch_email_touch,
 	"manual": dispatch_manual_task,
 	"winback": dispatch_winback_touch,
+	"stl_cadence": dispatch_stl_cadence_touch_wrapper,    # Task 4.2.2
 }

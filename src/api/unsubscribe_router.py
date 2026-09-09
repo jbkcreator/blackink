@@ -26,6 +26,7 @@ from sqlalchemy import text
 
 from src.core.database import get_db_context
 from src.services.email_unsubscribe import verify_unsubscribe_token
+from src.services.stl_cadence import stop_active_stl_cadences
 from src.services.winback_sequencer import stop_active_winback_runs
 
 router = APIRouter(prefix="/api/v1/public", tags=["public-unsubscribe"])
@@ -49,6 +50,8 @@ def _do_unsubscribe(token: str) -> HTMLResponse:
 			{"email": email},
 		)
 		stop_active_winback_runs(session, client_id, email, "OPT_OUT")
+		# Task 4.2.2 — also stop any active STL cadences for this prospect.
+		stop_active_stl_cadences(session, client_id, email, "OPT_OUT")
 		session.commit()
 
 	return HTMLResponse(_CONFIRMED_HTML, status_code=200)

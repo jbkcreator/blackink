@@ -17,6 +17,8 @@ def _row(agreement_source: str) -> SimpleNamespace:
 	return SimpleNamespace(
 		transaction_id=1, client_id="acme", company_id="co1", opportunity_id="opp-1", door_count=3,
 		installment_1_cents=5_000, installment_2_cents=5_000, inst1_attempts=0, inst2_attempts=0,
+		inst1_reopen_count=0, inst2_reopen_count=0,
+		inst1_stripe_invoice_id=None, inst2_stripe_invoice_id=None,
 		evidence_packet_url="https://files.stripe.com/already-published.pdf",
 		door_signed_at=_AS_OF, pms_agreement_id=1, agreement_source=agreement_source, agreement_status="ACTIVE",
 		stripe_customer_id="cus_123", ach_payment_method_id_encrypted="enc-ach", card_payment_method_id_encrypted="enc-card",
@@ -45,7 +47,18 @@ class _FakeSession:
 		sql = str(stmt)
 		if "FROM settlement_transactions t" in sql:
 			return _FakeResult(self.row)
+		if "UPDATE settlement_transactions SET" in sql and "stripe_invoice_id" in sql and params:
+			self.row.inst1_stripe_invoice_id = params.get("invoice_id", self.row.inst1_stripe_invoice_id)
 		return _FakeResult(None)
+
+	def begin_nested(self):
+		from contextlib import contextmanager
+
+		@contextmanager
+		def _cm():
+			yield
+
+		return _cm()
 
 	def rollback(self):
 		pass
@@ -59,6 +72,14 @@ class _RecordingGateway(StripeGateway):
 	def create_invoice(self, **kw):
 		self.calls.append("create_invoice")
 		return InvoiceHandle(stripe_invoice_id="in_123", status="draft")
+
+	def find_invoice_by_metadata(self, **kw):
+		self.calls.append("find_invoice_by_metadata")
+		return None
+
+	def retrieve_invoice(self, *, stripe_invoice_id):
+		self.calls.append("retrieve_invoice")
+		return InvoiceHandle(stripe_invoice_id=stripe_invoice_id, status="draft")
 
 	def add_invoice_item(self, **kw):
 		self.calls.append("add_invoice_item")

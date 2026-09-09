@@ -17,7 +17,7 @@ from sqlalchemy import text
 from src.core.database import get_system_db_context
 from src.services.pms_sync import StubPmsProvider
 from src.services.settlement.charge import charge_installment
-from src.services.settlement.clawback import process_installment_2
+from src.services.settlement.clawback import process_installment_2, void_terminated_installment_2_batch
 from src.services.settlement.ledger import claim_installment_1, claim_installment_2
 
 logger = logging.getLogger(__name__)
@@ -66,16 +66,26 @@ def run_installment_1_sweep(limit: int = 20, *, claim_time: datetime | None = No
 
 
 def run_installment_2_sweep(limit: int = 20, *, claim_time: datetime | None = None) -> int:
+	"""PR #37 review finding #1: void_terminated_installment_2_batch() runs
+	FIRST, before claim_installment_2()'s own CHARGING claim — a transaction
+	whose agreement terminated inside the clawback window is now EXCLUDED
+	from that claim (the guard trigger would otherwise reject entry into
+	CHARGING for it and abort the whole bulk UPDATE, taking every other
+	transaction in the same claim batch down with it), so this is what
+	actually reaches VOIDED_CLAWBACK for it instead."""
 	claim_time = claim_time or datetime.now(timezone.utc)
 	pms = StubPmsProvider()
 	processed = 0
 	with get_system_db_context() as session:
+		voided = void_terminated_installment_2_batch(session, limit=limit)
 		claimed = claim_installment_2(session, claim_time=claim_time, limit=limit)
 		for transaction_id in claimed:
 			with session.begin_nested():
 				process_installment_2(session, transaction_id, as_of=claim_time, pms=pms)
 			processed += 1
-	logger.info("settlement_sweep.installment_2: processed %d transaction(s)", processed)
+	logger.info(
+		"settlement_sweep.installment_2: voided %d terminated, processed %d transaction(s)", voided, processed,
+	)
 	return processed
 
 

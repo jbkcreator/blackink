@@ -213,6 +213,21 @@ DDL = [
 		CONSTRAINT uq_settlement_agreement UNIQUE (client_id, pms_agreement_id)
 	)
 	""",
+	# PR #37 review finding #2: an exactly-once-alert guard for the terminal
+	# FAILED_PERMANENT state, mirroring the existing inst{N}_blocked_reason
+	# columns' role for the transient-BLOCKED alert. A compare-and-swap
+	# UPDATE ... WHERE {prefix}_alerted_permanent_at IS NULL in
+	# ledger.mark_installment_failed() is what makes "exactly one incident"
+	# provable even under a concurrent/duplicate call, and
+	# ledger.reopen_failed_permanent_installment() clears it back to NULL so
+	# a LATER FAILED_PERMANENT (after a manual reopen and a fresh 3-attempt
+	# budget) can alert again.
+	# Rollback: additive, nullable columns — safe to leave on the live
+	# server; undo only with a manual
+	# `ALTER TABLE settlement_transactions DROP COLUMN inst1_alerted_permanent_at, DROP COLUMN inst2_alerted_permanent_at`
+	# if ever needed (no down-migration exists in this repo).
+	"ALTER TABLE settlement_transactions ADD COLUMN IF NOT EXISTS inst1_alerted_permanent_at TIMESTAMPTZ",
+	"ALTER TABLE settlement_transactions ADD COLUMN IF NOT EXISTS inst2_alerted_permanent_at TIMESTAMPTZ",
 	"CREATE INDEX IF NOT EXISTS ix_settlement_client ON settlement_transactions(client_id)",
 	"CREATE INDEX IF NOT EXISTS ix_settlement_inst1_claim ON settlement_transactions(installment_1_status, inst1_next_retry_at)",
 	"CREATE INDEX IF NOT EXISTS ix_settlement_inst2_claim ON settlement_transactions(installment_2_status, installment_2_scheduled_for)",

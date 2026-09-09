@@ -162,10 +162,17 @@ def record_agreement_terminated(
 	"""Writes ONLY pms_agreements.terminated_at/status — the client_pm_books
 	claim row from record_door_signed() is left completely untouched, so
 	is_claimed_by_other_client() semantics do not change (see the migration
-	docstring). If a settlement row's installment 2 is still eligible for
-	the clawback window, this flips it to VOIDED_CLAWBACK immediately —
-	the sweep is the backstop for a missed termination event, not the
-	mechanism."""
+	docstring).
+
+	No production caller exists yet for this function (no PMS webhook/API
+	route feeds a real termination event into it — the same documented gap
+	as StubPmsProvider). The sweep's own claim_terminated_installment_2_for_void()
+	(this module) plus src/services/settlement/clawback.py's
+	void_terminated_installment_2_batch() are what ACTUALLY reach
+	VOIDED_CLAWBACK in production today, reading pms_agreements.terminated_at
+	however it got set (this function, a direct UPDATE, or a future real
+	integration) — this function does not need to duplicate that logic
+	itself; it is not the mechanism, the sweep is."""
 	session.execute(
 		text(
 			"UPDATE pms_agreements SET status = 'TERMINATED', terminated_at = :terminated_at, "
@@ -257,6 +264,16 @@ def open_settlement(
 
 
 def claim_installment_1(session: Session, *, claim_time: datetime, limit: int = 20) -> list[int]:
+	"""PR #37 review finding #1: the inner SELECT excludes any transaction
+	whose agreement is not ACTIVE. Without this, a single terminated
+	agreement in an otherwise-healthy batch makes the trigger's "installment
+	1 requires the agreement still be ACTIVE" guard raise on entry into
+	CHARGING — since this is one bulk UPDATE covering every claimed row, that
+	exception aborts the ENTIRE statement, so no row in the batch (not just
+	the terminated one) gets claimed. A terminated-before-ever-charged
+	agreement simply never reaches installment 1 (consistent with the
+	trigger's own ACTIVE requirement — this rule was already correct, only
+	unreachable for the rest of the batch alongside it)."""
 	rows = session.execute(
 		text(
 			f"""
@@ -264,17 +281,21 @@ def claim_installment_1(session: Session, *, claim_time: datetime, limit: int = 
 			SET installment_1_status = 'CHARGING', inst1_attempts = inst1_attempts + 1,
 				inst1_claimed_at = :claim_time
 			WHERE transaction_id IN (
-				SELECT transaction_id FROM settlement_transactions
-				WHERE (installment_1_status = 'PENDING'
-						AND (inst1_next_retry_at IS NULL OR inst1_next_retry_at <= :claim_time))
-					OR (installment_1_status = 'FAILED' AND inst1_next_retry_at <= :claim_time)
-					OR (installment_1_status = 'CHARGING'
-						AND inst1_claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
-					OR (installment_1_status = 'BLOCKED'
-						AND inst1_blocked_reason = ANY(:retryable_reasons)
-						AND inst1_next_retry_at IS NOT NULL AND inst1_next_retry_at <= :claim_time)
-				ORDER BY transaction_id
-				FOR UPDATE SKIP LOCKED
+				SELECT t.transaction_id FROM settlement_transactions t
+				JOIN pms_agreements a ON a.pms_agreement_id = t.pms_agreement_id
+				WHERE a.status = 'ACTIVE'
+					AND (
+						(t.installment_1_status = 'PENDING'
+							AND (t.inst1_next_retry_at IS NULL OR t.inst1_next_retry_at <= :claim_time))
+						OR (t.installment_1_status = 'FAILED' AND t.inst1_next_retry_at <= :claim_time)
+						OR (t.installment_1_status = 'CHARGING'
+							AND t.inst1_claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
+						OR (t.installment_1_status = 'BLOCKED'
+							AND t.inst1_blocked_reason = ANY(:retryable_reasons)
+							AND t.inst1_next_retry_at IS NOT NULL AND t.inst1_next_retry_at <= :claim_time)
+					)
+				ORDER BY t.transaction_id
+				FOR UPDATE OF t SKIP LOCKED
 				LIMIT :limit
 			)
 			RETURNING transaction_id
@@ -286,6 +307,16 @@ def claim_installment_1(session: Session, *, claim_time: datetime, limit: int = 
 
 
 def claim_installment_2(session: Session, *, claim_time: datetime, limit: int = 20) -> list[int]:
+	"""PR #37 review finding #1: the inner SELECT excludes any transaction
+	whose agreement terminated inside its own offer's clawback window — the
+	same "one bad row aborts the whole bulk UPDATE" failure mode as
+	claim_installment_1, this time against the trigger's "installment 2
+	requires the agreement not to have terminated inside the clawback
+	window" guard. Such a row must never enter CHARGING at all; it belongs
+	to claim_terminated_installment_2_for_void() instead, which the sweep
+	runs BEFORE this claim (this predicate is the defense-in-depth backstop
+	for a termination landing between those two steps in the same tick, not
+	the primary path)."""
 	rows = session.execute(
 		text(
 			f"""
@@ -293,18 +324,26 @@ def claim_installment_2(session: Session, *, claim_time: datetime, limit: int = 
 			SET installment_2_status = 'CHARGING', inst2_attempts = inst2_attempts + 1,
 				inst2_claimed_at = :claim_time
 			WHERE transaction_id IN (
-				SELECT transaction_id FROM settlement_transactions
-				WHERE ((installment_2_status = 'SCHEDULED' AND installment_2_scheduled_for <= :claim_time)
-						AND (inst2_next_retry_at IS NULL OR inst2_next_retry_at <= :claim_time))
-					OR (installment_2_status = 'FAILED' AND inst2_next_retry_at <= :claim_time)
-					OR (installment_2_status = 'CHARGING'
-						AND inst2_claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
-					OR (installment_2_status = 'BLOCKED'
-						AND inst2_blocked_reason = ANY(:retryable_reasons)
-						AND installment_2_scheduled_for <= :claim_time
-						AND inst2_next_retry_at IS NOT NULL AND inst2_next_retry_at <= :claim_time)
-				ORDER BY transaction_id
-				FOR UPDATE SKIP LOCKED
+				SELECT t.transaction_id FROM settlement_transactions t
+				JOIN pms_agreements a ON a.pms_agreement_id = t.pms_agreement_id
+				JOIN settlement_offer_config o ON o.offer_code = t.offer_code
+				WHERE NOT (
+						a.terminated_at IS NOT NULL AND o.clawback_window_days IS NOT NULL
+						AND a.terminated_at < t.door_signed_at + (o.clawback_window_days || ' days')::INTERVAL
+					)
+					AND (
+						((t.installment_2_status = 'SCHEDULED' AND t.installment_2_scheduled_for <= :claim_time)
+							AND (t.inst2_next_retry_at IS NULL OR t.inst2_next_retry_at <= :claim_time))
+						OR (t.installment_2_status = 'FAILED' AND t.inst2_next_retry_at <= :claim_time)
+						OR (t.installment_2_status = 'CHARGING'
+							AND t.inst2_claimed_at < :claim_time - INTERVAL '{_CLAIM_LEASE_MINUTES} minutes')
+						OR (t.installment_2_status = 'BLOCKED'
+							AND t.inst2_blocked_reason = ANY(:retryable_reasons)
+							AND t.installment_2_scheduled_for <= :claim_time
+							AND t.inst2_next_retry_at IS NOT NULL AND t.inst2_next_retry_at <= :claim_time)
+					)
+				ORDER BY t.transaction_id
+				FOR UPDATE OF t SKIP LOCKED
 				LIMIT :limit
 			)
 			RETURNING transaction_id
@@ -313,6 +352,47 @@ def claim_installment_2(session: Session, *, claim_time: datetime, limit: int = 
 		{"claim_time": claim_time, "limit": limit, "retryable_reasons": list(_RETRYABLE_BLOCKED_REASONS)},
 	).all()
 	return [r.transaction_id for r in rows]
+
+
+def claim_terminated_installment_2_for_void(session: Session, *, limit: int = 20) -> list[dict]:
+	"""PR #37 review finding #1 — the other half of claim_installment_2's
+	exclusion: a transaction excluded from that claim because its agreement
+	terminated inside the clawback window must still actually REACH
+	VOIDED_CLAWBACK, not sit excluded forever. Locks (FOR UPDATE SKIP LOCKED)
+	without transitioning status yet — the trigger permits a direct
+	transition into VOIDED_CLAWBACK from any prior state (only entry into
+	CHARGING/SETTLING/CHARGED is guarded), so the caller
+	(clawback.void_terminated_installment_2_batch) writes that terminal
+	status itself, after voiding any Stripe invoice that may already exist
+	for the row."""
+	rows = session.execute(
+		text(
+			"""
+			SELECT t.transaction_id, t.client_id, t.installment_2_cents, t.inst2_stripe_invoice_id,
+				t.door_signed_at, a.terminated_at
+			FROM settlement_transactions t
+			JOIN pms_agreements a ON a.pms_agreement_id = t.pms_agreement_id
+			JOIN settlement_offer_config o ON o.offer_code = t.offer_code
+			WHERE t.installment_2_status IN ('SCHEDULED', 'FAILED', 'BLOCKED')
+				AND a.terminated_at IS NOT NULL
+				AND o.clawback_window_days IS NOT NULL
+				AND a.terminated_at < t.door_signed_at + (o.clawback_window_days || ' days')::INTERVAL
+			ORDER BY t.transaction_id
+			FOR UPDATE OF t SKIP LOCKED
+			LIMIT :limit
+			"""
+		),
+		{"limit": limit},
+	).all()
+	return [
+		{
+			"transaction_id": r.transaction_id, "client_id": r.client_id,
+			"installment_2_cents": r.installment_2_cents,
+			"inst2_stripe_invoice_id": r.inst2_stripe_invoice_id,
+			"door_signed_at": r.door_signed_at, "terminated_at": r.terminated_at,
+		}
+		for r in rows
+	]
 
 
 def mark_installment(
@@ -358,7 +438,10 @@ def mark_installment(
 	)
 
 
-def mark_installment_failed(session: Session, transaction_id: int, installment: int, attempts: int, error: str) -> None:
+def mark_installment_failed(
+	session: Session, transaction_id: int, installment: int, attempts: int, error: str,
+	*, stripe_invoice_id: Optional[str] = None,
+) -> bool:
 	"""Bounded retry, same convention as self_serve_audit_worker.py: 2**attempts
 	minutes backoff until _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT, then a
 	terminal status excluded from the claim query forever.
@@ -368,14 +451,97 @@ def mark_installment_failed(session: Session, transaction_id: int, installment: 
 	up after bounded retries is correct. Never use this for a BLOCKED-for-a-
 	transient-reason row (a Stripe Files outage, a day-60 PMS timeout) — those
 	retry indefinitely, because forfeiting 50% of a bounty is strictly worse
-	than a row retrying quietly (PR #30 review findings 1 & 2)."""
+	than a row retrying quietly (PR #30 review findings 1 & 2).
+
+	stripe_invoice_id (PR #37 review finding #2) is threaded through even on
+	a FAILED/FAILED_PERMANENT decline — the invoice was already created and
+	finalized by the time a pay_invoice call declines, and without recording
+	it here a retry had no way to know that and would call create_invoice
+	again under charge.py's OBJECT-creation idempotency key (which does
+	protect against Stripe seeing two calls within its own ~24h retention
+	window, but this stored id is what lets charge_installment reuse the
+	SAME invoice deliberately, by choice, not by hoping the key cache is
+	still warm).
+
+	Returns True exactly once — the specific call that FIRST transitions this
+	installment into FAILED_PERMANENT (a compare-and-swap on
+	inst{N}_alerted_permanent_at, so a duplicate/racing call for the same
+	already-FAILED_PERMANENT row never returns True twice) — the caller
+	(charge.py) emits settlement_charge_failed_permanent only on that edge,
+	giving "exactly one incident per terminal failure" a real guarantee
+	rather than an per-call assumption."""
 	from datetime import timedelta, timezone
 
 	if attempts >= _MAX_ATTEMPTS_BEFORE_FAILED_PERMANENT:
-		mark_installment(session, transaction_id, installment, "FAILED_PERMANENT", error=error)
+		mark_installment(
+			session, transaction_id, installment, "FAILED_PERMANENT", error=error, stripe_invoice_id=stripe_invoice_id,
+		)
+		prefix = "inst1" if installment == 1 else "inst2"
+		alerted = session.execute(
+			text(
+				f"UPDATE settlement_transactions SET {prefix}_alerted_permanent_at = NOW() "
+				f"WHERE transaction_id = :tid AND {prefix}_alerted_permanent_at IS NULL "
+				f"RETURNING transaction_id"
+			),
+			{"tid": transaction_id},
+		).first()
+		return alerted is not None
 	else:
 		next_retry_at = datetime.now(timezone.utc) + timedelta(minutes=2 ** attempts)
-		mark_installment(session, transaction_id, installment, "FAILED", error=error, next_retry_at=next_retry_at)
+		mark_installment(
+			session, transaction_id, installment, "FAILED", error=error, next_retry_at=next_retry_at,
+			stripe_invoice_id=stripe_invoice_id,
+		)
+		return False
+
+
+def reopen_failed_permanent_installment(
+	session: Session, *, transaction_id: int, installment: int, reason: str, as_of: datetime,
+) -> bool:
+	"""Operator-triggered recovery for a FAILED_PERMANENT installment — e.g.
+	the client fixed a declined payment method after all 3 automatic attempts
+	were exhausted (PR #37 review finding #2's "controlled manual reopening").
+	Deliberately never automatic: a FAILED_PERMANENT row is never re-selected
+	by claim_installment_1/2 on its own, by design (this repo's own accepted
+	failure direction is under-billing, never an unbounded auto-retry loop).
+
+	Resets the attempt counter to 0 (a fresh 3-attempt budget — the SAME
+	pinned object-creation idempotency keys in charge.py, but the payment
+	ATTEMPT keys are attempt-numbered, so this genuinely tries again rather
+	than replaying the original decline) and clears the alert guard so a
+	LATER FAILED_PERMANENT can alert again. No-op (returns False, no event
+	logged) unless the row is genuinely FAILED_PERMANENT for this installment
+	right now — never silently reopens an already-charged or already-voided
+	row.
+
+	`{prefix}_reopen_count` is incremented (never reset) alongside the
+	attempt-counter reset (PR #37 second review finding #1-adjacent): without
+	it, charge.py's pay-attempt idempotency key would rebuild the EXACT SAME
+	key an already-exhausted first attempt used, and Stripe would replay that
+	original cached decline for up to ~24h instead of this reopened retry
+	actually reaching Stripe again."""
+	prefix = "inst1" if installment == 1 else "inst2"
+	status_col = f"installment_{installment}_status"
+	row = session.execute(
+		text(
+			f"UPDATE settlement_transactions SET {status_col} = 'FAILED', "
+			f"  {prefix}_attempts = 0, {prefix}_reopen_count = {prefix}_reopen_count + 1, "
+			f"  {prefix}_next_retry_at = :as_of, "
+			f"  {prefix}_alerted_permanent_at = NULL, {prefix}_last_error = NULL, updated_at = NOW() "
+			f"WHERE transaction_id = :tid AND {status_col} = 'FAILED_PERMANENT' "
+			f"RETURNING client_id"
+		),
+		{"tid": transaction_id, "as_of": as_of},
+	).first()
+	if row is None:
+		return False
+	log_event(
+		row.client_id, "settlement_installment_reopened", entity_type="settlement_transaction",
+		entity_id=str(transaction_id),
+		payload={"transaction_id": transaction_id, "installment": installment, "reason": reason},
+		session=session,
+	)
+	return True
 
 
 def defer_installment(
