@@ -88,6 +88,12 @@ TENANT_POLICIES = {
 	"confirmation_logs": {"mode": "direct", "column": "client_id"},
 	"appointment_dispositions": {"mode": "direct", "column": "client_id"},
 	"appointment_disputes": {"mode": "direct", "column": "client_id"},
+	# Subtask 1.2.2 — Settlement engine. settlement_offer_config is
+	# deliberately NOT registered here — it's global reference config (the
+	# commercial-terms row, same class as payment_auth_offer_config /
+	# entitlement_offers), not tenant-bearing.
+	"pms_agreements": {"mode": "direct", "column": "client_id"},
+	"settlement_transactions": {"mode": "direct", "column": "client_id"},
 	# Reply Triage Agent inbound email intake.
 	"inbound_messages": {"mode": "direct", "column": "client_id"},
 	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Both carry their own client_id

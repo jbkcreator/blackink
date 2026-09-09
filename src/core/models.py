@@ -26,6 +26,7 @@ from sqlalchemy import (
 	Date,
 	DateTime,
 	ForeignKey,
+	ForeignKeyConstraint,
 	Index,
 	Integer,
 	BigInteger,
@@ -215,6 +216,27 @@ class Company(Base):
 	owner_entity_id: Mapped[Optional[int]] = mapped_column(
 		BigInteger, ForeignKey("owner_entities.id"), nullable=True, index=True
 	)
+	# ── Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1) ─────────
+	# Additive-only, all nullable, starts NULL — same pattern as owner_entity_id
+	# above. The two *_encrypted columns store Fernet ciphertext produced by
+	# src/core/token_crypto.py's encrypt_token(), never plaintext Stripe IDs.
+	# See migrations/apply_payment_auth_capture.py and src/services/payment_auth.py.
+	stripe_customer_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+	card_payment_method_id_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	ach_payment_method_id_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	ach_mandate_id_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	# Which payment_auth_offer_config.offer_code this capture was performed
+	# under — NULL means payment auth has never run for this company. This
+	# flow is offer-scoped, never a universal rule (see that table's docstring).
+	payment_auth_offer_code: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+	# The $1 verification PaymentIntent id, so it can be explicitly cancelled
+	# rather than relying solely on Stripe's ~7-day automatic hold expiry.
+	payment_auth_hold_payment_intent_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+	# Set ONLY once both the card and ACH SetupIntents are verified succeeded
+	# server-side (src/services/payment_auth.py::record_payment_auth_completed).
+	# Never flips billing/entitlement itself — that is a separate, later
+	# settlement-pipeline ticket's responsibility.
+	payment_auth_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -943,3 +965,157 @@ class AppointmentDispute(Base):
 	evidence_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 	outcome: Mapped[str] = mapped_column(String(50), nullable=False, server_default=text("'CREDITED_AUTOMATIC'"))
 	resolved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PmsAgreement(Base):
+	"""One signed management agreement, giving both the day-0 door_signed
+	trigger and the day-60 clawback re-check a real data source. NOT
+	client_pm_books — that table is the PERMANENT non-poach lock read by
+	is_claimed_by_other_client() and must not gain a lifecycle column (see
+	migrations/apply_pms_agreements.py). record_door_signed() writes this
+	row and upserts the client_pm_books claim in the same transaction;
+	record_agreement_terminated() touches only this row."""
+
+	__tablename__ = "pms_agreements"
+
+	pms_agreement_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	company_id: Mapped[Optional[str]] = mapped_column(
+		String(64), ForeignKey("companies.company_id"), nullable=True
+	)
+	owner_contact_id: Mapped[Optional[int]] = mapped_column(
+		BigInteger, ForeignKey("owner_contacts.owner_contact_id"), nullable=True
+	)
+	opportunity_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
+	pms_property_ref: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	door_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+	agreement_source: Mapped[str] = mapped_column(String(20), nullable=False)
+	status: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'ACTIVE'"))
+	attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+	last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	door_signed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	last_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	terminated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		CheckConstraint("status IN ('ACTIVE','TERMINATED','UNVERIFIED','SUPERSEDED')", name="ck_pms_agreements_status"),
+		CheckConstraint("agreement_source IN ('PMS_SYNC','MANUAL','SYNTHETIC')", name="ck_pms_agreements_source"),
+		UniqueConstraint("client_id", "opportunity_id", "door_signed_at", name="uq_pms_agreements_identity"),
+		UniqueConstraint("client_id", "pms_agreement_id", name="uq_pms_agreements_tenant_id"),
+	)
+
+
+class SettlementTransaction(Base):
+	"""50/50 settlement ledger row (Subtask 1.2.2). CHARGED, not PAID, per
+	the subtask's own Definition of Done wording; SETTLING carries ACH's
+	asynchronous pending-settlement window. evidence_packet_url is
+	functionally required before either installment may reach
+	CHARGING/SETTLING/CHARGED — enforced by trg_settlement_guard_transition,
+	not merely by convention. is_clawed_back is a STORED generated column so
+	it can never disagree with installment_2_status."""
+
+	__tablename__ = "settlement_transactions"
+
+	transaction_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+	client_id: Mapped[str] = mapped_column(
+		String(40), ForeignKey("clients.client_id"), nullable=False, index=True
+	)
+	pms_agreement_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+	opportunity_id: Mapped[str] = mapped_column(UUID(as_uuid=False), nullable=False)
+	company_id: Mapped[Optional[str]] = mapped_column(
+		String(64), ForeignKey("companies.company_id"), nullable=True
+	)
+	offer_code: Mapped[str] = mapped_column(
+		String(50), ForeignKey("settlement_offer_config.offer_code"), nullable=False
+	)
+	door_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+	total_bounty_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+	installment_1_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+	installment_2_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+	installment_1_status: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'PENDING'"))
+	inst1_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+	inst1_last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	inst1_next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	inst1_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	installment_1_charged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	inst1_stripe_invoice_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	inst1_rail: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
+	installment_2_status: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'SCHEDULED'"))
+	inst2_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+	inst2_last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	inst2_next_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	inst2_claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	installment_2_scheduled_for: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	installment_2_charged_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	inst2_stripe_invoice_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+	inst2_rail: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+
+	door_signed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+	allow_synthetic_charge: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+
+	evidence_packet_status: Mapped[str] = mapped_column(String(30), nullable=False, server_default=text("'PENDING'"))
+	evidence_packet_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+	evidence_packet_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+	evidence_packet_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+	evidence_packet_stripe_file_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+	is_clawed_back: Mapped[bool] = mapped_column(
+		Boolean, Computed("installment_2_status = 'VOIDED_CLAWBACK'", persisted=True)
+	)
+
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		ForeignKeyConstraint(
+			["client_id", "pms_agreement_id"],
+			["pms_agreements.client_id", "pms_agreements.pms_agreement_id"],
+			name="fk_settlement_agreement_same_tenant",
+		),
+		CheckConstraint(
+			"installment_1_cents + installment_2_cents = total_bounty_cents",
+			name="ck_settlement_split_sums",
+		),
+		UniqueConstraint("client_id", "opportunity_id", name="uq_settlement_opportunity"),
+		UniqueConstraint("client_id", "pms_agreement_id", name="uq_settlement_agreement"),
+	)
+
+
+class SettlementOfferConfig(Base):
+	"""Global reference config (NOT tenant-bearing — same class as
+	payment_auth_offer_config/entitlement_offers): the commercial-terms row
+	an operator flips per confirmed offer. Ships settlement_enabled=FALSE
+	and both amount columns NULL — this repo does not pick a price. Both
+	pricing bases are supported because the blueprint's own printed DDL
+	(per-door) contradicts its own pricing registry (flat fee)."""
+
+	__tablename__ = "settlement_offer_config"
+
+	offer_code: Mapped[str] = mapped_column(String(50), primary_key=True)
+	settlement_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+	pricing_basis: Mapped[str] = mapped_column(String(24), nullable=False, server_default=text("'PER_DOOR'"))
+	per_door_bounty_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+	flat_bounty_cents: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+	installment_1_bps: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("5000"))
+	clawback_window_days: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("60"))
+	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+	updated_at: Mapped[datetime] = mapped_column(
+		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+	)
+
+	__table_args__ = (
+		CheckConstraint("pricing_basis IN ('PER_DOOR','FLAT_PER_AGREEMENT')", name="ck_settlement_offer_basis"),
+	)
