@@ -81,10 +81,13 @@ class _FakeSession:
 
 
 class _FakeGateway(StripeGateway):
-	def __init__(self, pay_outcomes):
+	def __init__(self, pay_outcomes, existing_invoice_status="draft"):
 		self._pay_outcomes = list(pay_outcomes)
 		self.pay_calls = []
 		self.idempotency_keys = []
+		self.existing_invoice_status = existing_invoice_status
+		self.add_item_calls = 0
+		self.finalize_calls = 0
 
 	def create_invoice(self, *, stripe_customer_id, default_payment_method_id, metadata, idempotency_key):
 		self.idempotency_keys.append(idempotency_key)
@@ -93,13 +96,18 @@ class _FakeGateway(StripeGateway):
 	def find_invoice_by_metadata(self, **kw):
 		return None
 
+	def retrieve_invoice(self, *, stripe_invoice_id):
+		return InvoiceHandle(stripe_invoice_id=stripe_invoice_id, status=self.existing_invoice_status)
+
 	def add_invoice_item(self, **kw):
+		self.add_item_calls += 1
 		self.idempotency_keys.append(kw["idempotency_key"])
 
 	def update_invoice_metadata(self, **kw):
 		pass
 
 	def finalize_invoice(self, *, stripe_invoice_id, idempotency_key):
+		self.finalize_calls += 1
 		self.idempotency_keys.append(idempotency_key)
 		return InvoiceHandle(stripe_invoice_id=stripe_invoice_id, status="open")
 
@@ -250,6 +258,42 @@ def test_reopened_retry_charges_the_current_payment_method_and_a_fresh_key():
 	assert pay_key not in {"settlement-pay-ach|1|1|r0a0", "settlement-pay-ach|1|1|r0a1", "settlement-pay-ach|1|1|r0a2"}
 
 
+def test_reopened_finalized_invoice_skips_item_and_finalize_reaches_pay():
+	"""PR #37 third review finding #1: a reopened FAILED_PERMANENT
+	installment's invoice was already finalized (status='open') by the
+	original attempt. Once Stripe's ~24h idempotency-key retention has
+	expired, re-running add_invoice_item/finalize_invoice against a
+	non-draft invoice is a REAL Stripe API error, not a cached no-op — so
+	charge_installment must skip both and go straight to pay_invoice with
+	the client's fixed payment method."""
+	row_reopened = SimpleNamespace(
+		**{**vars(_ROW), "inst1_attempts": 0, "inst1_reopen_count": 1, "inst1_stripe_invoice_id": "in_existing"},
+	)
+	gw = _FakeGateway([PayOutcome(status="paid")], existing_invoice_status="open")
+	outcome = charge_installment(_FakeSession(row_reopened), 1, 1, as_of=_AS_OF, gateway=gw, store=_StubStore())
+
+	assert outcome.status == "CHARGED"
+	assert gw.add_item_calls == 0
+	assert gw.finalize_calls == 0
+	assert gw.pay_calls == ["enc-ach"]
+
+
+def test_resumed_still_draft_invoice_still_gets_item_and_finalize():
+	"""The other half of the same fix: a resumed invoice that crashed BEFORE
+	ever reaching finalize_invoice (still 'draft' at Stripe) must still get
+	item + finalize run here — only an already-finalized invoice skips
+	them."""
+	row_resumed = SimpleNamespace(
+		**{**vars(_ROW), "inst1_stripe_invoice_id": "in_existing"},
+	)
+	gw = _FakeGateway([PayOutcome(status="paid")], existing_invoice_status="draft")
+	outcome = charge_installment(_FakeSession(row_resumed), 1, 1, as_of=_AS_OF, gateway=gw, store=_StubStore())
+
+	assert outcome.status == "CHARGED"
+	assert gw.add_item_calls == 1
+	assert gw.finalize_calls == 1
+
+
 def test_live_gateway_maps_async_ach_pending_to_processing_not_decline():
 	"""Re-review verification finding (not in the original two review
 	findings — found by testing against real Stripe test mode): Stripe
@@ -278,6 +322,59 @@ def test_live_gateway_maps_synchronous_paid_result_to_paid():
 	)
 	outcome = gw.pay_invoice(stripe_invoice_id="in_123", payment_method_id="pm_card", idempotency_key="k")
 	assert outcome.status == "paid"
+
+
+def _fake_invoice(invoice_id, metadata=None):
+	return SimpleNamespace(
+		id=invoice_id, status="draft",
+		metadata=SimpleNamespace(to_dict=lambda: metadata or {}) if metadata is not None else None,
+	)
+
+
+def test_find_invoice_by_metadata_paginates_past_first_page():
+	"""PR #37 third review finding #3: a single 100-invoice page silently
+	missed a matching invoice older than that page for a high-volume
+	customer, causing charge_installment to create a DUPLICATE invoice.
+	find_invoice_by_metadata must page through starting_after until it
+	finds the match, not stop at page 1."""
+	page_1 = [_fake_invoice(f"in_p1_{i}", {"transaction_id": "other", "installment": "1"}) for i in range(100)]
+	page_2_match = _fake_invoice("in_from_page_2", {"transaction_id": "1", "installment": "1"})
+	page_2 = [page_2_match] + [
+		_fake_invoice(f"in_p2_{i}", {"transaction_id": "other", "installment": "1"}) for i in range(5)
+	]
+
+	list_calls = []
+
+	def _fake_list(params):
+		list_calls.append(params)
+		if "starting_after" not in params:
+			return SimpleNamespace(data=page_1, has_more=True)
+		return SimpleNamespace(data=page_2, has_more=False)
+
+	gw = object.__new__(LiveStripeGateway)
+	gw._client = SimpleNamespace(invoices=SimpleNamespace(list=_fake_list))
+
+	result = gw.find_invoice_by_metadata(
+		stripe_customer_id="cus_1", metadata_filter={"transaction_id": "1", "installment": "1"},
+	)
+
+	assert result is not None
+	assert result.stripe_invoice_id == "in_from_page_2"
+	assert len(list_calls) == 2
+	assert list_calls[1]["starting_after"] == "in_p1_99"
+
+
+def test_find_invoice_by_metadata_gives_up_after_page_cap_without_crashing():
+	def _fake_list(params):
+		return SimpleNamespace(data=[_fake_invoice("in_x", {"transaction_id": "other"})], has_more=True)
+
+	gw = object.__new__(LiveStripeGateway)
+	gw._client = SimpleNamespace(invoices=SimpleNamespace(list=_fake_list))
+
+	result = gw.find_invoice_by_metadata(
+		stripe_customer_id="cus_1", metadata_filter={"transaction_id": "1", "installment": "1"},
+	)
+	assert result is None  # bounded scan, no match, no infinite loop
 
 
 def test_crash_between_create_invoice_and_savepoint_is_reconciled_not_duplicated():

@@ -9,9 +9,18 @@ property — see tests/test_no_upfront_charge_paths.py.
 """
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Hard cap on pages find_invoice_by_metadata will walk (100 invoices/page) —
+# bounds a pathological customer's invoice history from hanging a charge
+# attempt indefinitely; 20 pages (2000 invoices) is far beyond any real
+# per-installment/per-appointment invoice count this system produces.
+_MAX_RECONCILIATION_PAGES = 20
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,14 @@ class StripeGateway(ABC):
 		called on every entry BEFORE create_invoice specifically to survive a
 		crash between Stripe accepting create_invoice and this process
 		committing the id it just got back — see charge.py/sit_invoice.py."""
+
+	@abstractmethod
+	def retrieve_invoice(self, *, stripe_invoice_id: str) -> InvoiceHandle:
+		"""Fetches an invoice's CURRENT Stripe status. Used to tell a resumed
+		invoice (from settlement_transactions.inst{N}_stripe_invoice_id) that
+		is already finalized/open apart from one that's still draft — see
+		charge.py's "PR #37 third review finding #1" comment for why this
+		distinction matters."""
 
 	@abstractmethod
 	def add_invoice_item(
@@ -119,15 +136,37 @@ class LiveStripeGateway(StripeGateway):
 	def find_invoice_by_metadata(self, *, stripe_customer_id, metadata_filter):
 		# Stripe's invoices.list has no metadata query param — list this
 		# customer's recent invoices (newest first, Stripe's default order)
-		# and match metadata client-side. Bounded to 100 (Stripe's own max
-		# page size) — a customer's per-installment/per-appointment invoice
-		# count is small, and this only runs at the start of a charge attempt.
-		invoices = self._client.invoices.list(params={"customer": stripe_customer_id, "limit": 100})
-		for invoice in invoices.data:
-			meta = invoice.metadata.to_dict() if invoice.metadata else {}
-			if all(meta.get(k) == v for k, v in metadata_filter.items()):
-				return InvoiceHandle(stripe_invoice_id=invoice.id, status=invoice.status)
+		# and match metadata client-side. PR #37 third review finding #3: a
+		# single 100-invoice page silently missed a match for a high-volume
+		# customer whose matching invoice had aged past page 1, causing a
+		# duplicate create_invoice. Page through with `starting_after` until
+		# a match is found or Stripe reports no more pages, capped at
+		# _MAX_RECONCILIATION_PAGES so one pathological customer can't hang a
+		# charge attempt scanning an unbounded invoice history.
+		cursor = None
+		for _ in range(_MAX_RECONCILIATION_PAGES):
+			params = {"customer": stripe_customer_id, "limit": 100}
+			if cursor:
+				params["starting_after"] = cursor
+			invoices = self._client.invoices.list(params=params)
+			for invoice in invoices.data:
+				meta = invoice.metadata.to_dict() if invoice.metadata else {}
+				if all(meta.get(k) == v for k, v in metadata_filter.items()):
+					return InvoiceHandle(stripe_invoice_id=invoice.id, status=invoice.status)
+			if not invoices.data or not getattr(invoices, "has_more", False):
+				break
+			cursor = invoices.data[-1].id
+		else:
+			logger.warning(
+				"settlement.gateway: find_invoice_by_metadata scanned %s pages for customer=%s without "
+				"exhausting Stripe's invoice list — stopped to avoid an unbounded scan; metadata_filter=%s",
+				_MAX_RECONCILIATION_PAGES, stripe_customer_id, metadata_filter,
+			)
 		return None
+
+	def retrieve_invoice(self, *, stripe_invoice_id):
+		invoice = self._client.invoices.retrieve(stripe_invoice_id)
+		return InvoiceHandle(stripe_invoice_id=invoice.id, status=invoice.status)
 
 	def add_invoice_item(self, *, stripe_invoice_id, stripe_customer_id, amount_cents, description, idempotency_key):
 		item = self._client.invoice_items.create(

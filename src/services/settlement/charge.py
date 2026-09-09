@@ -238,9 +238,10 @@ def charge_installment(
 		# ~24h key retention, but recording and reusing our own id makes that
 		# protection not depend on that window.
 		stripe_invoice_id = existing_invoice_id
+		invoice_status = gw.retrieve_invoice(stripe_invoice_id=stripe_invoice_id).status
 		logger.info(
-			"settlement.charge: transaction=%s installment=%s resuming existing invoice=%s",
-			transaction_id, installment, stripe_invoice_id,
+			"settlement.charge: transaction=%s installment=%s resuming existing invoice=%s (status=%s)",
+			transaction_id, installment, stripe_invoice_id, invoice_status,
 		)
 	else:
 		metadata = {
@@ -263,9 +264,10 @@ def charge_installment(
 		)
 		if existing is not None:
 			stripe_invoice_id = existing.stripe_invoice_id
+			invoice_status = existing.status
 			logger.info(
-				"settlement.charge: transaction=%s installment=%s reconciled existing invoice=%s via metadata scan",
-				transaction_id, installment, stripe_invoice_id,
+				"settlement.charge: transaction=%s installment=%s reconciled existing invoice=%s via metadata scan (status=%s)",
+				transaction_id, installment, stripe_invoice_id, invoice_status,
 			)
 		else:
 			invoice = gw.create_invoice(
@@ -275,6 +277,7 @@ def charge_installment(
 				idempotency_key=f"settlement-invoice|{key_prefix}",
 			)
 			stripe_invoice_id = invoice.stripe_invoice_id
+			invoice_status = invoice.status
 		# Persisted in its own savepoint immediately after create_invoice
 		# succeeds — BEFORE add_invoice_item/finalize below — mirroring
 		# src/services/billing/sit_invoice.py's identical checkpoint (code
@@ -292,25 +295,33 @@ def charge_installment(
 				{"invoice_id": stripe_invoice_id, "tid": transaction_id},
 			)
 
-	# add_invoice_item/finalize run on EVERY entry (resume or fresh), never
-	# only on the fresh-create path — their idempotency keys are pinned to
-	# (transaction_id, installment) alone, so re-running them against an
-	# already-itemized/already-finalized invoice is a safe no-op (Stripe
-	# returns the cached object/result), while a resumed invoice that never
-	# got this far the first time actually gets finished here instead of
-	# jumping straight to an unfinalized pay attempt.
-	gw.add_invoice_item(
-		stripe_invoice_id=stripe_invoice_id,
-		stripe_customer_id=row.stripe_customer_id,
-		amount_cents=amount_cents,
-		description=f"Blackink verified door signed — installment {installment} of 2 ({row.door_count} door(s))",
-		idempotency_key=f"settlement-item|{key_prefix}",
-	)
-	gw.update_invoice_metadata(
-		stripe_invoice_id=stripe_invoice_id,
-		metadata={"evidence_packet_url": url},
-	)
-	gw.finalize_invoice(stripe_invoice_id=stripe_invoice_id, idempotency_key=f"settlement-finalize|{key_prefix}")
+	# PR #37 third review finding #1: add_invoice_item/finalize used to run
+	# unconditionally on EVERY entry (resume or fresh), on the assumption that
+	# their idempotency keys make a re-run against an already-finalized
+	# invoice a safe no-op. That's only true within Stripe's ~24h
+	# idempotency-key retention window — past it, Stripe rejects
+	# invoiceitems.create/finalize_invoice against an invoice that is no
+	# longer 'draft' with a real API error, which meant a reopened
+	# FAILED_PERMANENT installment (see reopen_failed_permanent_installment)
+	# could never reach pay_invoice at all once that window lapsed, however
+	# valid the client's replacement payment method now was.
+	#
+	# Only a 'draft' invoice needs item/metadata/finalize; an already-open
+	# (or otherwise already-finalized) invoice — the normal case for a
+	# resumed or reopened installment — skips straight to pay_invoice below.
+	if invoice_status == "draft":
+		gw.add_invoice_item(
+			stripe_invoice_id=stripe_invoice_id,
+			stripe_customer_id=row.stripe_customer_id,
+			amount_cents=amount_cents,
+			description=f"Blackink verified door signed — installment {installment} of 2 ({row.door_count} door(s))",
+			idempotency_key=f"settlement-item|{key_prefix}",
+		)
+		gw.update_invoice_metadata(
+			stripe_invoice_id=stripe_invoice_id,
+			metadata={"evidence_packet_url": url},
+		)
+		gw.finalize_invoice(stripe_invoice_id=stripe_invoice_id, idempotency_key=f"settlement-finalize|{key_prefix}")
 
 	# PR #37 review finding #2: the object-creation keys above stay pinned to
 	# (transaction_id, installment) alone — that is what guarantees ONE
