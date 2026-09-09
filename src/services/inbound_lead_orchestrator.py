@@ -71,6 +71,7 @@ class InboundLead:
     subject: Optional[str] = None
     body_html: Optional[str] = None
     utm: Optional[dict] = None
+    requires_human_review: bool = False
 
 
 @dataclass
@@ -234,6 +235,11 @@ def _write_message(
         session.execute(
             text("UPDATE inbound_messages SET utm = CAST(:utm AS JSONB) WHERE id = :id"),
             {"utm": _json.dumps(lead.utm), "id": new_id},
+        )
+    if lead.requires_human_review:
+        session.execute(
+            text("UPDATE inbound_messages SET requires_human_review = TRUE WHERE id = :id"),
+            {"id": new_id},
         )
     return str(new_id)
 

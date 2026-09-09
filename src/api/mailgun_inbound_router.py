@@ -30,6 +30,7 @@ from sqlalchemy import text
 from config.settings import get_settings
 from src.core.database import get_db_context
 from src.services.inbound_lead_orchestrator import InboundLead, run_inbound_pipeline
+from src.services.portal_parsers import EmailParts, classify_and_parse
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/webhooks", tags=["inbound"])
@@ -53,6 +54,18 @@ def _verify_mailgun_signature(timestamp: str, token: str, signature: str) -> boo
 def _extract_subdomain(recipient: str) -> Optional[str]:
     m = _SUBDOMAIN_RE.search(recipient)
     return m.group(1).lower() if m else None
+
+
+def _content_hash(sender: str, subject: str, body_plain: str, body_html: Optional[str]) -> str:
+    """Fallback idempotency key for a message with no Mailgun Message-Id.
+
+    Must include body_html: an HTML-only notification (body_plain empty) is a
+    supported case (see EmailParts.text_body), and without body_html here two
+    distinct HTML-only notifications sharing sender+subject hash identically —
+    the second is then treated as a duplicate and silently dropped."""
+    return hashlib.sha256(
+        f"{sender}:{subject}:{body_plain}:{body_html or ''}".encode()
+    ).hexdigest()
 
 
 def _resolve_client_id_from_slug(slug: str) -> Optional[str]:
@@ -98,30 +111,41 @@ async def mailgun_inbound(request: Request) -> dict:
     body_html = form.get("body-html", "") or None
     mg_message_id = form.get("Message-Id", "") or form.get("message-id", "")
 
-    # Derive email from sender field (e.g. "Name <email@domain.com>")
-    email_match = re.search(r"<([^>]+)>", sender) or re.search(r"[\w.+-]+@[\w.-]+", sender)
-    email = email_match.group(1 if "<" in sender else 0) if email_match else None
-
     # idempotency_key is globally UNIQUE — namespace with client_id. Prefer the
     # Mailgun Message-Id; fall back to a content hash if absent.
-    stable = mg_message_id.strip("<>") if mg_message_id else hashlib.sha256(
-        f"{sender}:{subject}:{body_plain[:200]}".encode()
-    ).hexdigest()
+    stable = mg_message_id.strip("<>") if mg_message_id else _content_hash(
+        sender, subject, body_plain, body_html
+    )
     idempotency_key = f"{client_id}:{stable}"
+
+    # 4.2.3 — classify the portal and extract structured fields.
+    parsed = classify_and_parse(EmailParts(
+        sender=sender,
+        subject=subject,
+        body_plain=body_plain,
+        body_html=body_html,
+    ))
 
     lead = InboundLead(
         client_id=client_id,
         channel="EMAIL",
-        source_channel="LISTING_PORTAL",   # refined by 4.2.3 portal parsers
+        source_channel=parsed.source_channel,
         idempotency_key=idempotency_key,
         destination_address=recipient,
-        prospect_name=None,
-        email=email,
-        phone=None,
-        property_address=None,
-        inquiry_text=body_plain[:2000],
+        prospect_name=parsed.prospect_name,
+        # Never fall back to the From-header email for a portal notification:
+        # the sender IS the portal's own address, so backfilling it would make
+        # the STL sweep auto-reply to the portal instead of the owner. Only a
+        # body-extracted email (parsed.email) is a real owner address; if none
+        # was found, leave it unset (a name+phone lead still posts a closer
+        # card, and the sweep skips the email send rather than misdirecting it).
+        email=parsed.email,
+        phone=parsed.phone,
+        property_address=parsed.property_address,
+        inquiry_text=(parsed.inquiry_text or body_plain)[:2000],
         subject=subject or None,
         body_html=body_html,
+        requires_human_review=parsed.requires_human_review,
     )
 
     try:

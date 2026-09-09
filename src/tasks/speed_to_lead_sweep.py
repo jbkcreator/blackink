@@ -79,8 +79,13 @@ def _claim_due(session: Session, limit: int):
             "UPDATE inbound_messages SET status = 'SENDING' "
             "WHERE id IN ("
             "  SELECT id FROM inbound_messages "
-            "  WHERE (status = 'RECEIVED' AND send_at <= NOW()) "
-            "     OR (status = 'SENDING' AND send_at <= NOW() - INTERVAL '15 minutes') "
+            # requires_human_review rows are NEVER auto-responded — an
+            # unparsed/ambiguous notification (e.g. an HTML-only portal mail we
+            # couldn't extract) must not trigger an automatic reply, which
+            # could land on the portal's own address. A human dispatches these.
+            "  WHERE requires_human_review = FALSE "
+            "    AND ((status = 'RECEIVED' AND send_at <= NOW()) "
+            "         OR (status = 'SENDING' AND send_at <= NOW() - INTERVAL '15 minutes')) "
             "  ORDER BY send_at ASC LIMIT :limit "
             "  FOR UPDATE SKIP LOCKED"
             ") "
