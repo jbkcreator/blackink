@@ -9,6 +9,7 @@ def _make_row(
     score_total: int,
     scored_signals: int = 5,
     signal_detail: dict | None = None,
+    data_coverage_pct: int = 50,
 ) -> dict:
     """Build a minimal scored-row dict for testing."""
     if signal_detail is None:
@@ -29,6 +30,7 @@ def _make_row(
         "score_total": score_total,
         "signal_detail": signal_detail,
         "data_gaps": [],
+        "data_coverage_pct": data_coverage_pct,
     }
 
 
@@ -51,14 +53,25 @@ class TestCountyRankOrdering:
         assert result[0]["county_rank"] == 1
         assert result[0]["county_percentile"] == 100
 
-    def test_tie_breaking_is_stable_by_company_id(self):
+    def test_tie_breaking_primary_by_data_coverage_pct(self):
+        # Same score_total; higher data_coverage_pct wins.
         rows = [
-            _make_row("zzz", "Z Corp", score_total=50),
-            _make_row("aaa", "A Corp", score_total=50),
+            _make_row("zzz", "Z Corp", score_total=50, data_coverage_pct=60),
+            _make_row("aaa", "A Corp", score_total=50, data_coverage_pct=40),
         ]
         result = calculate_county_ranks(rows)
         by_id = {r["company_id"]: r for r in result}
-        # Alphabetically earlier company_id should get rank 1 on tie.
+        assert by_id["zzz"]["county_rank"] == 1
+        assert by_id["aaa"]["county_rank"] == 2
+
+    def test_tie_breaking_secondary_by_company_id_when_coverage_equal(self):
+        rows = [
+            _make_row("zzz", "Z Corp", score_total=50, data_coverage_pct=50),
+            _make_row("aaa", "A Corp", score_total=50, data_coverage_pct=50),
+        ]
+        result = calculate_county_ranks(rows)
+        by_id = {r["company_id"]: r for r in result}
+        # Same score and coverage — alphabetically earlier company_id gets rank 1.
         assert by_id["aaa"]["county_rank"] == 1
         assert by_id["zzz"]["county_rank"] == 2
 

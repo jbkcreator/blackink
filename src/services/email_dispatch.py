@@ -53,6 +53,20 @@ class EmailProvider(ABC):
 		single arbitrary attachment (the OVS PDF), distinct from the fixed
 		ICS the booking-confirmation path always sends."""
 
+	def send_with_attachments(
+		self, to: str, reply_to: str, bcc: str, subject: str, html_body: str,
+		attachments: list,   # list of (bytes, filename, subtype) tuples
+	) -> str:
+		"""Send with multiple attachments. Default: calls send_with_attachment
+		for the first item; concrete providers may override for efficiency."""
+		if not attachments:
+			return self.send_plain(to=to, reply_to=reply_to, bcc=bcc, subject=subject, html_body=html_body)
+		first_bytes, first_name, first_subtype = attachments[0]
+		return self.send_with_attachment(
+			to=to, reply_to=reply_to, bcc=bcc, subject=subject, html_body=html_body,
+			attachment_bytes=first_bytes, attachment_filename=first_name, attachment_subtype=first_subtype,
+		)
+
 
 class SmtpEmailProvider(EmailProvider):
 	def __init__(self, host: str, port: int, username: str, password: str, from_address: str):
@@ -109,15 +123,25 @@ class SmtpEmailProvider(EmailProvider):
 		self, to: str, reply_to: str, bcc: str, subject: str, html_body: str,
 		attachment_bytes: bytes, attachment_filename: str, attachment_subtype: str,
 	) -> str:
+		return self.send_with_attachments(
+			to=to, reply_to=reply_to, bcc=bcc, subject=subject, html_body=html_body,
+			attachments=[(attachment_bytes, attachment_filename, attachment_subtype)],
+		)
+
+	def send_with_attachments(
+		self, to: str, reply_to: str, bcc: str, subject: str, html_body: str,
+		attachments: list,   # list of (bytes, filename, subtype) tuples
+	) -> str:
 		msg = MIMEMultipart()
 		msg["From"] = self._from_address
 		msg["To"] = to
 		msg["Reply-To"] = reply_to
 		msg["Subject"] = subject
 		msg.attach(MIMEText(html_body, "html"))
-		part = MIMEApplication(attachment_bytes, _subtype=attachment_subtype)
-		part.add_header("Content-Disposition", "attachment", filename=attachment_filename)
-		msg.attach(part)
+		for attachment_bytes, attachment_filename, attachment_subtype in attachments:
+			part = MIMEApplication(attachment_bytes, _subtype=attachment_subtype)
+			part.add_header("Content-Disposition", "attachment", filename=attachment_filename)
+			msg.attach(part)
 		recipients = [to, bcc] if bcc else [to]
 		self._send_mime(msg, recipients)
 		return f"smtp-{uuid.uuid4().hex}"

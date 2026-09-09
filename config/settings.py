@@ -1,14 +1,9 @@
 """Application configuration powered by Pydantic settings.
 
-Mirrors Forced Action's config/settings.py convention (single AppSettings,
-env_file=".env", Field(..., env="...") per var, @lru_cache singleton) —
-see C:\\Users\\HEU-Vishnu\\Forced-action-\\config\\settings.py.
-
-Which file gets loaded is controlled by the ENV_FILE shell environment
-variable (not itself read from any .env file — set it before running a
-command), defaulting to ".env". Local Docker-Postgres testing should use a
-permanent, gitignored ".env.local" instead of overwriting the real ".env" —
-see CLAUDE.md's "Local development database" section:
+Single AppSettings class, env_file=".env", Field(..., env="...") per var,
+@lru_cache singleton. Which file gets loaded is controlled by the ENV_FILE
+shell environment variable (not itself read from any .env file — set it
+before running a command), defaulting to ".env".
 
     $env:ENV_FILE=".env.local"
     python migrations/apply_db_roles.py
@@ -372,6 +367,20 @@ class AppSettings(BaseSettings):
 	# only when a real RentValuationProvider implementation lands in Q1.
 	rentbot_live_api_enabled: bool = Field(default=False, env="RENTBOT_LIVE_API_ENABLED")
 
+	# ── Ghost Shopper IMAP listener (src/tasks/imap_listener.py) ───────────────
+	# Monitors the audit-bot inbox for PM firm replies to Ghost Shopper form
+	# submissions. Fail-closed: if imap_enabled is False the listener logs a
+	# warning and exits immediately — active Ghost Shopper campaigns will stay
+	# suspended at WAIT_REPLY until manually resumed or until imap_enabled is set.
+	ghost_shopper_mock: bool = Field(default=False, env="GHOST_SHOPPER_MOCK")
+	imap_enabled: bool = Field(default=False, env="IMAP_ENABLED")
+	imap_host: str = Field(default="imap.gmail.com", env="IMAP_HOST")
+	imap_port: int = Field(default=993, env="IMAP_PORT")
+	imap_user: str = Field(default="audit-bot@audit-blackink.com", env="IMAP_USER")
+	imap_password: Optional[SecretStr] = Field(default=None, env="IMAP_PASSWORD")
+	# How long (hours) to wait for a PM firm reply before publishing a null resume
+	# signal so the campaign continues without audit data.
+	ghost_reply_timeout_hours: int = Field(default=24, env="GHOST_REPLY_TIMEOUT_HOURS")
 	# ── Stripe — Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1) ─
 	# Greenfield integration — no Stripe usage existed anywhere in this repo
 	# before this subtask. Test-mode keys only until the applicable offers are
@@ -427,6 +436,25 @@ class AppSettings(BaseSettings):
 	# Domain suffix used to construct per-client inbound addresses:
 	# replies@{client_id}.{inbound_email_domain}
 	inbound_email_domain: str = Field(default="getblackink.com", env="INBOUND_EMAIL_DOMAIN")
+
+	# ── Ink PDF Generator ─────────────────────────────────────────────────────
+	# Local directory for campaign audit PDFs (dev/staging only).
+	# Set PDF_LOCAL_DIR to a writable path; swap get_pdf_store() for S3PdfStore
+	# once AWS credentials exist.
+	pdf_local_dir: str = Field(default="tmp/pdf", env="PDF_LOCAL_DIR")
+
+	# ── Ink Sendspark ─────────────────────────────────────────────────────────
+	# Fail-closed: if either is unset, node_sendspark logs SENDSPARK_SKIPPED and
+	# returns video_id=None / landing_url=None -- campaign continues without video.
+	sendspark_api_key:    Optional[SecretStr] = Field(default=None, env="SENDSPARK_API_KEY")
+	sendspark_template_id: Optional[str]      = Field(default=None, env="SENDSPARK_TEMPLATE_ID")
+
+	# ── Ink Approval Webhook ──────────────────────────────────────────────────
+	# Shared secret for POST /api/v1/webhooks/ink/approve.
+	# Fail-closed: if unset, every request returns 503.
+	# Normal operator path is the Slack card buttons (Bolt action handlers),
+	# which write to ink:resume_signals directly without this secret.
+	ink_webhook_secret: Optional[SecretStr] = Field(default=None, env="INK_WEBHOOK_SECRET")
 
 	# ── Six Billing Rules (Subtask 1.2.3) ────────────────────────────────────
 	# Rule 1's $50 miss credit is keyed on inbound_messages.acked_at, which

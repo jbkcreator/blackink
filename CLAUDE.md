@@ -66,13 +66,16 @@ PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escala
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
 PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
 PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
+PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py  # re-adds ghost_submitted_at + ghost_work_order_id to contacts (Ghost Shopper reactivated); before RLS
+PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py       # audit log for IMAP listener inbound replies + timeouts; not tenant-bearing, no RLS
+PYTHONPATH=. python migrations/apply_ghost_form_submissions.py      # node-level idempotency for fill_and_submit (prevents double form POST on retry); not tenant-bearing, no RLS
+PYTHONPATH=. python migrations/apply_ovs_data_coverage.py          # Subtask 2.1.2 — adds data_coverage_pct SMALLINT to owner_visibility_scores; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py  # Task 4.2.1 — Speed-to-Lead columns on inbound_messages (additive; after the three inbound_messages migrations, before RLS)
 PYTHONPATH=. python migrations/apply_stl_cadence.py  # Task 4.2.2 — STL cadence stop-latch columns + stl_cadence_dispatches table (after apply_inbound_messages_lead_fields.py, before RLS)
 PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
 PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2 — Three-Touch Win-Back Sequence (winback_touch_dispatches, stop columns, calendar_connections.is_default_owner_booking; after apply_winback_imports.py and apply_calendar_connections.py, before RLS)
 PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
-# NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
 # Background jobs
@@ -88,8 +91,11 @@ python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
+python -m src.agents.cora.worker           # Cora draft-generation worker (LLM sequence + Slack card)
+python -m src.agents.relay.worker          # Relay dispatch worker (Instantly / SMTP send)
 python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
 python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
+python -m src.tasks.imap_listener          # Ghost Shopper IMAP listener — monitors audit-bot inbox; requires IMAP_ENABLED=True
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
 python -m src.tasks.billing_sweep               # Subtask 1.2.3 — $50 miss-credit, dispute-credit, 60-day-guarantee sweeps
@@ -102,49 +108,12 @@ pytest tests/                       # unit tests, no DB required for most
 pytest tests/test_tenant_isolation.py  # requires a live Postgres with migrations applied
 ```
 
-## Local development database
+## Local development
 
-Schema/migration work must be developed and verified against a disposable
-local Postgres, never against the live server — there is no separate
-staging database yet, so the server's database is effectively production.
-
-Which env file gets loaded is controlled by the `ENV_FILE` shell variable
-(`config/settings.py`, default `.env`) — **never overwrite your real `.env`
-to test locally.** Create a permanent `.env.local` once (gitignored via
-`.env*` in `.gitignore`) and point `ENV_FILE` at it for the duration of
-your shell session instead. This eliminates the backup/restore-`.env`
-dance entirely — there's nothing to accidentally leave in the wrong state.
-
-```bash
-# One-time: create .env.local with the Docker test values
-cat > .env.local <<'EOF'
-DATABASE_URL=postgresql://postgres:localdevpass@localhost:5433/blackink
-DATABASE_URL_APP=postgresql://blackink_app:app_local_pw@localhost:5433/blackink
-DATABASE_URL_SYSTEM=postgresql://blackink_system:system_local_pw@localhost:5433/blackink
-DATABASE_URL_AKRASH=postgresql://akrash_ingest:akrash_local_pw@localhost:5433/blackink
-BLACKINK_APP_DB_PASSWORD=app_local_pw
-BLACKINK_SYSTEM_DB_PASSWORD=system_local_pw
-AKRASH_INGEST_DB_PASSWORD=akrash_local_pw
-EOF
-
-# Start a disposable local Postgres (port 5433, not 5432 — avoids clashing
-# with a native Postgres install some dev machines already have on 5432)
-docker compose up -d postgres-test
-
-# Point this shell at .env.local for the rest of the session (PowerShell:
-# $env:ENV_FILE=".env.local"; bash: export ENV_FILE=.env.local)
-export ENV_FILE=.env.local
-
-# Then run the full migration sequence from Common Commands above, and:
-pytest tests/
-
-# Tear down when finished:
-docker compose down -v postgres-test
-unset ENV_FILE   # or just open a fresh shell for real-.env work
-```
-
-Only once a change is verified this way should it be applied to the real
-server (manual sync today — no CI/CD deploy pipeline exists yet).
+Settings load from `.env` by default (`config/settings.py`, controlled by
+the `ENV_FILE` shell variable). Keep `.env` populated with the real
+connection strings. Run migrations and tests directly against the live
+server — there is no separate staging database.
 
 ## Cloud Run deployment (test)
 
@@ -204,6 +173,14 @@ Manager-backed env vars, never baked into the image):
 - `EMAIL_SENDING_ENABLED` — leave `False`/unset unless real SMTP
   credentials for a validated sending domain exist; see
   `src/services/email_dispatch.py`.
+- `IMAP_ENABLED`, `IMAP_HOST`, `IMAP_PORT`, `IMAP_USER`, `IMAP_PASSWORD` —
+  Ghost Shopper IMAP listener (`src/tasks/imap_listener.py`). `IMAP_ENABLED`
+  defaults `False` (fail-closed); set `True` only when the `audit-bot@audit-blackink.com`
+  mailbox is provisioned and `IMAP_PASSWORD` is a real app password.
+  `imap_listener` runs as a **separate process** (not in the API lifespan);
+  deploy it as its own Cloud Run Job or alongside the Ink worker.
+  `GHOST_REPLY_TIMEOUT_HOURS` controls how long the listener waits before
+  sending a null resume signal (default 24).
 - `OVS_PDF_ALLOWED_HOSTS` — comma-separated exact hostnames the 30-minute
   pre-demo reminder is allowed to fetch `contacts.ovs_pdf_url` from (e.g.
   the real object-storage host once Dev 2's storage step exists); leave

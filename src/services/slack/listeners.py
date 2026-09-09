@@ -1700,4 +1700,93 @@ async def handle_claim_context_card(ack, body, respond, action, client):
 				}
 			],
 		)
-	await respond(response_type="ephemeral", text=f":white_check_mark: You've claimed this lead. Get in touch fast!")
+
+
+# ── Ink Campaign — Approve / Reject draft card buttons ───────────────────────
+#
+# Cora posts a draft-approval card to #blackink-command for each campaign.
+# These handlers publish a resume signal to ink:resume_signals so the Ink
+# worker can proceed past wait_approve. No payload hash needed here — the
+# approval decision is idempotent (publishing twice is harmless; the worker
+# guards against a completed graph via get_state().next check).
+
+
+async def _handle_ink_campaign_decision(
+    ack, body, action, approved: bool,
+) -> None:
+    await ack()
+    user_id = body.get("user", {}).get("id", "unknown")
+    try:
+        value = json.loads(action.get("value", "{}"))
+    except (json.JSONDecodeError, TypeError):
+        logger.warning("ink.listeners: malformed ink campaign button value")
+        return
+
+    work_order_id = value.get("work_order_id", "")
+    if not work_order_id:
+        logger.warning("ink.listeners: ink campaign button missing work_order_id")
+        return
+
+    from src.services.slack.auth import approver_authorized
+    if not approver_authorized(user_id):
+        logger.warning(
+            "ink.listeners: unauthorized campaign decision attempt work_order_id=%s user_id=%s",
+            work_order_id, user_id,
+        )
+        return
+
+    try:
+        from src.api.ink_webhook_router import publish_resume_signal
+        publish_resume_signal(work_order_id=work_order_id, approved=approved, approved_by=user_id)
+    except Exception as exc:
+        logger.error(
+            "ink.listeners: failed to publish resume signal work_order_id=%s: %s",
+            work_order_id, exc,
+        )
+        return
+
+    decision_label = "Approved" if approved else "Rejected"
+    icon = ":white_check_mark:" if approved else ":x:"
+    logger.info(
+        "ink.listeners: campaign %s work_order_id=%s by user_id=%s",
+        decision_label, work_order_id, user_id,
+    )
+
+    # Update the card in place so the buttons are replaced with a status line
+    try:
+        channel = body.get("channel", {}).get("id")
+        ts      = body.get("message", {}).get("ts")
+        original_blocks = body.get("message", {}).get("blocks", [])
+        # Keep header + metrics blocks, replace actions block with status
+        display_blocks = [b for b in original_blocks if b.get("type") != "actions"]
+        display_blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{icon} *{decision_label}* by <@{user_id}>",
+            },
+        })
+        if channel and ts:
+            from src.services.slack.bolt_app import get_bolt_app
+            await get_bolt_app().client.chat_update(
+                channel=channel,
+                ts=ts,
+                blocks=display_blocks,
+                text=f"{decision_label} by <@{user_id}>",
+            )
+    except Exception as exc:
+        logger.warning("ink.listeners: card update failed work_order_id=%s: %s", work_order_id, exc)
+
+    # Decrement Cora's approval backlog counter
+    from src.agents.cora.throttle import notify_approval_resolved
+    notify_approval_resolved()
+
+
+@app.action("approve_ink_campaign")
+async def handle_approve_ink_campaign(ack, body, action):
+    await _handle_ink_campaign_decision(ack, body, action, approved=True)
+
+
+@app.action("reject_ink_campaign")
+async def handle_reject_ink_campaign(ack, body, action):
+    await _handle_ink_campaign_decision(ack, body, action, approved=False)

@@ -36,6 +36,7 @@ from src.api.metrics_router import router as metrics_router
 from src.api.meetings_router import router as meetings_router
 from src.api.ovs_router import router as ovs_router
 from src.api.booking_webhook_router import router as booking_webhook_router
+from src.api.ink_webhook_router import router as ink_webhook_router
 from src.api.inbound_router import router as inbound_router
 from src.api.calendar_oauth_router import router as calendar_oauth_router
 from src.api.payment_auth_router import router as payment_auth_router
@@ -233,6 +234,7 @@ app.include_router(meetings_router)
 app.include_router(ovs_router)
 app.include_router(calendar_oauth_router)
 app.include_router(booking_webhook_router)
+app.include_router(ink_webhook_router)
 app.include_router(inbound_router)
 app.include_router(public_landing_router)
 app.include_router(payment_auth_router)
