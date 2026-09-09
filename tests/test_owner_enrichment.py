@@ -373,7 +373,7 @@ def test_tracerfy_provider_collect_matches_by_normalized_address_not_row_id():
 	provider = TracerfyEnrichmentProvider("fake-key")
 	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
 		handle = provider.submit([_tracerfy_input(winback_row_id=7)])
-	result_row = {"address": "123 main st", "email_1": "jane@example.com", "primary_phone": "8135550100"}
+	result_row = {"address": "123 main st", "city": "tampa", "state": "fl", "email_1": "jane@example.com", "primary_phone": "8135550100"}
 	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=[result_row]):
 		results = provider.collect(handle)
 	assert 7 in results
@@ -381,6 +381,38 @@ def test_tracerfy_provider_collect_matches_by_normalized_address_not_row_id():
 	assert results[7].phone == "8135550100"
 	assert results[7].phone_verified is True
 	assert results[7].provider == "tracerfy"
+
+
+def test_tracerfy_provider_same_street_different_city_are_not_conflated():
+	# PR review finding: keying on street alone made "123 Main St, Tampa"
+	# and "123 Main St, Orlando" collide, silently attaching one owner's
+	# contact details to the other's winback row.
+	provider = TracerfyEnrichmentProvider("fake-key")
+	tampa = _tracerfy_input(winback_row_id=1)
+	orlando = _tracerfy_input(winback_row_id=2, property_address="123 Main St, Orlando, FL 32801")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
+		handle = provider.submit([tampa, orlando])
+	assert sorted(handle.match_keys.values()) == [1, 2]
+	assert handle.unprocessable_ids == frozenset()
+	rows = [
+		{"address": "123 Main St", "city": "Orlando", "state": "FL", "email_1": "orlando@example.com"},
+		{"address": "123 Main St", "city": "Tampa", "state": "FL", "email_1": "tampa@example.com"},
+	]
+	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=rows):
+		results = provider.collect(handle)
+	assert results[1].email == "tampa@example.com"
+	assert results[2].email == "orlando@example.com"
+
+
+def test_tracerfy_provider_identical_addresses_fail_closed_for_review():
+	# Two rows for the SAME property: a result row can't be attributed to
+	# either, so both are flagged for review rather than one overwriting
+	# the other's key.
+	provider = TracerfyEnrichmentProvider("fake-key")
+	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
+		handle = provider.submit([_tracerfy_input(winback_row_id=1), _tracerfy_input(winback_row_id=2)])
+	assert handle.match_keys == {}
+	assert handle.unprocessable_ids == frozenset({1, 2})
 
 
 def test_tracerfy_provider_collect_unmatched_result_row_is_ignored_not_crashed():
@@ -396,7 +428,7 @@ def test_tracerfy_provider_collect_no_phone_found_gives_none_not_false():
 	provider = TracerfyEnrichmentProvider("fake-key")
 	with patch("src.services.tracerfy_client.submit_skiptrace_batch", return_value=("q1", 0)):
 		handle = provider.submit([_tracerfy_input(winback_row_id=1)])
-	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=[{"address": "123 main st", "email_1": "jane@example.com"}]):
+	with patch("src.services.tracerfy_client.poll_skiptrace_queue", return_value=[{"address": "123 main st", "city": "tampa", "state": "fl", "email_1": "jane@example.com"}]):
 		results = provider.collect(handle)
 	assert results[1].phone is None
 	assert results[1].phone_verified is None  # never False -- Tracerfy never disproves a phone, only finds or doesn't

@@ -237,8 +237,22 @@ class _TracerfySubmitHandle:
 
     queue_id: str
     estimated_wait_seconds: int
-    match_keys: dict[str, int]  # normalized street address -> winback_row_id
+    match_keys: dict[tuple[str, str, str], int]  # (normalized street, city, state) -> winback_row_id
     unprocessable_ids: frozenset[int] = frozenset()  # winback_row_ids excluded before submission — address didn't parse
+
+
+def _match_key(street: str, city: str, state: str) -> tuple[str, str, str] | None:
+    """Composite matching key for a Tracerfy result row. Street alone
+    collides across cities ("123 Main St" exists in every metro), which
+    would silently attach one owner's contact details to another owner's
+    winback row; Tracerfy echoes city/state back on every result row, so
+    all three are used."""
+    from src.services.winback_ingest import normalize_address
+
+    norm_street = normalize_address(street)
+    if not norm_street:
+        return None
+    return (norm_street, normalize_address(city), normalize_address(state))
 
 
 class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
@@ -249,7 +263,7 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
     tracerfy_client owns HTTP transport — same split as
     compliance_gate.DncProvider vs tracerfy_client for DNC.
 
-    Result rows are matched by normalized street address, NOT by an
+    Result rows are matched by normalized (street, city, state), NOT by an
     embedded row-id field — confirmed (both from Tracerfy's own docs and
     from the working ForcedAction-System reference integration) that the
     batch queue result echoes back no submitted identifier at all. Reuses
@@ -278,8 +292,9 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
         from src.services.winback_ingest import normalize_address
 
         records: list[dict] = []
-        match_keys: dict[str, int] = {}
+        match_keys: dict[tuple[str, str, str], int] = {}
         unprocessable_ids: set[int] = set()
+        ambiguous_keys: set[tuple[str, str, str]] = set()
         for i in inputs:
             split = _split_address(i.property_address)
             if split is None:
@@ -301,9 +316,22 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
                 "city": city,
                 "state": state,
             })
-            key = normalize_address(street)
+            key = _match_key(street, city, state)
             if key:
-                match_keys[key] = i.winback_row_id
+                if key in match_keys:
+                    # Two submitted rows share one (street, city, state) —
+                    # a result row for that key can't be attributed to
+                    # either without guessing, and attaching the wrong
+                    # owner's phone/email is worse than no enrichment.
+                    # Fail both closed for review; the earlier row's key is
+                    # never silently overwritten.
+                    unprocessable_ids.add(match_keys.pop(key))
+                    unprocessable_ids.add(i.winback_row_id)
+                    ambiguous_keys.add(key)
+                elif key in ambiguous_keys:
+                    unprocessable_ids.add(i.winback_row_id)
+                else:
+                    match_keys[key] = i.winback_row_id
 
         if not records:
             # Every input in this chunk had an unparseable address — nothing
@@ -332,7 +360,7 @@ class TracerfyEnrichmentProvider(OwnerEnrichmentProvider):
         result_rows = poll_skiptrace_queue(handle.queue_id, self._api_key, handle.estimated_wait_seconds)
         result: dict[int, EnrichmentResult] = {}
         for row in result_rows:
-            key = normalize_address(row.get("address") or "")
+            key = _match_key(row.get("address") or "", row.get("city") or "", row.get("state") or "")
             winback_row_id = handle.match_keys.get(key)
             if winback_row_id is None:
                 logger.warning("owner_enrichment: skip-trace result row did not match any submitted address: %r", row.get("address"))
