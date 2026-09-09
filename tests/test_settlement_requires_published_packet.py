@@ -66,6 +66,10 @@ class _RecordingGateway(StripeGateway):
 		self.calls.append("find_invoice_by_metadata")
 		return None
 
+	def retrieve_invoice(self, **kw):
+		self.calls.append("retrieve_invoice")
+		raise AssertionError("must not be called when the evidence packet is unpublished")
+
 	def add_invoice_item(self, **kw):
 		self.calls.append("add_invoice_item")
 

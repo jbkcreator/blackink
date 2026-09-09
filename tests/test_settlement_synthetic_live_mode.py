@@ -77,6 +77,10 @@ class _RecordingGateway(StripeGateway):
 		self.calls.append("find_invoice_by_metadata")
 		return None
 
+	def retrieve_invoice(self, *, stripe_invoice_id):
+		self.calls.append("retrieve_invoice")
+		return InvoiceHandle(stripe_invoice_id=stripe_invoice_id, status="draft")
+
 	def add_invoice_item(self, **kw):
 		self.calls.append("add_invoice_item")
 
