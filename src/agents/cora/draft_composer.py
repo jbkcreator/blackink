@@ -76,7 +76,7 @@ _FALLBACK_SEQUENCE: List[dict] = [
             "market, that delay puts roughly {loss_dollars}/year in owner leads at risk.\n\n"
             "I put together a 2-min audit walkthrough -- {video_url}\n\n"
             "Worth a quick look? This is {client_firm} -- happy to show you how our "
-            "clients are responding in under 5 minutes, 24/7.\n\nBest,\n{{sender_name}}"
+            "clients are responding in under 5 minutes, 24/7.\n\nBest,\n{client_firm} Team"
         ),
     },
     {
