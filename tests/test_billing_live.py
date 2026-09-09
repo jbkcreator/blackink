@@ -622,6 +622,10 @@ class _FakeSitGateway(StripeGateway):
 		self.calls.append("create_invoice")
 		return InvoiceHandle(stripe_invoice_id=f"in_{uuid.uuid4().hex[:8]}", status="draft")
 
+	def find_invoice_by_metadata(self, **kw):
+		self.calls.append("find_invoice_by_metadata")
+		return None
+
 	def add_invoice_item(self, **kw):
 		self.calls.append("add_invoice_item")
 		if self._fail_add_item_times > 0:

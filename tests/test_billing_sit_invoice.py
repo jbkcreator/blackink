@@ -23,6 +23,10 @@ class _FakeGateway:
 		self.calls = []
 		self._fail_on = fail_on
 
+	def find_invoice_by_metadata(self, **kw):
+		self.calls.append(("find_invoice_by_metadata", kw))
+		return None
+
 	def create_invoice(self, **kw):
 		self.calls.append(("create_invoice", kw))
 		if self._fail_on == "create_invoice":
@@ -216,4 +220,38 @@ def test_retry_after_mid_sequence_failure_resumes_same_invoice_no_second_create(
 
 	assert outcome.status == "INVOICED"
 	assert outcome.stripe_invoice_id == "in_fake"
+	assert [name for name, _ in gw.calls] == ["add_invoice_item", "finalize_invoice"]
+
+
+def test_crash_before_savepoint_commits_is_reconciled_not_duplicated(monkeypatch):
+	"""Re-review finding #2: simulates a worker crash after Stripe accepted
+	create_invoice but before the savepoint persisting stripe_invoice_id ever
+	committed to disk — the retry's row has stripe_invoice_id=None, exactly as
+	if create_invoice had never been called. find_invoice_by_metadata must
+	find the already-created invoice by the (appointment_id, purpose) metadata
+	this path always stamps, and reuse it rather than creating a second one."""
+	monkeypatch.setattr(
+		"src.services.billing.sit_invoice.resolve_sit_charge",
+		lambda *a, **kw: type("C", (), {"offer_code": "appt_standard", "amount_cents": 9900, "first_sit": False})(),
+	)
+	monkeypatch.setattr(
+		"src.services.billing.sit_invoice.apply_pending_credits_to_invoice",
+		lambda *a, **kw: 0,
+	)
+	row = _Row(is_billable=True, billed_offer_code=None, billed_amount_cents=None, stripe_customer_id="cus_1")
+	session = _FakeSession(row)
+
+	class _ReconcilingGateway(_FakeGateway):
+		def find_invoice_by_metadata(self, *, stripe_customer_id, metadata_filter):
+			assert metadata_filter == {"appointment_id": "appt-1", "purpose": "sit_charge"}
+			return type("H", (), {"stripe_invoice_id": "in_from_crash", "status": "draft"})()
+
+	gw = _ReconcilingGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+
+	assert outcome.status == "INVOICED"
+	assert outcome.stripe_invoice_id == "in_from_crash"
 	assert [name for name, _ in gw.calls] == ["add_invoice_item", "finalize_invoice"]

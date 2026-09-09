@@ -17,6 +17,7 @@ def _row(agreement_source: str) -> SimpleNamespace:
 	return SimpleNamespace(
 		transaction_id=1, client_id="acme", company_id="co1", opportunity_id="opp-1", door_count=3,
 		installment_1_cents=5_000, installment_2_cents=5_000, inst1_attempts=0, inst2_attempts=0,
+		inst1_reopen_count=0, inst2_reopen_count=0,
 		inst1_stripe_invoice_id=None, inst2_stripe_invoice_id=None,
 		evidence_packet_url="https://files.stripe.com/already-published.pdf",
 		door_signed_at=_AS_OF, pms_agreement_id=1, agreement_source=agreement_source, agreement_status="ACTIVE",
@@ -71,6 +72,10 @@ class _RecordingGateway(StripeGateway):
 	def create_invoice(self, **kw):
 		self.calls.append("create_invoice")
 		return InvoiceHandle(stripe_invoice_id="in_123", status="draft")
+
+	def find_invoice_by_metadata(self, **kw):
+		self.calls.append("find_invoice_by_metadata")
+		return None
 
 	def add_invoice_item(self, **kw):
 		self.calls.append("add_invoice_item")

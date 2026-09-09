@@ -512,13 +512,21 @@ def reopen_failed_permanent_installment(
 	LATER FAILED_PERMANENT can alert again. No-op (returns False, no event
 	logged) unless the row is genuinely FAILED_PERMANENT for this installment
 	right now — never silently reopens an already-charged or already-voided
-	row."""
+	row.
+
+	`{prefix}_reopen_count` is incremented (never reset) alongside the
+	attempt-counter reset (PR #37 second review finding #1-adjacent): without
+	it, charge.py's pay-attempt idempotency key would rebuild the EXACT SAME
+	key an already-exhausted first attempt used, and Stripe would replay that
+	original cached decline for up to ~24h instead of this reopened retry
+	actually reaching Stripe again."""
 	prefix = "inst1" if installment == 1 else "inst2"
 	status_col = f"installment_{installment}_status"
 	row = session.execute(
 		text(
 			f"UPDATE settlement_transactions SET {status_col} = 'FAILED', "
-			f"  {prefix}_attempts = 0, {prefix}_next_retry_at = :as_of, "
+			f"  {prefix}_attempts = 0, {prefix}_reopen_count = {prefix}_reopen_count + 1, "
+			f"  {prefix}_next_retry_at = :as_of, "
 			f"  {prefix}_alerted_permanent_at = NULL, {prefix}_last_error = NULL, updated_at = NOW() "
 			f"WHERE transaction_id = :tid AND {status_col} = 'FAILED_PERMANENT' "
 			f"RETURNING client_id"

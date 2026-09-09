@@ -60,6 +60,7 @@ PYTHONPATH=. python migrations/apply_appointment_ops.py   # Subtask 1.1.1 — ap
 PYTHONPATH=. python migrations/apply_payment_auth_capture.py   # Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture columns + config/webhook-idempotency tables (needs companies; before RLS)
 PYTHONPATH=. python migrations/apply_pms_agreements.py      # Subtask 1.2.2 — door_signed data source (needs clients+companies+owner_contacts; before RLS)
 PYTHONPATH=. python migrations/apply_settlement_ledger.py   # Subtask 1.2.2 — 50/50 settlement split + 60-day clawback ledger (needs pms_agreements+companies; before RLS)
+PYTHONPATH=. python migrations/apply_settlement_reopen_count.py   # PR #37 re-review fix — inst{1,2}_reopen_count, so a reopened FAILED_PERMANENT retry gets a fresh pay idempotency key instead of replaying the stale cached decline (after apply_settlement_ledger.py, before RLS)
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)

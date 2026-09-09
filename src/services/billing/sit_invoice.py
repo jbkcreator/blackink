@@ -149,13 +149,32 @@ def charge_sit_for_appointment(
             client_id, appointment_id, stripe_invoice_id,
         )
     else:
-        invoice = gw.create_invoice(
+        # Reconciliation, not creation (PR #37 re-review finding — a worker
+        # crash between Stripe accepting create_invoice and the savepoint
+        # below committing to disk is the one gap the savepoint and Stripe's
+        # own idempotency-key retention don't cover). find_invoice_by_metadata
+        # lists this customer's invoices and matches on the SAME
+        # (appointment_id, purpose) pair every invoice this path creates
+        # carries in its own metadata — a genuinely already-created invoice is
+        # found and reused instead of a second one being created.
+        existing = gw.find_invoice_by_metadata(
             stripe_customer_id=row.stripe_customer_id,
-            default_payment_method_id=None,
-            metadata={"client_id": client_id, "appointment_id": str(appointment_id), "purpose": "sit_charge"},
-            idempotency_key=f"{idempotency_prefix}|invoice",
+            metadata_filter={"appointment_id": str(appointment_id), "purpose": "sit_charge"},
         )
-        stripe_invoice_id = invoice.stripe_invoice_id
+        if existing is not None:
+            stripe_invoice_id = existing.stripe_invoice_id
+            logger.info(
+                "billing.sit_invoice: client=%s appointment=%s reconciled existing invoice=%s via metadata scan",
+                client_id, appointment_id, stripe_invoice_id,
+            )
+        else:
+            invoice = gw.create_invoice(
+                stripe_customer_id=row.stripe_customer_id,
+                default_payment_method_id=None,
+                metadata={"client_id": client_id, "appointment_id": str(appointment_id), "purpose": "sit_charge"},
+                idempotency_key=f"{idempotency_prefix}|invoice",
+            )
+            stripe_invoice_id = invoice.stripe_invoice_id
         # Persisted in its own savepoint so it survives a LATER exception in
         # this same call (add_invoice_item/apply_credits/finalize below) —
         # see the module docstring for exactly what this does and doesn't

@@ -45,6 +45,19 @@ class StripeGateway(ABC):
 		would otherwise fail with no payment method to charge."""
 
 	@abstractmethod
+	def find_invoice_by_metadata(
+		self, *, stripe_customer_id: str, metadata_filter: dict,
+	) -> Optional[InvoiceHandle]:
+		"""Reconciliation, not creation: lists this customer's recent invoices
+		and returns the one whose metadata matches every key/value in
+		metadata_filter, or None. Uses Stripe's `invoices.list` (immediately
+		consistent) rather than the Search API (eventually consistent — a
+		just-created invoice can be briefly invisible to it), because this is
+		called on every entry BEFORE create_invoice specifically to survive a
+		crash between Stripe accepting create_invoice and this process
+		committing the id it just got back — see charge.py/sit_invoice.py."""
+
+	@abstractmethod
 	def add_invoice_item(
 		self, *, stripe_invoice_id: str, stripe_customer_id: str, amount_cents: int,
 		description: str, idempotency_key: str,
@@ -103,6 +116,19 @@ class LiveStripeGateway(StripeGateway):
 		)
 		return InvoiceHandle(stripe_invoice_id=invoice.id, status=invoice.status)
 
+	def find_invoice_by_metadata(self, *, stripe_customer_id, metadata_filter):
+		# Stripe's invoices.list has no metadata query param — list this
+		# customer's recent invoices (newest first, Stripe's default order)
+		# and match metadata client-side. Bounded to 100 (Stripe's own max
+		# page size) — a customer's per-installment/per-appointment invoice
+		# count is small, and this only runs at the start of a charge attempt.
+		invoices = self._client.invoices.list(params={"customer": stripe_customer_id, "limit": 100})
+		for invoice in invoices.data:
+			meta = invoice.metadata.to_dict() if invoice.metadata else {}
+			if all(meta.get(k) == v for k, v in metadata_filter.items()):
+				return InvoiceHandle(stripe_invoice_id=invoice.id, status=invoice.status)
+		return None
+
 	def add_invoice_item(self, *, stripe_invoice_id, stripe_customer_id, amount_cents, description, idempotency_key):
 		item = self._client.invoice_items.create(
 			params={
@@ -145,7 +171,24 @@ class LiveStripeGateway(StripeGateway):
 			)
 		except (stripe_sdk.error.APIConnectionError, stripe_sdk.error.IdempotencyError) as exc:
 			return PayOutcome(status="processing", is_transport_error=True, error_message=str(exc))
-		return PayOutcome(status=invoice.status)
+		if invoice.status == "paid":
+			return PayOutcome(status="paid")
+		# `.pay()` returned without raising — for ACH this is the NORMAL case,
+		# never a decline: Stripe delivers every ACH failure asynchronously via
+		# the invoice.payment_failed webhook (see stripe_webhook_router.py's
+		# _handle_settlement_event), days later in production and never
+		# synchronously from this call. A genuine synchronous decline (a card
+		# payment method) already raised CardError above and returned before
+		# reaching here. Verified against a real Stripe test-mode ACH payment
+		# (re-review verification pass): `.pay()` returned the invoice still
+		# `status="open"` while the charge was in flight; the SAME invoice
+		# reached `status="paid"` moments later with no exception ever raised.
+		# Treating that "open, no exception" result as a decline (the
+		# pre-existing bug this comment replaces) would fire the card fallback
+		# — or mark the installment FAILED — while the ACH charge was still
+		# genuinely succeeding, a direct double-charge risk this repo's own
+		# "under-billing, never double-billing" invariant forbids.
+		return PayOutcome(status="processing")
 
 	def void_or_delete_invoice(self, *, stripe_invoice_id, invoice_status):
 		if invoice_status == "draft":
