@@ -19,6 +19,23 @@ cd "$(dirname "$0")/.." || exit 1
 export PYTHONPATH="$(pwd)"
 VENV_PYTHON="./venv/bin/python3"
 
+# A few migration scripts (e.g. apply_stl_cadence.py) read os.environ
+# directly instead of going through config/settings.py, so they see
+# nothing unless the shell itself has DATABASE_URL etc. exported —
+# unlike the rest of the app, which loads .env on its own. Export .env
+# here via python-dotenv (already a dependency) so every script works
+# regardless of which pattern it follows. shlex-quoted, not `source .env`
+# directly — a value containing quotes would otherwise get mangled.
+if [ -f .env ]; then
+  eval "$("$VENV_PYTHON" -c '
+import shlex
+from dotenv import dotenv_values
+for k, v in dotenv_values(".env").items():
+    if v is not None:
+        print(f"export {k}={shlex.quote(v)}")
+')"
+fi
+
 mkdir -p logs
 LOG="logs/migrations_$(date +%Y%m%d_%H%M%S).log"
 
