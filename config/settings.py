@@ -428,6 +428,18 @@ class AppSettings(BaseSettings):
 	# replies@{client_id}.{inbound_email_domain}
 	inbound_email_domain: str = Field(default="getblackink.com", env="INBOUND_EMAIL_DOMAIN")
 
+	# ── Six Billing Rules (Subtask 1.2.3) ────────────────────────────────────
+	# Rule 1's $50 miss credit is keyed on inbound_messages.acked_at, which
+	# nothing in this codebase writes yet (that's the automated first-response
+	# sender's job — a separate, not-yet-built path; see
+	# src/services/billing/miss_credit.py's module docstring). Until that
+	# sender exists and is verified to actually stamp acked_at, EVERY
+	# unclassified email older than 60 seconds looks identical to a miss —
+	# the sweep must fail closed (a no-op, not a flood of false $50 credits)
+	# rather than run on an unmet precondition. Flip to True only once the
+	# automated-ack sender is live and acked_at is confirmed being written.
+	billing_miss_credit_sweep_enabled: bool = Field(default=False, env="BILLING_MISS_CREDIT_SWEEP_ENABLED")
+
 
 @lru_cache
 def get_settings() -> AppSettings:

@@ -78,6 +78,11 @@ _SETTLEMENT_INSTALLMENT_2_SWEEP_INTERVAL_SECONDS = 3600
 # Task 4.2.1 — 30-second tick keeps SLA response latency well under 30 min
 _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS = 30
 _RESPOND_SLA_SWEEP_INTERVAL_SECONDS = 60
+# Subtask 1.2.3 — Six Billing Rules.
+_BILLING_MISS_CREDIT_SWEEP_INTERVAL_SECONDS = 60
+_BILLING_DISPUTE_CREDIT_SWEEP_INTERVAL_SECONDS = 60
+_BILLING_GUARANTEE_SWEEP_INTERVAL_SECONDS = 3600
+_BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS = 300
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -106,6 +111,12 @@ def _start_background_workers() -> None:
 	from src.tasks.speed_to_lead_sweep import run_sweep as speed_to_lead_sweep
 	from src.tasks.respond_sla_sweep import run_sweep as respond_sla_sweep
 	from src.agents.respond.worker import Worker as RespondWorker
+	from src.tasks.billing_sweep import (
+		run_dispute_credit_sweep as billing_dispute_credit_sweep,
+		run_guarantee_sweep as billing_guarantee_sweep,
+		run_miss_credit_sweep as billing_miss_credit_sweep,
+		run_sit_invoice_sweep as billing_sit_invoice_sweep,
+	)
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -125,6 +136,10 @@ def _start_background_workers() -> None:
 		# Task 4.2.1 — SLA sweep dispatches deferred Speed-to-Lead auto-responses.
 		("speed_to_lead_sweep.run_sweep", _SPEED_TO_LEAD_SWEEP_INTERVAL_SECONDS, speed_to_lead_sweep),
 		("respond_sla_sweep.run_sweep", _RESPOND_SLA_SWEEP_INTERVAL_SECONDS, respond_sla_sweep),
+		("billing_sweep.run_miss_credit_sweep", _BILLING_MISS_CREDIT_SWEEP_INTERVAL_SECONDS, billing_miss_credit_sweep),
+		("billing_sweep.run_dispute_credit_sweep", _BILLING_DISPUTE_CREDIT_SWEEP_INTERVAL_SECONDS, billing_dispute_credit_sweep),
+		("billing_sweep.run_guarantee_sweep", _BILLING_GUARANTEE_SWEEP_INTERVAL_SECONDS, billing_guarantee_sweep),
+		("billing_sweep.run_sit_invoice_sweep", _BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS, billing_sit_invoice_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)

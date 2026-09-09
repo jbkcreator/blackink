@@ -118,7 +118,8 @@ yet `succeeded` · `502` Stripe API error.
 Header: `Authorization: Bearer <jwt>` — **not** a query parameter. A
 query-string token is routinely retained in browser history,
 reverse-proxy/access logs, and observability systems; the header keeps a
-live onboarding credential out of all of them (PR #36 review finding 2).
+live onboarding credential out of all of them (fixed independently on two
+stacked branches: PR #36 review finding 2, and PR #37 review finding #7).
 
 Response `200`:
 ```json
