@@ -66,4 +66,6 @@ playwright>=1.44
 anthropic>=0.40
 # IMAP IDLE listener (src/tasks/imap_listener.py) — async IMAP with IDLE support.
 aioimaplib>=1.0
+# Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1)
+stripe>=10.0
 
