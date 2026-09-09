@@ -200,6 +200,48 @@ class TestClassifyAndParse:
         ))
         assert result.source_channel == "APM"
 
+    # ── Security: display-name spoofing must never trigger auto-dispatch ──────
+
+    def test_spoofed_display_name_does_not_match_portal(self):
+        """PR review finding: matching on the raw From string let an attacker
+        spoof 'From: Thumbtack <attacker@evil.example>' with a crafted body
+        (Name/Email lines pointing at a victim) and get auto-dispatched as a
+        real Thumbtack lead. Classification must key off the real address
+        domain only — never the attacker-controlled display name — so this
+        falls through to UNCLASSIFIED/human-review instead."""
+        result = classify_and_parse(_parts(
+            sender="Thumbtack <attacker@evil.example>",
+            subject="New lead",
+            body="Name: Victim\nEmail: victim@example.com\nPhone: 555-000-1111",
+        ))
+        assert result.source_channel == UNCLASSIFIED
+        assert result.requires_human_review is True
+        assert result.email is None
+
+    def test_spoofed_display_name_apm_and_mmp_also_rejected(self):
+        for sender in (
+            "All Property Management <attacker@evil.example>",
+            "Manage My Property <attacker@evil.example>",
+        ):
+            result = classify_and_parse(_parts(sender=sender, body="Name: X\nEmail: x@example.com"))
+            assert result.source_channel == UNCLASSIFIED, sender
+            assert result.requires_human_review is True, sender
+
+    def test_subdomain_of_real_portal_domain_still_matches(self):
+        result = classify_and_parse(_parts(
+            sender="notify@mail.thumbtack.com",
+            body=THUMBTACK_BODY,
+        ))
+        assert result.source_channel == "THUMBTACK"
+
+    def test_lookalike_domain_does_not_match(self):
+        # "thumbtack.com.evil.example" is NOT a subdomain of thumbtack.com.
+        result = classify_and_parse(_parts(
+            sender="notify@thumbtack.com.evil.example",
+            body=THUMBTACK_BODY,
+        ))
+        assert result.source_channel == UNCLASSIFIED
+
     def test_phone_only_lead_never_adopts_portal_from_header(self):
         """PR finding: a name+phone APM lead with no body email is 'usable'
         (not review-required), but its email must stay None — never the portal's

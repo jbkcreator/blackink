@@ -46,6 +46,7 @@ import html as _html
 import logging
 import re
 from dataclasses import dataclass, field
+from email.utils import parseaddr
 from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -112,31 +113,50 @@ class EmailParts:
         return _html_to_text(self.body_html)
 
 
+def _sender_domain(sender: str) -> str:
+    """The actual sending domain, ignoring the attacker-controlled display name.
+
+    ``parseaddr`` strips a 'From' string like ``Thumbtack <attacker@evil.example>``
+    down to the real address; only the part after '@' is ever trusted for
+    portal identification. Never match on the free-text display name — that's
+    exactly what a spoofed sender controls."""
+    _, addr = parseaddr(sender or "")
+    if "@" not in addr:
+        return ""
+    return addr.rsplit("@", 1)[-1].strip().lower()
+
+
+def _domain_matches(domain: str, allowed: str) -> bool:
+    return bool(domain) and (domain == allowed or domain.endswith("." + allowed))
+
+
 @dataclass
 class PortalConfig:
-    """One registry row. ``sender_pattern`` and/or ``subject_pattern`` are
-    case-insensitive regexes; a config matches when every provided pattern
-    matches (a config with neither never matches). First match wins."""
+    """One registry row. ``sender_domains`` is matched against the REAL address
+    domain only (never the display name — see ``_sender_domain``); an exact
+    domain or subdomain of one of them matches. ``subject_pattern`` is an
+    optional case-insensitive regex, required in addition when set. A config
+    matches when every provided condition matches (a config with neither never
+    matches). First match wins."""
 
     name: str
     source_channel: str
     parser: ParserFn
-    sender_pattern: Optional[str] = None
+    sender_domains: tuple = ()
     subject_pattern: Optional[str] = None
-    _sender_re: Optional[re.Pattern] = field(default=None, init=False, repr=False)
     _subject_re: Optional[re.Pattern] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.sender_pattern:
-            self._sender_re = re.compile(self.sender_pattern, re.IGNORECASE)
         if self.subject_pattern:
             self._subject_re = re.compile(self.subject_pattern, re.IGNORECASE)
 
     def matches(self, parts: EmailParts) -> bool:
-        if self._sender_re is None and self._subject_re is None:
+        if not self.sender_domains and self._subject_re is None:
             return False
-        if self._sender_re is not None and not self._sender_re.search(parts.sender or ""):
-            return False
+        if self.sender_domains:
+            domain = _sender_domain(parts.sender)
+            if not any(_domain_matches(domain, allowed) for allowed in self.sender_domains):
+                return False
         if self._subject_re is not None and not self._subject_re.search(parts.subject or ""):
             return False
         return True
@@ -288,22 +308,19 @@ PORTAL_REGISTRY: List[PortalConfig] = [
         name="All Property Management",
         source_channel="APM",
         parser=parse_apm,
-        sender_pattern=r"allpropertymanagement\.com|@apm\.|All Property Management",
-        subject_pattern=None,
+        sender_domains=("allpropertymanagement.com",),
     ),
     PortalConfig(
         name="Manage My Property",
         source_channel="MANAGE_MY_PROPERTY",
         parser=parse_manage_my_property,
-        sender_pattern=r"managemyproperty\.com|Manage\s?My\s?Property",
-        subject_pattern=None,
+        sender_domains=("managemyproperty.com",),
     ),
     PortalConfig(
         name="Thumbtack",
         source_channel="THUMBTACK",
         parser=parse_thumbtack,
-        sender_pattern=r"thumbtack\.com|Thumbtack",
-        subject_pattern=None,
+        sender_domains=("thumbtack.com",),
     ),
 ]
 

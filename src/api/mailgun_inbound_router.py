@@ -56,6 +56,18 @@ def _extract_subdomain(recipient: str) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
+def _content_hash(sender: str, subject: str, body_plain: str, body_html: Optional[str]) -> str:
+    """Fallback idempotency key for a message with no Mailgun Message-Id.
+
+    Must include body_html: an HTML-only notification (body_plain empty) is a
+    supported case (see EmailParts.text_body), and without body_html here two
+    distinct HTML-only notifications sharing sender+subject hash identically —
+    the second is then treated as a duplicate and silently dropped."""
+    return hashlib.sha256(
+        f"{sender}:{subject}:{body_plain}:{body_html or ''}".encode()
+    ).hexdigest()
+
+
 def _resolve_client_id_from_slug(slug: str) -> Optional[str]:
     """Resolve client_id from the subdomain slug. The clients table is
     RLS-scoped, so a bare session sees zero rows — resolution goes through the
@@ -101,9 +113,9 @@ async def mailgun_inbound(request: Request) -> dict:
 
     # idempotency_key is globally UNIQUE — namespace with client_id. Prefer the
     # Mailgun Message-Id; fall back to a content hash if absent.
-    stable = mg_message_id.strip("<>") if mg_message_id else hashlib.sha256(
-        f"{sender}:{subject}:{body_plain[:200]}".encode()
-    ).hexdigest()
+    stable = mg_message_id.strip("<>") if mg_message_id else _content_hash(
+        sender, subject, body_plain, body_html
+    )
     idempotency_key = f"{client_id}:{stable}"
 
     # 4.2.3 — classify the portal and extract structured fields.
