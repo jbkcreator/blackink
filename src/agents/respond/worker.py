@@ -45,6 +45,8 @@ from src.agents.respond import queue
 from src.agents.respond.classifier import ClassificationResult, classify
 from src.agents.respond.context_cards import CONTEXT_CARD_INTENTS, post_context_card
 from src.agents.respond.intents import Intent
+from src.agents.respond.kb_cards import post_kb_card
+from src.agents.respond.kb_matcher import match_kb
 from src.core.database import Database
 from src.services.events import log_event
 
@@ -158,6 +160,15 @@ def _halt_sequence(db: Any, sender_email: str, client_id: str) -> None:
     )
 
 
+def _load_body(db: Any, db_id: int) -> str:
+    """Fetch body_text for KB matching — separate query so the classifier result is already written."""
+    row = db.execute(
+        text("SELECT body_text FROM inbound_messages WHERE id = :id"),
+        {"id": db_id},
+    ).first()
+    return (row[0] or "") if row else ""
+
+
 def _route(
     db: Any,
     db_id: int,
@@ -175,10 +186,20 @@ def _route(
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
     sla_due_at   = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
 
-    # QUESTION: flag for human review when confidence is below threshold.
-    requires_human_review = (
-        result.intent == Intent.QUESTION and result.confidence < 0.90
-    )
+    # QUESTION: run KB matcher to determine requires_human_review.
+    # High-confidence match (>=0.90) → draft card queued, no human review needed yet.
+    # Low-confidence or no match → requires_human_review=TRUE, card still posted.
+    kb_match = None
+    requires_human_review = False
+    if result.intent == Intent.QUESTION:
+        try:
+            kb_match = match_kb(db, _load_body(db, db_id))
+        except Exception:
+            logger.exception("respond.worker: kb match failed for db_id=%s", db_id)
+        if kb_match and kb_match.match_confidence >= 0.90:
+            requires_human_review = False
+        else:
+            requires_human_review = True
 
     # Pre-commit side-effects that must be atomic with the status write.
     if result.intent == Intent.UNSUBSCRIBE:
@@ -241,6 +262,16 @@ def _route(
             f"Client: `{client_id}` | Sender: `{sender_email}`\n"
             f"Message ID: `{db_id}` — route to Referral Agent.",
         ))
+
+    elif result.intent == Intent.QUESTION:
+        card_meta = asyncio.run(post_kb_card(
+            db_id=db_id,
+            client_id=client_id,
+            sender_email=sender_email,
+            kb_match=kb_match,
+        ))
+        if card_meta:
+            _write_card_meta(db_id, card_meta)
 
     elif result.intent in CONTEXT_CARD_INTENTS and sla_due_at:
         card_meta = asyncio.run(post_context_card(
