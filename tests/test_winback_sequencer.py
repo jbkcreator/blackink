@@ -33,6 +33,13 @@ def _row(**overrides):
 		stopped_at=None,
 		stop_reason=None,
 		audit_loss_dollars_est=None,
+		# Subtask 3.2.1 — default to "already enriched, healthy" so every
+		# pre-existing test above this line (disposition/suppression/stopped_at
+		# assertions) continues to exercise exactly what it did before the
+		# enrichment gate landed, without having to know about it.
+		enrichment_timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+		requires_enrichment_review=False,
+		email_status="VERIFIED",
 	)
 	base.update(overrides)
 	return SimpleNamespace(**base)
@@ -103,7 +110,7 @@ def test_gate_records_every_check_to_the_audit_table():
 	evaluate_winback_touch_gate(session, _row(winback_row_id=99), "client_a")
 	assert len(session.recorded) == 4  # one row per check, always, not just failures
 	assert {r["check_name"] for r in session.recorded} == {
-		"disposition", "not_suppressed", "not_stopped", "has_email",
+		"disposition", "not_suppressed", "not_stopped", "enrichment_verified",
 	}
 	assert all(r["winback_row_id"] == 99 and r["client_id"] == "client_a" for r in session.recorded)
 	assert all(r["status"] == "PASS" for r in session.recorded)
