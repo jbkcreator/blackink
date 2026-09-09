@@ -49,7 +49,15 @@ logger = logging.getLogger(__name__)
 # false-positive risk this threshold is chosen to avoid).
 _OWNER_NAME_MATCH_THRESHOLD = 85
 
-_REQUIRED_CSV_COLUMNS = ("owner_name", "property_address", "county", "phone", "email")
+_REQUIRED_CSV_COLUMNS = ("owner_name", "property_address", "county")
+# phone/email (not in the tuple above) are legal to omit — an owner with no
+# last-known contact method is exactly the row Subtask 3.2.1's enrichment
+# step exists to rescue. Neither Blueprint v2 nor the client's own comments
+# specify the CSV's columns at all; the five-column "minimum required" list
+# that used to appear here traced only to the derived
+# Week2_Tasks_Dev_Split_v1.md:236, not to the client. Requiring phone meant a
+# client export with no phone column produced 500 rows of UNKNOWN and zero
+# outreach — see Subtask 3.2.1's plan doc §3 Step 0.
 
 _PUNCTUATION_RE = re.compile(r"[^\w\s]")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -313,6 +321,19 @@ def run_import(
 	SAVEPOINT pattern; without this, a single mid-batch exception would
 	silently wipe every row processed so far (system_session_scope rolls
 	back the ENTIRE session on any uncaught exception).
+
+	Deliberately does NOT call any enrichment/skip-trace vendor (Subtask
+	3.2.1) — this function is invoked synchronously from an async FastAPI
+	handler (src/api/winback_router.py's upload_winback_csv), and Tracerfy's
+	submit-then-poll API can block up to 10 minutes; doing that per-row here
+	would badly worsen an already-blocking request path. Every
+	outreach-eligible row this function inserts simply lands with
+	enrichment_timestamp IS NULL, which is exactly
+	src/tasks/enrichment_verification.py's claim-query predicate — so every
+	such row is automatically queued for enrichment with no extra plumbing.
+	That sweep (not this function) is what clears enrichment_timestamp
+	before evaluate_winback_touch_gate or the /arm endpoint will allow a row
+	to be sequenced.
 	"""
 	settings = get_settings()
 	rows = parse_csv(raw_csv)
@@ -459,18 +480,28 @@ def _process_row(
 		# suppressed") — a SOLD/UNKNOWN row can never be sequenced regardless
 		# of DNC status, so scrubbing its phone would only spend a Tracerfy
 		# credit for nothing.
-		normalized_phone = _normalize_phone(row.phone) if row.phone else ""
-		if normalized_phone:
-			dnc_check_targets.append((winback_row_id, normalized_phone))
+		if row.phone is None:
+			# Legal since Subtask 3.2.1 (phone is an optional CSV column) —
+			# an email-only owner is a perfectly valid win-back target with
+			# nothing to scrub. Must NOT go through _flag_unscrubbed: that
+			# sets suppression_state = TRUE, which would suppress every
+			# email-only row outright — exactly the rows this optional-column
+			# change exists to stop discarding.
+			pass
 		else:
-			# A phone that's present in the CSV (required column, so it
-			# passed the not-empty check) but doesn't normalize to any
-			# digits at all (e.g. "n/a", "unknown") previously fell through
-			# here silently — never scrubbed, never flagged, never
-			# suppressed (confirmed review finding). It can never be
-			# scrubbed at all, so it gets the same fail-closed treatment as
-			# a Tracerfy outage, not a silent skip.
-			_flag_unscrubbed(session, [winback_row_id], counts)
+			normalized_phone = _normalize_phone(row.phone)
+			if normalized_phone:
+				dnc_check_targets.append((winback_row_id, normalized_phone))
+			else:
+				# A phone value IS present in the CSV but doesn't normalize to
+				# any digits at all (e.g. "n/a", "unknown") — previously fell
+				# through here silently — never scrubbed, never flagged, never
+				# suppressed (confirmed review finding). It can never be
+				# scrubbed at all, so it gets the same fail-closed treatment as
+				# a Tracerfy outage, not a silent skip. Distinct from "no phone
+				# supplied at all" above: here the client supplied *something*
+				# that turned out to be ungradeable, which stays fail-closed.
+				_flag_unscrubbed(session, [winback_row_id], counts)
 
 
 def _insert_row(
@@ -526,6 +557,16 @@ def _insert_row(
 	return result.scalar_one()
 
 
+def dnc_scrub_rows(session: Session, targets: list[tuple[int, str]], settings, counts: dict) -> None:
+	"""Public entry point to the DNC-scrub batch path, for callers outside
+	this module — src/tasks/enrichment_verification.py (Subtask 3.2.1) scrubs
+	phone numbers newly discovered by skip-trace through this same path, to
+	preserve 3.1.1's ordering invariant (DNC scrub before any sequence can
+	arm) for numbers that didn't exist at import time. Thin wrapper, not a
+	re-implementation — see _run_dnc_scrub for the actual logic."""
+	_run_dnc_scrub(session, targets, settings, counts)
+
+
 def _run_dnc_scrub(
 	session: Session,
 	targets: list[tuple[int, str]],
@@ -555,13 +596,13 @@ def _run_dnc_scrub(
 	"""
 	from src.services.tracerfy_client import BATCH_SIZE, scrub_phones
 
-	if not settings.dnc_vendor_api_key:
-		logger.warning("winback_ingest: DNC_VENDOR_API_KEY not set — %d rows left unscrubbed, flagged for review",
+	if not settings.tracerfy_api_key:
+		logger.warning("winback_ingest: TRACERFY_API_KEY not set — %d rows left unscrubbed, flagged for review",
 					   len(targets))
 		_flag_unscrubbed(session, [wid for wid, _ in targets], counts)
 		return
 
-	api_key = settings.dnc_vendor_api_key.get_secret_value()
+	api_key = settings.tracerfy_api_key.get_secret_value()
 	now = datetime.now(timezone.utc)
 	phone_to_row_ids: dict[str, list[int]] = {}
 	for winback_row_id, phone in targets:

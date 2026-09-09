@@ -94,6 +94,16 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 			"suppressed_count",
 		}
 	),
+	# Subtask 3.2.1 — Enrichment Pipeline Wiring Verification. `provider` is
+	# required because the DoD names it explicitly ("event logged with
+	# provider field populated"). `signal_source` ("WINBACK_IMPORT" today,
+	# "HOMESTEAD_DROP" / "SPEED_TO_LEAD" once those pipelines produce
+	# signals of their own — see src/services/owner_enrichment.py's
+	# enrich_homestead_drop_signals) is what makes the client's "for every
+	# signal" requirement auditable per source, not just in aggregate.
+	"owner_enrichment_completed": frozenset(
+		{"provider", "signal_source", "email_found", "phone_found", "requires_review"}
+	),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is

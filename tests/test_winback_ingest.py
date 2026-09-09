@@ -132,16 +132,27 @@ def test_parse_csv_flags_missing_required_column():
 	assert "owner_name" in rows[0].validation_error
 
 
-def test_parse_csv_empty_phone_and_email_flagged_as_missing():
-	# Phone and email are BOTH in the spec's own "minimum required columns"
-	# list (Week2_Tasks_Dev_Split_v1.md:236) — an empty value for either is
-	# a validation failure, not a silently-accepted optional field.
+def test_parse_csv_empty_phone_and_email_is_legal_subtask_3_2_1():
+	# Corrected (Subtask 3.2.1): "phone and email are BOTH required" traced
+	# only to Week2_Tasks_Dev_Split_v1.md:236, a derived dev-split doc, not
+	# to the client's own spec — neither Blueprint v2 nor the client comments
+	# doc specifies the CSV's columns at all. An owner with no last-known
+	# contact method is exactly the row skip-trace enrichment exists to
+	# rescue, so a blank phone/email must NOT be a validation failure.
 	csv_text = "owner_name,property_address,county,phone,email\nJane Doe,123 Main St,hillsborough_fl,,\n"
 	rows = parse_csv(csv_text)
 	assert rows[0].phone is None
 	assert rows[0].email is None
+	assert rows[0].validation_error is None
+
+
+def test_parse_csv_missing_owner_name_still_flagged():
+	# owner_name/property_address/county remain required — only phone/email
+	# became optional.
+	csv_text = "owner_name,property_address,county,phone,email\n,123 Main St,hillsborough_fl,,jane@example.com\n"
+	rows = parse_csv(csv_text)
 	assert rows[0].validation_error is not None
-	assert "phone" in rows[0].validation_error and "email" in rows[0].validation_error
+	assert "owner_name" in rows[0].validation_error
 
 
 # ---------------------------------------------------------------------------
@@ -430,7 +441,7 @@ def test_flag_unscrubbed_is_a_noop_for_empty_list():
 
 def test_run_dnc_scrub_missing_api_key_suppresses_every_target_fail_closed():
 	session = _DncFakeSession()
-	settings = MagicMock(dnc_vendor_api_key=None)
+	settings = MagicMock(tracerfy_api_key=None)
 	counts = {"suppressed_count": 0}
 	_run_dnc_scrub(session, [(1, "8135550100"), (2, "8135550101")], settings, counts)
 	assert len(session.updates) == 1
@@ -441,7 +452,7 @@ def test_run_dnc_scrub_missing_api_key_suppresses_every_target_fail_closed():
 def test_run_dnc_scrub_vendor_call_failure_suppresses_targets_fail_closed():
 	session = _DncFakeSession()
 	settings = MagicMock()
-	settings.dnc_vendor_api_key.get_secret_value.return_value = "test-key"
+	settings.tracerfy_api_key.get_secret_value.return_value = "test-key"
 	counts = {"suppressed_count": 0}
 	with patch("src.services.tracerfy_client.scrub_phones", side_effect=RuntimeError("Tracerfy is down")):
 		_run_dnc_scrub(session, [(1, "8135550100")], settings, counts)
@@ -456,7 +467,7 @@ def test_run_dnc_scrub_partial_vendor_response_suppresses_only_the_missing_phone
 	not left at suppression_state=FALSE by default."""
 	session = _DncFakeSession()
 	settings = MagicMock()
-	settings.dnc_vendor_api_key.get_secret_value.return_value = "test-key"
+	settings.tracerfy_api_key.get_secret_value.return_value = "test-key"
 	counts = {"suppressed_count": 0}
 	with patch("src.services.tracerfy_client.scrub_phones", return_value={"8135550100": True}):
 		_run_dnc_scrub(session, [(1, "8135550100"), (2, "8135550199")], settings, counts)
@@ -475,7 +486,7 @@ def test_run_dnc_scrub_dnc_hit_suppresses_with_dnc_listed_not_unverified():
 	DNC_LISTED reason, distinct from an unverified/failed-lookup row."""
 	session = _DncFakeSession()
 	settings = MagicMock()
-	settings.dnc_vendor_api_key.get_secret_value.return_value = "test-key"
+	settings.tracerfy_api_key.get_secret_value.return_value = "test-key"
 	counts = {"suppressed_count": 0}
 	with patch("src.services.tracerfy_client.scrub_phones", return_value={"8135550100": False}):
 		_run_dnc_scrub(session, [(1, "8135550100")], settings, counts)
@@ -512,3 +523,35 @@ def test_process_row_malformed_phone_is_fail_closed_not_silently_skipped():
 	assert dnc_targets == []  # never queued for a paid Tracerfy lookup it can't pass
 	assert counts["still_owns_still_renting_count"] == 1
 	assert counts["suppressed_count"] == 1  # fail-closed, not silently left outreach-eligible
+
+
+def test_process_row_no_phone_at_all_is_not_suppressed_subtask_3_2_1():
+	"""Distinct from the malformed-phone case above: phone=None means the
+	CSV legitimately omitted it (legal since Subtask 3.2.1 — see
+	test_parse_csv_empty_phone_and_email_is_legal_subtask_3_2_1). There is
+	nothing to scrub, so this must NOT go through _flag_unscrubbed — doing so
+	would suppress every email-only row, exactly the rows enrichment exists
+	to rescue."""
+	session = _ScriptedSession(
+		[
+			_ScriptedResult(fetchone_value=("hillsborough_fl",)),
+			_ScriptedResult(fetchone_value=("Jane Doe",)),  # assessor match -> still_owns=True
+			_ScriptedResult(fetchone_value=None),  # non-poach: no match
+			_ScriptedResult(scalar_one_value=56),  # insert
+			# NO _flag_unscrubbed UPDATE queued — if _process_row tries to
+			# execute one, _ScriptedSession.execute() raises IndexError on
+			# the empty list, failing this test loudly.
+		]
+	)
+	counts = {"total_rows": 1, "still_owns_still_renting_count": 0, "still_owns_not_renting_count": 0,
+			  "sold_count": 0, "unknown_count": 0, "suppressed_count": 0}
+	dnc_targets: list = []
+	frbo = StubFrboProvider()
+	frbo.check_active_listing = lambda address: True
+	_process_row(
+		session, "import-1", "acme_pm", _row(phone=None), StagingTableAssessorProvider(session), frbo,
+		datetime.now(timezone.utc), counts, dnc_targets,
+	)
+	assert dnc_targets == []  # nothing to scrub
+	assert counts["still_owns_still_renting_count"] == 1
+	assert counts["suppressed_count"] == 0  # NOT suppressed — email-only is a valid target

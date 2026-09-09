@@ -115,11 +115,20 @@ def arm_winback_import(import_id: str, client_id: str):
 		if not exists:
 			raise HTTPException(status_code=404, detail="Import not found")
 
+		# enrichment_timestamp IS NOT NULL AND requires_enrichment_review = FALSE
+		# (Subtask 3.2.1) — the dispatch gate alone (evaluate_winback_touch_gate)
+		# does NOT satisfy the DoD's "no sequence record created for those
+		# contacts": arm_winback_run INSERTs the agent_work_orders row and posts
+		# the Slack approval card BEFORE any touch gate is evaluated, so a
+		# gate-only implementation would post approval cards for un-enriched
+		# rows and only block them later at dispatch. Also makes eligible_count
+		# below honest rather than counting rows that would be skipped anyway.
 		rows = session.execute(
 			text(
 				"SELECT * FROM winback_rows WHERE import_id = :import_id AND client_id = :client_id "
 				"AND disposition IN ('STILL_OWNS_STILL_RENTING', 'STILL_OWNS_NOT_RENTING') "
-				"AND suppression_state = FALSE AND stopped_at IS NULL"
+				"AND suppression_state = FALSE AND stopped_at IS NULL "
+				"AND enrichment_timestamp IS NOT NULL AND requires_enrichment_review = FALSE"
 			),
 			{"import_id": import_id, "client_id": client_id},
 		).fetchall()

@@ -66,6 +66,7 @@ PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_r
 PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py  # Task 4.2.1 — Speed-to-Lead columns on inbound_messages (additive; after the three inbound_messages migrations, before RLS)
 PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
 PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2 — Three-Touch Win-Back Sequence (winback_touch_dispatches, stop columns, calendar_connections.is_default_owner_booking; after apply_winback_imports.py and apply_calendar_connections.py, before RLS)
+PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 # NOTE: apply_ghost_shopper_columns.py lives on feat/agent-ghost-shopper-sub only — NEVER run on this DB
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
@@ -88,6 +89,7 @@ python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHAL
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches
+python -m src.tasks.enrichment_verification --client-id <id> [--import-id <id>] [--limit 10]  # Subtask 3.2.1 — owner-enrichment (skip-trace) sweep; must run before a Win-Back import can be armed, posts the pre-pilot summary to #blackink-qa
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
@@ -202,7 +204,9 @@ Manager-backed env vars, never baked into the image):
   unset until then — every such reminder job stays `BLOCKED` rather than
   fetching from an unapproved host. See
   `src/services/show_rate_reminders._fetch_ovs_pdf`.
-- `AKRASH_INGEST_JWT_SECRET`, `DNC_VENDOR_API_KEY`, etc. — the existing
+- `AKRASH_INGEST_JWT_SECRET`, `TRACERFY_API_KEY` (renamed from
+  `DNC_VENDOR_API_KEY` — Subtask 3.2.1 made it dual-purpose: DNC scrub and
+  skip-trace owner enrichment, same Tracerfy account), etc. — the existing
   Week 1 settings, only needed if those code paths are actually
   exercised in this test deployment.
 
@@ -645,6 +649,148 @@ Slack workspace over Socket Mode. Note that **Interactivity must be toggled
 on** in the Slack app config even under Socket Mode — Socket Mode only
 replaces the Request URL; it does not enable interactivity, and a card's
 button renders with a warning until it is on.
+
+### Owner Enrichment / Skip-Trace (Week 2 Subtask 3.2.1 — note the number
+collides with Week 1's unrelated "Inbound booking engine" section above;
+these are two different subtasks that happen to share a number across
+sprints)
+
+Client mandate: *"Confirm the enrichment step (owner → phone/email) for
+every signal... If it isn't, it's a blocker for everything in §3"*
+(`blackink-client-comments-04-09-2026.md:77`). Skip-tracing is also written
+into the Win-Back Recipe's own definition (Blueprint v2:659 — *"Runs
+automated skip-tracing and DNC/suppression screening"*), so this is not
+solely a client-comments-derived requirement.
+
+`src/services/owner_enrichment.py` is the one place enrichment logic lives:
+an `OwnerEnrichmentProvider` ABC (mirroring `compliance_gate.py`'s
+`DncProvider`/`EmailVerificationProvider` pattern) split into `submit()`/
+`collect()` rather than one call — **forced by the chosen vendor, not a
+style choice**. Skip-trace and DNC are both Tracerfy, same account
+(`TRACERFY_API_KEY`, renamed from `DNC_VENDOR_API_KEY` since it is now
+dual-purpose — no fallback to the old name; this is the only deployment of
+this codebase, so there is nothing else the rename could break), and
+Tracerfy's API is submit-then-poll (up to 10 minutes — see
+`src/services/tracerfy_client.py`).
+The submit/collect split is what lets the caller
+(`src/tasks/enrichment_verification.py`) commit each chunk's
+`enrichment_attempts` bump *between* the two calls: a submit-stage failure
+(bad key, rate limit) means nothing was queued or billed, so it costs zero
+retry budget; a collect-stage (poll) failure happens after the vendor may
+already be processing, so the bump must already be committed to survive a
+crash without risking a silent re-charge on the next sweep.
+`StubOwnerEnrichmentProvider` is the no-key fallback — it passes a row's
+CSV-supplied `phone`/`email` through unchanged, so a row that already has
+one keeps exactly the sequenceability it has today (the Win-Back gate below
+cannot regress the moment it lands).
+
+**Claim lease (`enrichment_claimed_at`, `_CLAIM_LEASE_MINUTES=15`) —
+another PR-review finding, confirmed real by tracing the code.** The
+`FOR UPDATE SKIP LOCKED` row lock from the claim query is released the
+moment `run_sweep()` commits the `enrichment_attempts` bump — well before
+`enrichment_timestamp` is ever set (that happens only after
+`provider.collect()` returns, up to ~10 minutes later for a real poll), so
+without a durable lease a second, concurrent sweep could re-claim and
+re-submit the same rows. The lease is stamped and committed immediately
+after claiming, in the same transaction that still holds the row lock, so
+there is no gap. A lease that genuinely expires (a crash mid-poll, not
+ordinary concurrent execution) makes the row re-claimable again — freshly
+**re-submitted**, not resumed from its stored `enrichment_queue_id` (kept
+only for operational visibility, checking Tracerfy's own dashboard for a
+stuck batch) — a deliberate scope decision matching
+`self_serve_audit_worker.py`'s own lease pattern, which accepts the same
+bounded-duplicate-on-crash tradeoff rather than building full
+resume-an-abandoned-poll machinery.
+
+**`TracerfyEnrichmentProvider` is fully implemented** (2026-09-08),
+cross-checked against Tracerfy's own API docs and the working, production
+ForcedAction-System reference integration (same vendor, same account
+type — `ForcedAction-System/Forced-action-/src/services/tracerfy_batch.py`).
+Skip-trace is a *different* Tracerfy product from the DNC scrub with its
+own contract: `POST /v1/api/trace/` as **multipart/form-data** (not JSON),
+a `queue_id` response key, and `GET /v1/api/queue/{id}` returning the
+result array **directly** (not DNC's `{"pending","download_url"}`
+wrapper) — completion is a stability window (row count steady across
+several polls, plus a minimum settle time), since Tracerfy streams results
+in; see `tracerfy_client.py`'s `poll_skiptrace_queue()`. Two gaps Tracerfy's
+API creates, both handled in `owner_enrichment.py`, not the transport layer:
+no submitted-row ID is echoed back in the result (matching is by normalized
+street address, reusing `winback_ingest.normalize_address()`), and `city`
+is a required separate request field while `winback_rows` only stores one
+freeform address string (`_split_address()` parses the confirmed
+`"STREET, CITY, ST[ ZIP]"` convention only — an address that doesn't match
+is excluded from that sweep's submission rather than guessed, and simply
+retried next sweep; upgrade path if real CSVs need more formats is the
+`usaddress`-based parser already proven in the ForcedAction-System sibling
+repo). `_split_owner_name()` is a deliberately simple first-token/rest split
+— Win-Back's `owner_name` is a client CSV column for an individual owner,
+not a corporate registry needing ForcedAction's own entity-detection
+machinery.
+
+`winback_rows` carries the enrichment state (`email_status`,
+`email_previous`, `phone_verified`, `requires_enrichment_review`,
+`enrichment_provider`, `enrichment_timestamp`, `enrichment_attempts` —
+`migrations/apply_winback_enrichment.py`; no `TENANT_POLICIES` entry
+needed, RLS is column-agnostic on an already-registered table).
+`requires_enrichment_review = (no usable email) AND (no verified phone)` —
+deliberately **not** `email_status != 'VERIFIED'`, which would recreate the
+exact trap `contacts.email_status` is already in (nothing in this repo
+ever writes `VERIFIED` except by hand in `scripts/e2e_approval_gate.py`, so
+`compliance_gate._check_deterministic_columns` hard-`FAIL`s on every cold
+contact today — a pre-existing gap this subtask deliberately does not
+import into Win-Back, though it is the same missing enrichment step and
+should be raised as a follow-up against Week 1's compliance gate).
+
+`src/tasks/enrichment_verification.py` sweeps
+self-heal → claim → enrich → scrub → log → post, `--client-id` never
+defaulted (an unscoped sweep would silently no-op under RLS otherwise —
+same posture as `work_orders`' own CLI). Self-heal runs first: a row whose
+`enrichment_attempts` hits `OWNER_ENRICHMENT_MAX_ATTEMPTS` without ever
+getting an answer is terminally marked
+(`enrichment_timestamp`/`requires_enrichment_review=TRUE`) — without this,
+`requires_enrichment_review`'s `NOT NULL DEFAULT FALSE` makes a
+never-enriched row indistinguishable from a happily-enriched one, exactly
+the trap `_flag_unscrubbed()`'s own docstring already warns about one
+column over. Newly-discovered phones are DNC-scrubbed through
+`winback_ingest.dnc_scrub_rows()` (a public wrapper around the existing
+`_run_dnc_scrub`), preserving Subtask 3.1.1's "DNC scrub before any
+sequence can arm" ordering for numbers that didn't exist at import time.
+Posts the pre-pilot summary to `#blackink-qa` (its first *periodic*
+producer — the channel already carries three fire-and-forget error alerts)
+and exits non-zero if that post didn't land, so a missing
+`BLACKINK_QA_SLACK_CHANNEL`/bot-not-in-channel can never be mistaken for a
+passing gate.
+
+`src/services/winback_sequencer.py`'s `evaluate_winback_touch_gate` gates
+on `enrichment_timestamp IS NOT NULL` **before** checking
+`requires_enrichment_review` — the same "must have run, not merely have
+failed to object" reasoning as self-heal above. The `/arm` endpoint's SQL
+(`src/api/winback_router.py`) carries the identical predicate, because
+`arm_winback_run` inserts the `agent_work_orders` row and posts the Slack
+approval card *before* any touch gate runs — a gate-only implementation
+would still post an approval card for an un-enriched row.
+
+**Subtask 3.1.1's ingest was also fixed here**: `winback_ingest.py`'s
+`_REQUIRED_CSV_COLUMNS` no longer includes `phone`/`email` — that
+five-column "minimum required" list traced only to the derived
+`Week2_Tasks_Dev_Split_v1.md:236`, never to the client, and requiring phone
+meant a client export with no phone column produced zero sequenceable
+rows, defeating this subtask's own purpose. An owner with `phone=None` is
+not DNC-scrubbed (nothing to scrub, not suppressed) — distinct from a
+phone value present but ungradeable (`"n/a"`), which stays fail-closed
+exactly as before.
+
+Enrichment does **not** cover Speed-to-Lead's inbound leads
+(`src/services/inbound_lead_orchestrator.py`, Task 4.2.1) — those are
+inbound-initiated (a webhook/email the owner sent *to us*), so by
+construction almost every row already carries a real contact method.
+`owner_enrichment.EnrichmentInput`/`apply_result` are the contract whoever
+picks up that rare no-contact case would call, with
+`signal_source="SPEED_TO_LEAD"`. Same for the deed engine's homestead-drop
+and same-owner-match signals (client comments:28-29, deferred this sprint
+per `Week2_Tasks_Dev_Split_v1.md:11`) —
+`owner_enrichment.enrich_homestead_drop_signals()` is a documented no-op
+hook, called from the sweep so it is on the real code path, not orphaned.
 
 ### Appointment operations & the billing gate (Subtask 1.1.1)
 
