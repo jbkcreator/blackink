@@ -28,6 +28,7 @@ from src.agents.ink.nodes import (
     make_node_ghost_shopper,
     node_assets_merge,
     node_cora_dispatch,
+    node_fee_stack,
     node_gif_generator,
     node_pdf_generator,
     node_relay_dispatch,
@@ -62,6 +63,7 @@ def build_graph(
     builder.add_node("ghost_shopper",  make_node_ghost_shopper(ghost_shopper_graph))
     builder.add_node("wait_reply",     node_wait_reply)
     builder.add_node("pdf_generator",  node_pdf_generator)
+    builder.add_node("fee_stack",      node_fee_stack)
     builder.add_node("sendspark",      node_sendspark)
     builder.add_node("gif_generator",  node_gif_generator)
     builder.add_node("assets_merge",   node_assets_merge)
@@ -80,7 +82,8 @@ def build_graph(
 
     # Sequential asset pipeline
     builder.add_edge("wait_reply",     "pdf_generator")
-    builder.add_edge("pdf_generator",  "sendspark")
+    builder.add_edge("pdf_generator",  "fee_stack")
+    builder.add_edge("fee_stack",      "sendspark")
     builder.add_edge("sendspark",      "gif_generator")
     builder.add_edge("gif_generator",  "assets_merge")
 

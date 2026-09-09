@@ -211,7 +211,80 @@ def node_pdf_generator(state: GlobalState) -> dict:
     return {"pdf_url": pdf_url}
 
 
-# ── 4. Sendspark ─────────────────────────────────────────────────────────────
+# ── 4. Fee-Stack One-Pager ───────────────────────────────────────────────────
+
+def node_fee_stack(state: GlobalState) -> dict:
+    """Generate the ADD-8-Lite Fee-Stack one-pager PDF and store it.
+
+    Uses the same shared fpdf2 renderer (fee_stack_report.py) — no independent
+    renderer. Always returns fee_stack_url — None on failure so assets_merge
+    is never blocked.
+    """
+    import datetime
+
+    from sqlalchemy import text
+
+    from src.agents.ink.subagents.fee_stack.fee_stack_report import (
+        FeeStackData,
+        compile_fee_stack_pdf,
+    )
+    from src.agents.ink.subagents.pdf_generator.storage import get_pdf_store
+    from src.core.database import get_db_context
+    from src.services.events import log_event
+
+    try:
+        with get_db_context(client_id=state["client_id"]) as db:
+            row = db.execute(
+                text("""
+                    SELECT c.company_name, co.county_name, c.door_count_est
+                    FROM   companies c
+                    JOIN   counties  co ON co.county_slug = c.county_slug
+                    WHERE  c.company_id = :cid
+                """),
+                {"cid": state["company_id"]},
+            ).fetchone()
+
+        company_name = row.company_name  if row else state["company_id"]
+        county_name  = row.county_name   if row else "Unknown County"
+        door_count   = int(row.door_count_est or 50) if row else 50
+        audit_date   = datetime.date.today().strftime("%B %Y")
+
+        data = FeeStackData(
+            company_name=company_name,
+            county_name=county_name,
+            door_count=door_count,
+            audit_date=audit_date,
+            latency_sec=state.get("latency_sec"),
+        )
+
+        pdf_bytes = compile_fee_stack_pdf(data)
+
+        store         = get_pdf_store()
+        fee_key       = f"{state['company_id']}/{state['work_order_id']}/fee_stack.pdf"
+        fee_stack_url = store.put(fee_key, pdf_bytes)
+
+        logger.info(
+            "ink.nodes: fee_stack complete — company_id=%s size=%d url=%s",
+            state["company_id"], len(pdf_bytes), fee_stack_url,
+        )
+        return {"fee_stack_url": fee_stack_url}
+
+    except Exception as exc:
+        logger.error(
+            "ink.nodes: fee_stack failed company_id=%s: %s — continuing without fee-stack PDF",
+            state["company_id"], exc,
+        )
+        log_event(
+            client_id=state["client_id"],
+            event_type="fee_stack_generation_failed",
+            entity_type="work_order",
+            entity_id=state["work_order_id"],
+            payload={"company_id": state["company_id"], "error": str(exc)},
+        )
+        return {"fee_stack_url": None}
+
+
+# ── 5. Sendspark ─────────────────────────────────────────────────────────────
 
 def node_sendspark(state: GlobalState) -> dict:
     """Call Sendspark API to render a personalised video landing page.
@@ -340,6 +413,14 @@ def node_gif_generator(state: GlobalState) -> dict:
             "ink.nodes: gif compose failed company_id=%s: %s — skipping gif",
             state["company_id"], exc,
         )
+        from src.services.events import log_event
+        log_event(
+            client_id=state["client_id"],
+            event_type="gif_generation_failed",
+            entity_type="work_order",
+            entity_id=state["work_order_id"],
+            payload={"company_id": state["company_id"], "error": str(exc)},
+        )
         return {"gif_url": None}
 
     store   = get_pdf_store()
@@ -370,9 +451,10 @@ def node_assets_merge(state: GlobalState) -> dict:
             missing, state["company_id"],
         )
     logger.info(
-        "ink.nodes: assets_merge complete — company_id=%s pdf=%s video=%s gif=%s",
+        "ink.nodes: assets_merge complete — company_id=%s pdf=%s fee_stack=%s video=%s gif=%s",
         state["company_id"],
         bool(state.get("pdf_url")),
+        bool(state.get("fee_stack_url")),
         bool(state.get("video_id")),
         bool(state.get("gif_url")),
     )
@@ -397,6 +479,7 @@ def node_cora_dispatch(state: GlobalState) -> dict:
         "latency_sec":   state.get("latency_sec"),
         "loss_est":      state.get("loss_est"),
         "pdf_url":       state.get("pdf_url"),
+        "fee_stack_url": state.get("fee_stack_url"),
         "video_id":      state.get("video_id"),
         "landing_url":   state.get("landing_url"),
         "gif_url":       state.get("gif_url"),
@@ -465,6 +548,7 @@ def node_relay_dispatch(state: GlobalState) -> dict:
         client_id=state["client_id"],
         draft_message_id=state.get("draft_message_id") or "",
         pdf_url=state.get("pdf_url"),
+        fee_stack_url=state.get("fee_stack_url"),
         video_id=state.get("video_id"),
         landing_url=state.get("landing_url"),
         gif_url=state.get("gif_url"),

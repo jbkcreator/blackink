@@ -346,15 +346,23 @@ def _dispatch_via_smtp(
     gif_bytes = _read_file_url(msg.gif_url) if msg.gif_url else None
     if gif_bytes:
         b64 = base64.b64encode(gif_bytes).decode()
-        gif_block = f'<p><img src="data:image/gif;base64,{b64}" width="600" style="max-width:100%;display:block;" alt="Audit snapshot"/></p>'
+        img_tag = f'<img src="data:image/gif;base64,{b64}" width="600" style="max-width:100%;display:block;" alt="Audit snapshot"/>'
+        # Wrap in link if a landing URL exists (opens video/landing page on click)
+        if msg.landing_url:
+            gif_block = f'<p><a href="{msg.landing_url}" target="_blank">{img_tag}</a></p>'
+        else:
+            gif_block = f"<p>{img_tag}</p>"
         logger.info("relay.worker: GIF embedded (%d bytes) work_order_id=%s", len(gif_bytes), msg.work_order_id)
 
     body_html = gif_block + body_text
 
-    # Read PDF for attachment if available
-    pdf_bytes = _read_file_url(msg.pdf_url) if msg.pdf_url else None
+    # Build PDF attachment list — audit PDF + fee-stack one-pager
+    pdf_bytes       = _read_file_url(msg.pdf_url)       if msg.pdf_url       else None
+    fee_stack_bytes = _read_file_url(msg.fee_stack_url) if msg.fee_stack_url else None
     if pdf_bytes:
-        logger.info("relay.worker: PDF attached (%d bytes) work_order_id=%s", len(pdf_bytes), msg.work_order_id)
+        logger.info("relay.worker: audit PDF attached (%d bytes) work_order_id=%s", len(pdf_bytes), msg.work_order_id)
+    if fee_stack_bytes:
+        logger.info("relay.worker: fee-stack PDF attached (%d bytes) work_order_id=%s", len(fee_stack_bytes), msg.work_order_id)
 
     try:
         with get_db_context(client_id=msg.client_id) as db:
@@ -379,16 +387,20 @@ def _dispatch_via_smtp(
             from_address=mailbox.mailbox_address,
         )
 
+        attachments = []
         if pdf_bytes:
-            provider.send_with_attachment(
+            attachments.append((pdf_bytes, "audit-report.pdf", "pdf"))
+        if fee_stack_bytes:
+            attachments.append((fee_stack_bytes, "fee-stack-opportunity.pdf", "pdf"))
+
+        if attachments:
+            provider.send_with_attachments(
                 to=contact_email,
                 reply_to=mailbox.mailbox_address,
                 bcc=mailbox.mailbox_address,
                 subject=subject,
                 html_body=body_html,
-                attachment_bytes=pdf_bytes,
-                attachment_filename="audit-report.pdf",
-                attachment_subtype="pdf",
+                attachments=attachments,
             )
         else:
             provider.send_plain(
@@ -400,9 +412,10 @@ def _dispatch_via_smtp(
             )
 
         logger.info(
-            "relay.worker: SMTP Touch 1 sent work_order_id=%s mailbox=%s to=%s gif=%s pdf=%s",
+            "relay.worker: SMTP Touch 1 sent work_order_id=%s mailbox=%s to=%s "
+            "gif=%s pdf=%s fee_stack=%s",
             msg.work_order_id, mailbox.mailbox_address, contact_email,
-            bool(gif_bytes), bool(pdf_bytes),
+            bool(gif_bytes), bool(pdf_bytes), bool(fee_stack_bytes),
         )
     except NoMailboxAvailable as exc:
         raise RuntimeError(f"No warmed mailbox available: {exc}") from exc

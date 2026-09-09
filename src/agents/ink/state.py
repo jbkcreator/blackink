@@ -23,6 +23,7 @@ class InkStage(str, Enum):
     WAIT_REPLY      = "wait_reply"       # suspend: waiting for IMAP reply
     PDF_GENERATOR   = "pdf_generator"
     SENDSPARK       = "sendspark"
+    FEE_STACK       = "fee_stack"
     GIF_GENERATOR   = "gif_generator"
     ASSETS_MERGE    = "assets_merge"
     CORA_DISPATCH   = "cora_dispatch"
@@ -51,10 +52,11 @@ class GlobalState(TypedDict):
     loss_est:       Optional[int]           # dollars, from revenue loss formula
 
     # ── Proof asset outputs ───────────────────────────────────────────────────
-    pdf_url:        Optional[str]
-    video_id:       Optional[str]
-    landing_url:    Optional[str]           # Sendspark personalised landing URL
-    gif_url:        Optional[str]
+    pdf_url:          Optional[str]
+    fee_stack_url:    Optional[str]         # Fee-Stack one-pager PDF
+    video_id:         Optional[str]
+    landing_url:      Optional[str]         # Sendspark personalised landing URL
+    gif_url:          Optional[str]
 
     # ── Cora output ───────────────────────────────────────────────────────────
     draft_message_id: Optional[str]         # cora:drafts message_id

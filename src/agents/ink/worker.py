@@ -111,6 +111,7 @@ def _initial_state(msg) -> GlobalState:
         latency_sec=None,
         loss_est=None,
         pdf_url=None,
+        fee_stack_url=None,
         video_id=None,
         landing_url=None,
         gif_url=None,

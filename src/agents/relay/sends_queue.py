@@ -32,6 +32,7 @@ class SendMessage:
     client_id:        str
     draft_message_id: str
     pdf_url:          Optional[str]
+    fee_stack_url:    Optional[str]
     video_id:         Optional[str]
     landing_url:      Optional[str]
     gif_url:          Optional[str]
@@ -56,6 +57,7 @@ def publish(
     client_id:        str,
     draft_message_id: str,
     pdf_url:          Optional[str] = None,
+    fee_stack_url:    Optional[str] = None,
     video_id:         Optional[str] = None,
     landing_url:      Optional[str] = None,
     gif_url:          Optional[str] = None,
@@ -71,6 +73,7 @@ def publish(
         "client_id":        client_id,
         "draft_message_id": draft_message_id,
         "pdf_url":          pdf_url or "",
+        "fee_stack_url":    fee_stack_url or "",
         "video_id":         video_id or "",
         "landing_url":      landing_url or "",
         "gif_url":          gif_url or "",
@@ -103,6 +106,7 @@ def _parse(message_id: str, fields: dict, delivery_count: int = 1) -> SendMessag
         client_id=fields.get("client_id", ""),
         draft_message_id=fields.get("draft_message_id", ""),
         pdf_url=fields.get("pdf_url") or None,
+        fee_stack_url=fields.get("fee_stack_url") or None,
         video_id=fields.get("video_id") or None,
         landing_url=fields.get("landing_url") or None,
         gif_url=fields.get("gif_url") or None,
