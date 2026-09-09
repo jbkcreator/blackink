@@ -102,9 +102,6 @@ class EmailParts:
     subject: str
     body_plain: str
     body_html: Optional[str] = None
-    # Email already teased out of the raw From header by the router, if any —
-    # used as a fallback contact when the body carries no explicit email.
-    fallback_email: Optional[str] = None
 
     def text_body(self) -> str:
         """Body the parsers read: the text/plain part when present, else the
@@ -324,20 +321,13 @@ def classify_and_parse(parts: EmailParts) -> ParsedLead:
     for config in PORTAL_REGISTRY:
         try:
             if config.matches(parts):
-                result = config.parser(parts)
-                # Defensive: if a parser handed back an email of None but the
-                # router already derived one from the From header, keep it —
-                # but ONLY for a usable (non-review) lead. For portal
-                # notifications the From address is the PORTAL, not the owner;
-                # backfilling it onto a review-required row would make the
-                # portal look like the prospect and (pre-fix) get auto-replied.
-                if (
-                    result.email is None
-                    and parts.fallback_email
-                    and not result.requires_human_review
-                ):
-                    result.email = parts.fallback_email
-                return result
+                # Never backfill the From-header email: for a portal
+                # notification the sender IS the portal, not the owner, so the
+                # only trustworthy owner address is one the parser pulled from
+                # the body. A matched parser with no body email leaves email
+                # unset (its own requires_human_review reflects whether the lead
+                # is still usable via name+phone).
+                return config.parser(parts)
         except Exception:  # noqa: BLE001 — resilience is the whole point here
             logger.exception(
                 "[portal_parsers] parser %s raised — falling through to UNCLASSIFIED",

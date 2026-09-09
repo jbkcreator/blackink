@@ -99,10 +99,6 @@ async def mailgun_inbound(request: Request) -> dict:
     body_html = form.get("body-html", "") or None
     mg_message_id = form.get("Message-Id", "") or form.get("message-id", "")
 
-    # Derive email from sender field (e.g. "Name <email@domain.com>")
-    email_match = re.search(r"<([^>]+)>", sender) or re.search(r"[\w.+-]+@[\w.-]+", sender)
-    email = email_match.group(1 if "<" in sender else 0) if email_match else None
-
     # idempotency_key is globally UNIQUE — namespace with client_id. Prefer the
     # Mailgun Message-Id; fall back to a content hash if absent.
     stable = mg_message_id.strip("<>") if mg_message_id else hashlib.sha256(
@@ -116,7 +112,6 @@ async def mailgun_inbound(request: Request) -> dict:
         subject=subject,
         body_plain=body_plain,
         body_html=body_html,
-        fallback_email=email,
     ))
 
     lead = InboundLead(
@@ -126,11 +121,13 @@ async def mailgun_inbound(request: Request) -> dict:
         idempotency_key=idempotency_key,
         destination_address=recipient,
         prospect_name=parsed.prospect_name,
-        # For a review-required row, never fall back to the From-header email:
-        # on a portal notification that is the portal's own address, and using
-        # it would make the STL sweep auto-reply to the portal. Human review
-        # supplies the real owner email instead.
-        email=parsed.email if parsed.requires_human_review else (parsed.email or email),
+        # Never fall back to the From-header email for a portal notification:
+        # the sender IS the portal's own address, so backfilling it would make
+        # the STL sweep auto-reply to the portal instead of the owner. Only a
+        # body-extracted email (parsed.email) is a real owner address; if none
+        # was found, leave it unset (a name+phone lead still posts a closer
+        # card, and the sweep skips the email send rather than misdirecting it).
+        email=parsed.email,
         phone=parsed.phone,
         property_address=parsed.property_address,
         inquiry_text=(parsed.inquiry_text or body_plain)[:2000],

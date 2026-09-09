@@ -15,13 +15,12 @@ from src.services.portal_parsers import (
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _parts(sender="", subject="", body="", html=None, fallback_email=None) -> EmailParts:
+def _parts(sender="", subject="", body="", html=None) -> EmailParts:
     return EmailParts(
         sender=sender,
         subject=subject,
         body_plain=body,
         body_html=html,
-        fallback_email=fallback_email,
     )
 
 
@@ -161,7 +160,6 @@ class TestClassifyAndParse:
         result = classify_and_parse(_parts(
             sender="other@portal.io",
             body="lead body",
-            fallback_email="notifications@portal.io",
         ))
         assert result.source_channel == UNCLASSIFIED
         assert result.requires_human_review is True
@@ -202,15 +200,21 @@ class TestClassifyAndParse:
         ))
         assert result.source_channel == "APM"
 
-    def test_fallback_email_used_when_parser_returns_none_email(self):
-        # APM body with no email in body — fallback_email should be kept.
+    def test_phone_only_lead_never_adopts_portal_from_header(self):
+        """PR finding: a name+phone APM lead with no body email is 'usable'
+        (not review-required), but its email must stay None — never the portal's
+        own From-header address, which would make the STL sweep auto-reply to
+        the portal instead of the owner."""
         body = "Owner Name: Sam\nPhone: 555-321-9876\nMessage: hi"
         result = classify_and_parse(_parts(
             sender="leads@allpropertymanagement.com",
             body=body,
-            fallback_email="from_header@example.com",
         ))
-        assert result.email == "from_header@example.com"
+        assert result.source_channel == "APM"
+        assert result.prospect_name == "Sam"
+        assert result.phone is not None and "555" in result.phone
+        assert result.requires_human_review is False  # name + phone = usable
+        assert result.email is None                    # but no portal backfill
 
 
 # ── PR finding: HTML-only notifications + no portal-sender email fallback ─────
@@ -249,7 +253,6 @@ class TestHtmlOnlyAndEmailFallback:
             sender="notifications@someportal.com",
             subject="You have a new lead",
             body="opaque body with no labels",
-            fallback_email="notifications@someportal.com",
         ))
         assert result.source_channel == UNCLASSIFIED
         assert result.requires_human_review is True
@@ -262,7 +265,6 @@ class TestHtmlOnlyAndEmailFallback:
             sender="leads@allpropertymanagement.com",
             subject="New lead",
             body="(nothing parseable here)",
-            fallback_email="leads@allpropertymanagement.com",
         ))
         assert result.source_channel == "APM"
         assert result.requires_human_review is True
