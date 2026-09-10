@@ -35,22 +35,22 @@ def _clean(text_body: str) -> str:
 def _score_entry(cleaned_body: str, patterns: list[str]) -> float:
     """Return the best score across all patterns, normalised 0–1.
 
-    Multi-word patterns use partial_ratio: slides the pattern over same-length
-    windows of the body, correctly matching a phrase embedded in a longer message.
+    Uses partial_ratio: slides the shorter string over all same-length windows
+    of the longer string and returns the best alignment score. This correctly
+    handles a trigger phrase (e.g. "how does this work") embedded inside a
+    longer owner message ("hi I wanted to ask how does this work exactly?")
+    without the false-positive inflation that token_set_ratio produces for
+    short patterns sharing common stopwords with unrelated messages.
 
-    Single-word patterns use full-string ratio instead — a bare word like "cost"
-    appears incidentally in too many unrelated messages to be trusted as a
-    substring match. Callers should prefer multi-word patterns in the seed;
-    this guard is the structural backstop that prevents accidental false positives
-    if a single-word pattern is ever introduced.
+    Pattern quality is enforced in the seed — generic English fragments (e.g.
+    bare "what happens if") must not be seeded, not filtered here, because the
+    same filter would also block intentionally specific short patterns like
+    "refund" or "pricing" that correctly match at 100% as substrings.
     """
     best = 0.0
     for pattern in patterns:
         cleaned_pattern = _clean(pattern)
-        if len(cleaned_pattern.split()) < 2:
-            score = fuzz.ratio(cleaned_body, cleaned_pattern)
-        else:
-            score = fuzz.partial_ratio(cleaned_body, cleaned_pattern)
+        score = fuzz.partial_ratio(cleaned_body, cleaned_pattern)
         if score > best:
             best = score
     return best / 100.0
