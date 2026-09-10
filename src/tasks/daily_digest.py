@@ -40,10 +40,13 @@ _WINDOW = timedelta(hours=24)
 #
 # Every event_type below is WRITTEN by a different Week 1 task's code, not
 # by this one:
-#   owner_score_generated     — Owner Visibility Score Engine (replaces the
-#       Ghost-Shopper Audit Factory); fields: score_total, county,
-#       data_coverage_pct, county_rank (see src/services/events.py's
-#       REQUIRED_PAYLOAD_FIELDS)
+#   owner_visibility_score_calculated — Owner Visibility Score Engine
+#       (replaces the Ghost-Shopper Audit Factory); fields: score_total,
+#       county_slug, data_coverage_pct, county_rank (see
+#       src/services/events.py's REQUIRED_PAYLOAD_FIELDS). Group D / D-4:
+#       this used to read "owner_score_generated" filtering on a "county"
+#       payload key — a name AND a field the sweep never wrote, so
+#       scores_generated / county_rank_reports_delivered read 0 permanently.
 #   outbound_touch_dispatched — Outbound Sequencer & Booking Engine, Subtask 3.1.1
 #   meeting_booked            — Outbound Sequencer & Booking Engine, Subtask 3.2.1
 #
@@ -56,7 +59,7 @@ _WINDOW = timedelta(hours=24)
 #       this name to whoever builds inbound reply handling.
 #
 # county_rank_reports_delivered needs NO new event: county_rank is already
-# one of owner_score_generated's required fields (the "County Rank
+# one of owner_visibility_score_calculated's required fields (the "County Rank
 # Calculator" computes it as part of scoring, not as a separate delivery
 # step — v2 blueprint lines 209, 367, 398). Defined here as the number of
 # DISTINCT counties scored in the window. If "delivered" is later confirmed
@@ -76,15 +79,18 @@ _WINDOW = timedelta(hours=24)
 # in apply_sandbox_dashboard_view.py's WHERE clause.
 _METRICS_SQL = """
     SELECT
-        COUNT(*) FILTER (WHERE event_type = 'owner_score_generated') AS scores_generated,
-        COUNT(DISTINCT payload->>'county') FILTER (WHERE event_type = 'owner_score_generated') AS county_rank_reports_delivered,
+        COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
+        COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
         COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        (COUNT(*) FILTER (WHERE event_type = 'email_opened')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS open_rate_pct,
-        (COUNT(*) FILTER (WHERE event_type = 'email_clicked')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS click_rate_pct,
-        (COUNT(*) FILTER (WHERE event_type = 'email_replied')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS reply_rate_pct,
+        -- Group D / D-4: email_opened/email_clicked/email_replied have no
+        -- producer anywhere in this codebase (S-8, open/click/reply
+        -- tracking, is not built). A real division here would compute a
+        -- mathematically correct but misleading 0% — "confirmed zero
+        -- engagement" rather than "not tracked". NULL renders as "n/a" via
+        -- fmt() below. Replace with the real division once S-8 lands.
+        NULL::numeric AS open_rate_pct,
+        NULL::numeric AS click_rate_pct,
+        NULL::numeric AS reply_rate_pct,
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window

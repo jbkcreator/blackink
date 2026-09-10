@@ -328,3 +328,83 @@ class TestPartnerRouting:
             )
         # NURTURE produces no Slack call at all
         assert mock_run.call_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Group D / D-10 — classifier fallback (meta={"path": "fallback"}) must never
+# be silently indistinguishable from a genuine NURTURE classification: it
+# must set requires_human_review, alert a human, and must NOT halt the
+# sequence (the true intent is unknown — halting on every transient LLM
+# error would stall live campaigns for no reason).
+# ---------------------------------------------------------------------------
+
+def _fallback_result() -> ClassificationResult:
+    return ClassificationResult(
+        intent=Intent.NURTURE,
+        confidence=0.0,
+        reasoning="Classifier error — conservative fallback pending manual review.",
+        meta={"path": "fallback"},
+    )
+
+
+class TestClassifierFallback:
+    def test_fallback_sets_requires_human_review(self):
+        db = _mock_db()
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None):
+            _route(
+                db=db, db_id=60, client_id="CL1",
+                sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc),
+                result=_fallback_result(),
+            )
+        write_call = next(
+            c for c in db.execute.call_args_list
+            if "requires_human_review" in _sql_text_of_call(c)
+        )
+        assert write_call[0][1]["human_review"] is True
+
+    def test_fallback_fires_a_slack_alert(self):
+        """Without this alert the row is permanently invisible: NURTURE gets
+        no context card (not in CONTEXT_CARD_INTENTS) and the SLA sweep can
+        only escalate a row that already has a card (card_ts IS NOT NULL)."""
+        db = _mock_db()
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None) as mock_run:
+            _route(
+                db=db, db_id=61, client_id="CL1",
+                sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc),
+                result=_fallback_result(),
+            )
+        assert mock_run.called, "Expected asyncio.run to be called for a fallback result"
+
+    def test_fallback_does_not_halt_sequence(self):
+        """The true intent is unknown on a classifier error — halting on
+        every transient LLM failure would stall live campaigns for no
+        reason. A human reviewer halts it if the reply actually warrants it."""
+        db = _mock_db()
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None):
+            _route(
+                db=db, db_id=62, client_id="CL1",
+                sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc),
+                result=_fallback_result(),
+            )
+        halt_calls = [c for c in db.execute.call_args_list if "HALTED" in _sql_text_of_call(c)]
+        assert halt_calls == []
+
+    def test_genuine_nurture_does_not_set_requires_human_review(self):
+        """Control: a real LLM-classified NURTURE (meta={"path": "llm"}) must
+        NOT be flagged for human review — only the fallback path is."""
+        db = _mock_db()
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None):
+            _route(
+                db=db, db_id=63, client_id="CL1",
+                sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc),
+                result=_result(Intent.NURTURE),
+            )
+        write_call = next(
+            c for c in db.execute.call_args_list
+            if "requires_human_review" in _sql_text_of_call(c)
+        )
+        assert write_call[0][1]["human_review"] is False

@@ -1,4 +1,3 @@
-import re
 from decimal import Decimal
 from unittest.mock import AsyncMock, patch
 
@@ -74,39 +73,39 @@ def test_metrics_sql_excludes_the_demo_sandbox_client():
     assert "client_id != 'DEMO_FRIDAY_SANDBOX'" in _METRICS_SQL or "client_id <> 'DEMO_FRIDAY_SANDBOX'" in _METRICS_SQL
 
 
-def test_metrics_sql_uses_owner_score_generated_not_ghost_shopper():
-    """v2 spec correction: the digest must read from owner_score_generated,
-    never from the permanently-deferred ghost-shopper events."""
-    assert "owner_score_generated" in _METRICS_SQL
+def test_metrics_sql_uses_owner_visibility_score_calculated_not_ghost_shopper():
+    """Group D / D-4: the digest must read from owner_visibility_score_calculated
+    — the event owner_visibility_sweep.py actually writes — never the
+    never-written owner_score_generated name it used to filter on, and never
+    the permanently-deferred ghost-shopper events."""
+    assert "owner_visibility_score_calculated" in _METRICS_SQL
+    assert "owner_score_generated" not in _METRICS_SQL
     assert "ghost_shopper" not in _METRICS_SQL
     assert "audit_pdf_generated" not in _METRICS_SQL
     assert "audit_reply_received" not in _METRICS_SQL
     assert "sendspark_engagement" not in _METRICS_SQL
 
 
-def test_metrics_sql_filters_open_and_click_rate_denominators_to_email_only():
-    """PR review fix, still required under v2: open_rate_pct/click_rate_pct
-    must divide only by email-channel outbound_touch_dispatched events, not
-    every channel. Regression guard on the SQL text — every other test in
-    this file mocks _query_metrics() and cannot see a bug inside
-    _METRICS_SQL. A live-Postgres test is the stronger check."""
-    open_rate_clause = re.search(r"AS open_rate_pct", _METRICS_SQL)
-    click_rate_clause = re.search(r"AS click_rate_pct", _METRICS_SQL)
-    assert open_rate_clause and click_rate_clause
-
-    open_rate_denominator = _METRICS_SQL[:open_rate_clause.start()].rsplit("NULLIF(", 1)[-1]
-    click_rate_denominator = _METRICS_SQL[:click_rate_clause.start()].rsplit("NULLIF(", 1)[-1]
-    for denominator in (open_rate_denominator, click_rate_denominator):
-        assert "outbound_touch_dispatched" in denominator
-        assert "payload->>'channel' = 'email'" in denominator
+def test_metrics_sql_county_rank_reports_uses_county_slug_not_county():
+    """Group D / D-4: the payload key owner_visibility_sweep.py actually
+    writes is county_slug, not county — the DISTINCT-county count must match
+    the real payload shape or it silently counts zero distinct values."""
+    assert "county_slug" in _METRICS_SQL
+    assert "payload->>'county'" not in _METRICS_SQL.replace("payload->>'county_slug'", "")
 
 
-def test_metrics_sql_reply_rate_denominator_is_also_email_only():
-    """reply_rate_pct is a new v2 metric — its denominator must follow the
-    same email-only convention as open/click rate, for the same reason
-    (SMS/call touches can never produce an email reply)."""
-    reply_rate_clause = re.search(r"AS reply_rate_pct", _METRICS_SQL)
-    assert reply_rate_clause
-    reply_rate_denominator = _METRICS_SQL[:reply_rate_clause.start()].rsplit("NULLIF(", 1)[-1]
-    assert "outbound_touch_dispatched" in reply_rate_denominator
-    assert "payload->>'channel' = 'email'" in reply_rate_denominator
+def test_metrics_sql_open_click_reply_rate_are_null_not_a_fabricated_zero():
+    """Group D / D-4: email_opened/email_clicked/email_replied have no
+    producer anywhere in this codebase (S-8 is not built). A real division
+    here would compute a mathematically correct but misleading 0% —
+    "confirmed zero engagement" rather than "not tracked". These three
+    columns must be a literal NULL (which build_digest_text's fmt() renders
+    as "n/a"), and the query must not FILTER on the unwritten event names as
+    an event_type — once S-8 lands, restore the real per-event computation
+    here. (The names may still appear in an explanatory SQL comment.)"""
+    assert "NULL::numeric AS open_rate_pct" in _METRICS_SQL
+    assert "NULL::numeric AS click_rate_pct" in _METRICS_SQL
+    assert "NULL::numeric AS reply_rate_pct" in _METRICS_SQL
+    assert "event_type = 'email_opened'" not in _METRICS_SQL
+    assert "event_type = 'email_clicked'" not in _METRICS_SQL
+    assert "event_type = 'email_replied'" not in _METRICS_SQL

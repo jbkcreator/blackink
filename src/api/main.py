@@ -165,6 +165,18 @@ def _start_background_workers() -> None:
 	# directly rather than wrapping in _loop(). Signal handlers are not
 	# installed: only the main thread can handle signals in Python, and Cloud
 	# Run SIGTERM terminates the container regardless.
+	#
+	# Group D / D-10 review finding: this is the ACTUAL production start path
+	# for the respond worker in this single-process deployment model —
+	# src/agents/respond/worker.py's own main()/_assert_llm_configured() is
+	# never reached here (that guard only covers a standalone
+	# `python -m src.agents.respond.worker` invocation, which this codebase
+	# does not use). Call the same guard here, synchronously and BEFORE the
+	# background thread is spawned, so a misconfigured deployment fails the
+	# whole API's startup loudly instead of silently starting a worker that
+	# will classify every reply as NURTURE/ROUTED with no alert.
+	from src.agents.respond.worker import _assert_llm_configured
+	_assert_llm_configured()
 	respond_worker = RespondWorker()
 	respond_thread = threading.Thread(
 		target=respond_worker.run_forever,
@@ -200,8 +212,40 @@ async def _periodic_flush_loop(interval_seconds: float = _FLUSH_INTERVAL_SECONDS
 			logger.error("[main] periodic flush_pending() failed", exc_info=True)
 
 
+def _log_disabled_inbound_routes() -> None:
+	"""Group D / D-2: several inbound webhook routes fail closed SILENTLY
+	(a log.error + 403/406/503 per request, no startup signal) when a
+	required secret is unset — the exact go-live trap D-2 named: setting
+	only one of what used to be two separate Mailgun signing-key settings
+	looked fine until the OTHER endpoint quietly rejected every delivery.
+	Log once, loudly, at startup which routes are currently disabled, so a
+	missing secret is caught before traffic arrives rather than after."""
+	from config.settings import get_settings
+
+	settings = get_settings()
+	disabled = []
+	if not settings.mailgun_signing_key:
+		disabled.append(
+			"POST /api/v1/webhooks/inbound-email and "
+			"POST /api/v1/webhooks/mailgun-inbound (MAILGUN_SIGNING_KEY unset "
+			"— both routers share this one setting)"
+		)
+	if not settings.inbound_parse_secret:
+		disabled.append(
+			"POST /api/v1/inbound/reply/{client_id} "
+			"(INBOUND_PARSE_SECRET unset — Reply Triage Agent intake)"
+		)
+	if disabled:
+		logger.error(
+			"[main] %d inbound route(s) disabled at startup for want of a "
+			"secret — every request to them will be rejected until set:\n  - %s",
+			len(disabled), "\n  - ".join(disabled),
+		)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+	_log_disabled_inbound_routes()
 	# Restore Redis halt state from Postgres before accepting any traffic —
 	# src.agents.relay.sync's own docstring: "without this, a Redis flush
 	# would silently clear all active halts until an admin noticed."

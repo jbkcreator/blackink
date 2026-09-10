@@ -188,10 +188,16 @@ def get_active_mailbox_for_client(
             # Speed-to-Lead auto-responses (Task 4.2.1) also consume this
             # mailbox's rolling-24h capacity — count them here, or repeated
             # inbound responses could blow past the cap while every check passes.
+            # SENT_UNCONFIRMED (Group D defect D-1 fix) also counts — the SMTP
+            # send happened even though the post-send status write failed, so
+            # excluding it would let repeated post-send failures bypass the
+            # cap entirely. responded_at is never set on that path (the write
+            # that would have set it is what failed), so fall back to
+            # received_at, which is always set.
             "      SELECT COUNT(*) FROM inbound_messages im "
             "      WHERE im.mailbox_id = m.id "
-            "        AND im.status = 'RESPONDED' "
-            "        AND im.responded_at >= NOW() - INTERVAL '24 hours' "
+            "        AND im.status IN ('RESPONDED', 'SENT_UNCONFIRMED') "
+            "        AND COALESCE(im.responded_at, im.received_at) >= NOW() - INTERVAL '24 hours' "
             "    ) + ( "
             # Speed-to-Lead cadence follow-ups (Task 4.2.2) also consume this
             # mailbox's rolling-24h capacity — without this a mailbox at cap

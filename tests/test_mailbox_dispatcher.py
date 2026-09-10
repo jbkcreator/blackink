@@ -239,6 +239,29 @@ def test_query_filters_warmed_and_active_domain():
     assert "active" in join_sql
 
 
+def test_cap_query_counts_sent_unconfirmed_inbound_messages():
+    """Group D / D-1 fix: a Speed-to-Lead auto-response whose post-send write
+    failed (status SENT_UNCONFIRMED) already went out over SMTP — it must
+    still count against this mailbox's rolling-24h cap, or repeated
+    post-send failures let sends bypass the cap entirely."""
+    session = _session_with_mailbox(client_id="client_a")
+    get_active_mailbox_for_client(session, "client_a")
+    join_sql = str(session.execute.call_args_list[3][0][0])
+    assert "SENT_UNCONFIRMED" in join_sql
+    assert "im.status IN ('RESPONDED', 'SENT_UNCONFIRMED')" in join_sql
+
+
+def test_cap_query_falls_back_to_received_at_for_unconfirmed_rows():
+    """responded_at is never set on a SENT_UNCONFIRMED row (the UPDATE that
+    would have set it is what failed) — the 24h window must fall back to
+    received_at, which is always set, or such rows would never expire from
+    (or ever enter) the cap window."""
+    session = _session_with_mailbox(client_id="client_a")
+    get_active_mailbox_for_client(session, "client_a")
+    join_sql = str(session.execute.call_args_list[3][0][0])
+    assert "COALESCE(im.responded_at, im.received_at)" in join_sql
+
+
 # ---------------------------------------------------------------------------
 # Per-mailbox cap + per-client daily ceiling (PR #35 review)
 # ---------------------------------------------------------------------------

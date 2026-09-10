@@ -36,7 +36,16 @@ class PostSendError(Exception):
 
     The SMTP send is not reversible, so the row must NOT be reset to RECEIVED
     (that would resend the same auto-response on the next tick). It goes to the
-    terminal SENT_UNCONFIRMED state for manual reconciliation instead."""
+    terminal SENT_UNCONFIRMED state for manual reconciliation instead.
+
+    Carries mailbox_id (known at the point the SMTP send happened, even though
+    the post-send UPDATE that would normally persist it failed) so the
+    terminal SENT_UNCONFIRMED row still attributes its send to a mailbox —
+    otherwise it can never count against that mailbox's rolling-24h cap."""
+
+    def __init__(self, message: str, mailbox_id: Optional[int] = None):
+        super().__init__(message)
+        self.mailbox_id = mailbox_id
 
 
 def run_sweep(limit: int = _BATCH) -> int:
@@ -47,14 +56,14 @@ def run_sweep(limit: int = _BATCH) -> int:
         try:
             _send_response(row)
             dispatched += 1
-        except PostSendError:
+        except PostSendError as exc:
             # Email already went out — a pre-send retry would duplicate it.
             # Flag terminal for manual reconciliation; never re-claim.
             logger.exception(
                 "[stl-sweep] post-send write failed for id=%s — email already sent, "
                 "marking SENT_UNCONFIRMED (no resend)", row.id,
             )
-            _mark_sent_unconfirmed(row.id)
+            _mark_sent_unconfirmed(row.id, mailbox_id=exc.mailbox_id)
         except Exception:
             # Failure BEFORE the SMTP send (mailbox pick, template, booking
             # link): safe to reset the claim so a later tick retries instead of
@@ -112,16 +121,21 @@ def _reset_to_received(message_id) -> None:
         logger.exception("[stl-sweep] failed to reset id=%s to RECEIVED", message_id)
 
 
-def _mark_sent_unconfirmed(message_id) -> None:
+def _mark_sent_unconfirmed(message_id, mailbox_id: Optional[int] = None) -> None:
     """Terminal flag for a row whose email was sent but whose post-send write
     failed. Never re-claimed by _claim_due (not RECEIVED/SENDING); a human
-    reconciles mailbox_id/responded_at. Prevents duplicate resends."""
+    reconciles responded_at/acked_at. Prevents duplicate resends.
+
+    mailbox_id is set here (when known) because the post-send UPDATE that
+    would normally have set it is exactly what failed — without it the send
+    can never be counted against that mailbox's rolling-24h cap."""
     try:
         with get_system_db_context() as session:
             session.execute(
-                text("UPDATE inbound_messages SET status = 'SENT_UNCONFIRMED' "
+                text("UPDATE inbound_messages SET status = 'SENT_UNCONFIRMED', "
+                     "mailbox_id = COALESCE(:mb, mailbox_id) "
                      "WHERE id = :id AND status = 'SENDING'"),
-                {"id": message_id},
+                {"id": message_id, "mb": mailbox_id},
             )
             session.commit()
     except Exception:
@@ -138,7 +152,10 @@ def _send_response(row) -> None:
     with get_db_context(client_id=client_id) as session:
         if not prospect_email:
             logger.warning("[stl-sweep] no prospect email for id=%s — marking RESPONDED (no send)", message_id)
-            _mark_responded(session, message_id, ack_latency=None, mailbox_id=None)
+            # acked_at stays NULL: nothing was actually acknowledged to anyone
+            # (there is no address to send to), so this must not read as a
+            # real automated response for billing rule 1's ack clock.
+            _mark_responded(session, message_id, acked_at=None, mailbox_id=None)
             return
 
         # Booking link points at the RECEIVING CLIENT's own owner-booking
@@ -211,22 +228,26 @@ def _send_response(row) -> None:
                 session=session,
             )
             # Record the sending mailbox + timestamp so the mailbox picker counts
-            # this send against that mailbox's rolling-24h cap.
-            _mark_responded(session, message_id, ack_latency, mailbox_id=mailbox.mailbox_id)
+            # this send against that mailbox's rolling-24h cap. acked_at is this
+            # auto-response's own timestamp — the one that feeds billing rule
+            # 1's $50 miss-credit ack clock (ack_latency_seconds is a GENERATED
+            # STORED column derived from acked_at; it must never be written to
+            # directly — Postgres rejects that, see apply_ack_latency_reconcile.py).
+            _mark_responded(session, message_id, acked_at=now, mailbox_id=mailbox.mailbox_id)
         except Exception as exc:
-            raise PostSendError(str(exc)) from exc
+            raise PostSendError(str(exc), mailbox_id=mailbox.mailbox_id) from exc
 
 
 def _mark_responded(
-    session: Session, message_id: str, ack_latency: Optional[float], mailbox_id: Optional[int]
+    session: Session, message_id: str, acked_at: Optional[datetime], mailbox_id: Optional[int]
 ) -> None:
     session.execute(
         text(
             "UPDATE inbound_messages SET status = 'RESPONDED', "
-            "ack_latency_seconds = :ack, mailbox_id = :mb, responded_at = NOW() "
+            "acked_at = :acked_at, mailbox_id = :mb, responded_at = NOW() "
             "WHERE id = :id"
         ),
-        {"ack": ack_latency, "mb": mailbox_id, "id": message_id},
+        {"acked_at": acked_at, "mb": mailbox_id, "id": message_id},
     )
     session.commit()
 

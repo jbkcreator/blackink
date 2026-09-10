@@ -175,9 +175,19 @@ def _route(
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
     sla_due_at   = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
 
+    # Group D / D-10: a classifier error (LLM/SDK/API-key failure) returns
+    # NURTURE with meta={"path": "fallback"} — the ONLY signal distinguishing
+    # it from a genuine NURTURE classification. Without this it lands ROUTED
+    # with no card (NURTURE is not in CONTEXT_CARD_INTENTS), no alert, and no
+    # halt — the row becomes permanently invisible: the SLA sweep requires
+    # card_ts to escalate at all (respond_sla_sweep.py), which a NURTURE row
+    # never gets. Flagging it for human review is what makes the row visible.
+    is_fallback = result.meta.get("path") == "fallback"
+
     # QUESTION: flag for human review when confidence is below threshold.
     requires_human_review = (
-        result.intent == Intent.QUESTION and result.confidence < 0.90
+        (result.intent == Intent.QUESTION and result.confidence < 0.90)
+        or is_fallback
     )
 
     # Pre-commit side-effects that must be atomic with the status write.
@@ -253,7 +263,21 @@ def _route(
             f"Message ID: `{db_id}` — route to Referral Agent.",
         ))
 
-    elif result.intent in CONTEXT_CARD_INTENTS and sla_due_at:
+    if is_fallback:
+        # This is the only place a fallback result becomes visible to a
+        # human — the SLA sweep cannot reach it (no card, escalation_level
+        # stays 0). Deliberately does NOT halt the sequence: the true intent
+        # is unknown, and halting on every transient LLM error would stall
+        # live campaigns for no reason; a human reviewer halts it if warranted.
+        asyncio.run(_post_slack_alert(
+            "qa",
+            f":warning: *Classifier error — manual review required*\n"
+            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+            f"Message ID: `{db_id}` — classification failed (LLM/SDK/API-key "
+            f"error); flagged for human review rather than auto-routed.",
+        ))
+
+    if result.intent in CONTEXT_CARD_INTENTS and sla_due_at:
         card_meta = asyncio.run(post_context_card(
             db_id=db_id,
             client_id=client_id,
@@ -472,8 +496,36 @@ class Worker:
         logger.info("respond.worker: stopped (consumer=%s)", self.consumer_name)
 
 
+def _assert_llm_configured() -> None:
+    """Refuse to start rather than silently classifying every reply as
+    NURTURE/ROUTED with zero human visibility (Group D / D-10). Before this
+    check, a missing anthropic SDK or an unset ANTHROPIC_API_KEY made
+    classify() return the error fallback for every single message —
+    indistinguishable from the LLM genuinely deciding NURTURE — and the
+    entire Respond product would no-op while every status column read
+    healthy. A misconfiguration must be a loud startup failure instead."""
+    from src.agents.respond.classifier import anthropic as _anthropic
+    from config.settings import get_settings
+
+    if _anthropic is None:
+        raise RuntimeError(
+            "respond.worker: refusing to start — the 'anthropic' package is "
+            "not installed. Every inbound reply would silently classify as "
+            "NURTURE/ROUTED with no alert. Install the SDK before starting "
+            "this worker."
+        )
+    if not get_settings().anthropic_api_key:
+        raise RuntimeError(
+            "respond.worker: refusing to start — ANTHROPIC_API_KEY is not "
+            "set. Every inbound reply would silently classify as "
+            "NURTURE/ROUTED with no alert. Set the key before starting this "
+            "worker."
+        )
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    _assert_llm_configured()
     worker = Worker()
     worker.install_signal_handlers()
     worker.run_forever()

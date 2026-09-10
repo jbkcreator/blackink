@@ -2,6 +2,11 @@
 
 Reuses the same SQL as src/tasks/daily_digest.py — same 7 KPIs, same 24h
 window, platform-wide (no client_id filter, system role). No auth guard yet.
+
+Group D / D-4: this copy of the query had the identical event-name/payload-key
+bug as daily_digest.py (owner_score_generated / 'county' — never written by
+owner_visibility_sweep.py, which emits owner_visibility_score_calculated /
+'county_slug') — see that file's comment for the full explanation.
 """
 from datetime import timedelta
 
@@ -17,15 +22,14 @@ _WINDOW = timedelta(hours=24)
 
 _METRICS_SQL = """
     SELECT
-        COUNT(*) FILTER (WHERE event_type = 'owner_score_generated') AS scores_generated,
-        COUNT(DISTINCT payload->>'county') FILTER (WHERE event_type = 'owner_score_generated') AS county_rank_reports_delivered,
+        COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
+        COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
         COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        (COUNT(*) FILTER (WHERE event_type = 'email_opened')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS open_rate_pct,
-        (COUNT(*) FILTER (WHERE event_type = 'email_clicked')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS click_rate_pct,
-        (COUNT(*) FILTER (WHERE event_type = 'email_replied')::numeric
-            / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0) * 100) AS reply_rate_pct,
+        -- Group D / D-4: no producer for these event types yet (S-8) — see
+        -- src/tasks/daily_digest.py's identical comment.
+        NULL::numeric AS open_rate_pct,
+        NULL::numeric AS click_rate_pct,
+        NULL::numeric AS reply_rate_pct,
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
