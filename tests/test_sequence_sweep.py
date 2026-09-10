@@ -243,9 +243,9 @@ def json_payloads(session):
     return " ".join(out)
 
 
-def test_run_sweep_routes_linkedin_and_email(monkeypatch):
-    """run_sweep dispatches email orders to _post_due_card and LinkedIn orders
-    to _post_due_linkedin_card; dial orders are ignored entirely."""
+def test_run_sweep_routes_linkedin_email_and_dial(monkeypatch):
+    """run_sweep dispatches email + deferred DIAL_TASK to _post_due_card and
+    LinkedIn orders to _post_due_linkedin_card."""
     batch = [
         _order(action_class="DISPATCH_EMAIL_TOUCH"),
         _order(action_class="LINKEDIN_TASK"),
@@ -256,12 +256,16 @@ def test_run_sweep_routes_linkedin_and_email(monkeypatch):
     monkeypatch.setattr(sweep, "_post_due_linkedin_card", AsyncMock(return_value=True))
 
     posted = sweep.run_sweep()
-    assert posted == 2  # one email + one linkedin, dial not swept
-    sweep._post_due_card.assert_awaited_once()
+    assert posted == 3  # email + linkedin + deferred dial
+    assert sweep._post_due_card.await_count == 2  # email + dial
     sweep._post_due_linkedin_card.assert_awaited_once()
 
 
-def test_run_sweep_zero_when_only_dial_due(monkeypatch):
+def test_run_sweep_posts_due_dial_card(monkeypatch):
+    """A DIAL_TASK whose due_at has arrived (deferred by calling-hours gate)
+    is posted by the sweep via _post_due_card on the 'dial' channel."""
     batch = [_order(action_class="DIAL_TASK")]
     monkeypatch.setattr(sweep.wo, "due_batch", lambda **kw: batch)
-    assert sweep.run_sweep() == 0
+    monkeypatch.setattr(sweep, "_post_due_card", AsyncMock(return_value=True))
+    assert sweep.run_sweep() == 1
+    sweep._post_due_card.assert_awaited_once()
