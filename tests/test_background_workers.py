@@ -50,43 +50,50 @@ def test_core_booking_workers_are_registered():
 		assert expected in names, f"{expected} not registered"
 
 
-def test_respond_worker_llm_guard_runs_before_thread_starts():
-	"""Group D / D-10 review finding: src/agents/respond/worker.py's own
-	main()/_assert_llm_configured() is NEVER reached by this codebase's
-	actual deployment — this single-process model instantiates RespondWorker()
-	directly inside _start_background_workers(), not via `python -m
-	src.agents.respond.worker`. Without a guard call HERE, a missing
-	ANTHROPIC_API_KEY silently starts a worker that classifies every reply
-	as NURTURE/ROUTED with zero alert. Assert the guard actually fires on
-	the real production start path, and that it runs BEFORE the respond
-	worker thread is spawned (a misconfiguration must abort the whole
-	startup, not race a thread that's already running)."""
+def test_respond_worker_llm_guard_runs_before_any_thread_starts():
+	"""PR #48 review finding: the guard used to run AFTER the `workers` loop
+	had already started all 18 sweep threads (billing, settlement, etc.) —
+	each of which calls its sweep function immediately on thread start, so a
+	misconfigured ANTHROPIC_API_KEY still let those threads run at least one
+	real tick (real Stripe calls included) before the RuntimeError ever
+	propagated. Threads are daemons and are not killed by an exception on a
+	different thread, so "the guard eventually raises" was not the same as
+	"nothing ran". Assert the guard is called before the FIRST thread of any
+	kind is even constructed, not merely before the respond worker's own
+	thread specifically."""
 	names = []
-	guard_called_before_thread_started = []
+	guard_called_before_first_thread = []
 
 	class _StubThread:
 		def __init__(self, *args, target=None, name=None, daemon=None, **kwargs):
-			self._name = name
+			if not names:  # this is the first thread constructed
+				guard_called_before_first_thread.append(mock_guard.called)
 			if name:
 				names.append(name)
 
 		def start(self):
-			if self._name == "respond_worker":
-				guard_called_before_thread_started.append(mock_guard.called)
+			pass
 
 	with patch.object(main.threading, "Thread", _StubThread), \
 	     patch("src.agents.respond.worker._assert_llm_configured") as mock_guard:
 		main._start_background_workers()
 
 	mock_guard.assert_called_once()
-	assert guard_called_before_thread_started == [True]
+	assert guard_called_before_first_thread == [True]
+	assert len(names) > 1, "sanity check: multiple worker threads should have been registered"
 
 
-def test_respond_worker_thread_never_starts_when_llm_misconfigured():
-	"""The guard raising must abort _start_background_workers() entirely —
-	including every OTHER worker registered after it in the function — not
-	just skip the respond worker. A partially-started worker set on a
-	misconfigured deployment is itself a silent-failure surface."""
+def test_no_worker_thread_starts_when_llm_misconfigured():
+	"""The guard raising must abort _start_background_workers() before ANY
+	worker thread is constructed — not just before the respond worker's own
+	thread. Before this fix, the guard ran after all 18 sweep threads
+	(including billing_sweep.run_sit_invoice_sweep and every settlement_sweep
+	sweep) had already started and fired at least one real tick, since
+	daemon threads are not killed by an exception raised on a different
+	thread. A partially-started worker set — real money-moving sweeps
+	included — on a misconfigured deployment is itself a silent-failure
+	surface this guard exists to prevent entirely, not just for the respond
+	worker."""
 	names = []
 
 	class _StubThread:
@@ -103,4 +110,4 @@ def test_respond_worker_thread_never_starts_when_llm_misconfigured():
 		with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
 			main._start_background_workers()
 
-	assert "respond_worker" not in names
+	assert names == [], f"no worker thread should have started, but these did: {names}"

@@ -11,15 +11,29 @@ Covers:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from src.agents.respond.classifier import ClassificationResult
 from src.agents.respond.intents import Intent
+from src.agents.respond import worker
 from src.agents.respond.worker import _process_message, _route
 from src.agents.respond.queue import InboundQueueMessage
+
+
+@pytest.fixture(autouse=True)
+def _reset_fallback_alert_cooldown():
+	"""_should_alert_fallback (PR #48 review finding) keeps process-local
+	module state (_last_fallback_alert_at / _fallback_suppressed_since_last_alert)
+	so a real outage coalesces into one alert instead of one per message.
+	That same state would otherwise leak between test functions in this
+	file, since they all import and call the same module — reset it before
+	every test regardless of whether the test touches fallback behavior."""
+	worker._last_fallback_alert_at = None
+	worker._fallback_suppressed_since_last_alert = 0
+	yield
 
 
 # ---------------------------------------------------------------------------
@@ -408,3 +422,137 @@ class TestClassifierFallback:
             if "requires_human_review" in _sql_text_of_call(c)
         )
         assert write_call[0][1]["human_review"] is False
+
+
+# ---------------------------------------------------------------------------
+# PR #48 review finding — the fallback Slack alert must coalesce during a
+# sustained outage (every queued reply hitting the classifier fallback path
+# at once), not post one synchronous alert per message.
+# ---------------------------------------------------------------------------
+
+class TestClassifierFallbackAlertCooldown:
+    def test_second_fallback_within_cooldown_does_not_alert(self):
+        """Two fallback messages back-to-back (well inside the 5-minute
+        cooldown) must produce exactly one Slack post, not two."""
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None) as mock_run:
+            for db_id in (70, 71):
+                db = _mock_db()
+                _route(
+                    db=db, db_id=db_id, client_id="CL1",
+                    sender_email="owner@co.com",
+                    received_at=datetime.now(timezone.utc),
+                    result=_fallback_result(),
+                )
+        assert mock_run.call_count == 1
+
+    def test_requires_human_review_still_set_on_every_suppressed_fallback(self):
+        """The cooldown throttles the ALERT only — every affected row must
+        still be flagged for human review regardless of whether its alert
+        was suppressed, so the Respond queue itself never silently drops a
+        row during a sustained outage."""
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None):
+            dbs = []
+            for db_id in (72, 73, 74):
+                db = _mock_db()
+                dbs.append(db)
+                _route(
+                    db=db, db_id=db_id, client_id="CL1",
+                    sender_email="owner@co.com",
+                    received_at=datetime.now(timezone.utc),
+                    result=_fallback_result(),
+                )
+        for db in dbs:
+            write_call = next(
+                c for c in db.execute.call_args_list
+                if "requires_human_review" in _sql_text_of_call(c)
+            )
+            assert write_call[0][1]["human_review"] is True
+
+    def test_many_consecutive_fallbacks_produce_at_most_one_alert(self):
+        """Simulates a sustained outage: N consecutive fallback
+        classifications must coalesce into at most one Slack post, not N."""
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None) as mock_run:
+            for db_id in range(80, 130):  # 50 consecutive fallbacks
+                db = _mock_db()
+                _route(
+                    db=db, db_id=db_id, client_id="CL1",
+                    sender_email="owner@co.com",
+                    received_at=datetime.now(timezone.utc),
+                    result=_fallback_result(),
+                )
+        assert mock_run.call_count <= 1
+
+    def test_alert_after_cooldown_expires_reports_suppressed_count(self):
+        """Once the cooldown window has elapsed, the next fallback alert
+        must fire again — and its text must report how many were
+        suppressed in between, so an outage reads as "N suppressed" rather
+        than a single unlabeled ping that hides its own scale."""
+        from src.agents.respond import worker as worker_mod
+
+        with patch("src.agents.respond.worker._post_slack_alert", new_callable=AsyncMock) as mock_alert:
+            db1 = _mock_db()
+            _route(
+                db=db1, db_id=90, client_id="CL1",
+                sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc),
+                result=_fallback_result(),
+            )
+            # Two suppressed while still inside the cooldown.
+            for db_id in (91, 92):
+                db = _mock_db()
+                _route(
+                    db=db, db_id=db_id, client_id="CL1",
+                    sender_email="owner@co.com",
+                    received_at=datetime.now(timezone.utc),
+                    result=_fallback_result(),
+                )
+            assert mock_alert.await_count == 1
+
+            # Force the cooldown to have elapsed.
+            worker_mod._last_fallback_alert_at = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=worker_mod._FALLBACK_ALERT_COOLDOWN_SECONDS + 1)
+            )
+            db2 = _mock_db()
+            _route(
+                db=db2, db_id=93, client_id="CL1",
+                sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc),
+                result=_fallback_result(),
+            )
+        assert mock_alert.await_count == 2
+        second_alert_text = mock_alert.await_args_list[1].args[1]
+        assert "2 more suppressed" in second_alert_text
+
+    def test_suppressed_count_resets_after_posting(self):
+        """After a cooldown-expired alert posts, the suppressed counter must
+        reset to zero — a THIRD alert (after a second cooldown expiry) must
+        not double-count suppressions from the first outage window."""
+        from src.agents.respond import worker as worker_mod
+
+        with patch("src.agents.respond.worker.asyncio.run", return_value=None):
+            db = _mock_db()
+            _route(
+                db=db, db_id=100, client_id="CL1", sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc), result=_fallback_result(),
+            )
+            assert worker_mod._fallback_suppressed_since_last_alert == 0
+
+            for db_id in (101, 102, 103):
+                db = _mock_db()
+                _route(
+                    db=db, db_id=db_id, client_id="CL1", sender_email="owner@co.com",
+                    received_at=datetime.now(timezone.utc), result=_fallback_result(),
+                )
+            assert worker_mod._fallback_suppressed_since_last_alert == 3
+
+            worker_mod._last_fallback_alert_at = (
+                datetime.now(timezone.utc)
+                - timedelta(seconds=worker_mod._FALLBACK_ALERT_COOLDOWN_SECONDS + 1)
+            )
+            db = _mock_db()
+            _route(
+                db=db, db_id=104, client_id="CL1", sender_email="owner@co.com",
+                received_at=datetime.now(timezone.utc), result=_fallback_result(),
+            )
+            assert worker_mod._fallback_suppressed_since_last_alert == 0

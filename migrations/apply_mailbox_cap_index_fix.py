@@ -27,12 +27,39 @@ index's WHERE clause only needs to be implied by the query's WHERE clause,
 not identical, but making it identical keeps this migration's intent
 legible without needing to re-derive it from mailbox_dispatcher.py).
 
-Idempotent: DROP INDEX IF EXISTS / CREATE INDEX IF NOT EXISTS.
+PR #48 review finding: both DDL statements now use CONCURRENTLY. Per
+CLAUDE.md there is no separate staging database — migrations run directly
+against the live server — and inbound_messages is get_active_mailbox_for_
+client()'s own table, called on every single outbound send attempt. A
+plain (non-CONCURRENTLY) CREATE/DROP INDEX takes a lock that blocks writes
+to the table for the build's duration; at today's row count that's
+effectively instant, but this repo's own docstring above anticipates
+growth to hundreds/thousands of rows/day, at which point a future
+non-CONCURRENTLY DDL statement on this table would measurably stall live
+mailbox-picking/inserts. CONCURRENTLY cannot run inside a transaction
+block, so this script uses the owner engine directly with an
+AUTOCOMMIT-isolation connection instead of get_owner_db_context()'s
+Session (the first use of that pattern in this repo — every other
+migration's DDL is small/rare enough not to need it).
+
+CONCURRENTLY's own failure mode, for the record: if a concurrent index
+build is interrupted (killed, or errors partway), Postgres leaves behind
+an INVALID index rather than cleanly rolling back — a subsequent run of
+this script's CREATE INDEX CONCURRENTLY IF NOT EXISTS would then no-op
+against that invalid index rather than fixing it. Recovery is a manual
+`DROP INDEX CONCURRENTLY ix_inbound_messages_mailbox_cap` followed by
+re-running this script — not automated here, since detecting and
+self-healing an invalid index is more machinery than a one-time index
+swap on a still-small table warrants.
+
+Idempotent: DROP INDEX CONCURRENTLY IF EXISTS / CREATE INDEX CONCURRENTLY
+IF NOT EXISTS.
 
 Rollback: additive-after-drop — dropping the old index is not reversible
-without recreating it by hand (`CREATE INDEX ix_inbound_messages_mailbox_responded
-ON inbound_messages (mailbox_id, responded_at) WHERE mailbox_id IS NOT NULL`),
-but since nothing else ever read it, there is no functional reason to.
+without recreating it by hand (`CREATE INDEX CONCURRENTLY
+ix_inbound_messages_mailbox_responded ON inbound_messages (mailbox_id,
+responded_at) WHERE mailbox_id IS NOT NULL`), but since nothing else ever
+read it, there is no functional reason to.
 
 Run AFTER apply_ack_latency_reconcile.py, BEFORE apply_rls_policies.py (not
 tenant-bearing — an index change on an already-registered table).
@@ -46,12 +73,12 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from sqlalchemy import text
 
-from src.core.database import get_owner_db_context
+from src.core.database import db
 
 DDL = [
-    "DROP INDEX IF EXISTS ix_inbound_messages_mailbox_responded",
+    "DROP INDEX CONCURRENTLY IF EXISTS ix_inbound_messages_mailbox_responded",
     """
-    CREATE INDEX IF NOT EXISTS ix_inbound_messages_mailbox_cap
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_inbound_messages_mailbox_cap
         ON inbound_messages (mailbox_id, COALESCE(responded_at, received_at))
         WHERE status IN ('RESPONDED', 'SENT_UNCONFIRMED')
     """,
@@ -59,10 +86,13 @@ DDL = [
 
 
 def main() -> None:
-    with get_owner_db_context() as session:
+    # CONCURRENTLY forbids running inside a transaction block — AUTOCOMMIT
+    # isolation makes each statement its own implicitly-committed
+    # transaction, which is what CONCURRENTLY requires.
+    engine = db.engine
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
         for stmt in DDL:
-            session.execute(text(stmt))
-        session.commit()
+            conn.execute(text(stmt))
     print("apply_mailbox_cap_index_fix: done")
 
 

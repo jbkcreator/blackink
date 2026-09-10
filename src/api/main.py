@@ -103,6 +103,20 @@ def _loop(name: str, interval_seconds: int, fn) -> None:
 
 
 def _start_background_workers() -> None:
+	# PR #48 review finding: this guard used to run AFTER the `workers` loop
+	# below had already started all 18 sweep threads — including
+	# billing_sweep.run_sit_invoice_sweep and every settlement_sweep sweep,
+	# each of which calls fn() immediately on thread start, before its first
+	# time.sleep(). A misconfigured ANTHROPIC_API_KEY would still let those
+	# threads run at least one real tick (real Stripe calls included) during
+	# the window between thread.start() and the RuntimeError propagating out
+	# of lifespan() — they're daemon threads, not killed by an exception on a
+	# different thread. Calling the guard FIRST, before any thread of any
+	# kind starts, is what actually makes "the whole API's startup fails
+	# loudly" true.
+	from src.agents.respond.worker import _assert_llm_configured
+	_assert_llm_configured()
+
 	from src.tasks.booking_confirmation_sender import run_sweep
 	from src.tasks.calendar_subscription_renewal import run_renewal_sweep
 	from src.tasks.calendar_sync_worker import drain_queue, sweep_all_active_connections
@@ -166,17 +180,14 @@ def _start_background_workers() -> None:
 	# installed: only the main thread can handle signals in Python, and Cloud
 	# Run SIGTERM terminates the container regardless.
 	#
-	# Group D / D-10 review finding: this is the ACTUAL production start path
-	# for the respond worker in this single-process deployment model —
+	# Group D / D-10: this is the ACTUAL production start path for the
+	# respond worker in this single-process deployment model —
 	# src/agents/respond/worker.py's own main()/_assert_llm_configured() is
 	# never reached here (that guard only covers a standalone
 	# `python -m src.agents.respond.worker` invocation, which this codebase
-	# does not use). Call the same guard here, synchronously and BEFORE the
-	# background thread is spawned, so a misconfigured deployment fails the
-	# whole API's startup loudly instead of silently starting a worker that
-	# will classify every reply as NURTURE/ROUTED with no alert.
-	from src.agents.respond.worker import _assert_llm_configured
-	_assert_llm_configured()
+	# does not use). The guard call itself now lives at the very top of this
+	# function — see the comment there for why it moved ahead of every other
+	# worker thread, not just this one.
 	respond_worker = RespondWorker()
 	respond_thread = threading.Thread(
 		target=respond_worker.run_forever,

@@ -56,6 +56,20 @@ DB_SCAN_SWEEP_EVERY_N_LOOPS = 60   # ~1 min at 1s block_ms
 DB_SCAN_MIN_AGE_SECONDS = 120       # only rows stuck for 2+ minutes
 IDLE_SLEEP_SECONDS = 5
 
+# PR #48 review finding: a sustained ANTHROPIC_API_KEY/SDK/Anthropic-API
+# outage makes every queued reply hit the classifier fallback path
+# (_classify_with_llm's own outer except catches ALL of those cases, not
+# just a missing key at startup). Without a cooldown, this worker's
+# single-consumer loop posted one synchronous Slack alert (asyncio.run +
+# a blocking webhook POST) per message — serializing its own throughput
+# behind Slack round-trips exactly when the queue most needs to drain
+# fast, and flooding #blackink-qa with near-duplicate pings. Process-local
+# state is sufficient: there is exactly one respond-worker thread per
+# deployed process (see src/api/main.py's _start_background_workers).
+_FALLBACK_ALERT_COOLDOWN_SECONDS = 300  # 5 minutes
+_last_fallback_alert_at: Optional[datetime] = None
+_fallback_suppressed_since_last_alert = 0
+
 _INTENT_TO_STATUS: Dict[Intent, str] = {
     Intent.UNSUBSCRIBE: "SUPPRESSED",
     Intent.LEGAL_GRIEF: "ESCALATED",
@@ -156,6 +170,33 @@ def _halt_sequence(db: Any, sender_email: str, client_id: str) -> None:
         ),
         {"email": sender_email.strip().lower(), "client_id": client_id},
     )
+
+
+def _should_alert_fallback() -> tuple[bool, int]:
+    """Coalesces repeated classifier-fallback alerts behind a cooldown.
+
+    Returns (should_post_now, suppressed_count). suppressed_count is the
+    number of fallback classifications that were silently suppressed since
+    the last alert actually posted — surfaced in the alert text so an
+    outage still reads as "N suppressed", not as a single unlabeled ping.
+
+    requires_human_review on the DB row is set unconditionally regardless
+    of this cooldown (see _route below) — only the Slack side-channel is
+    throttled, so a human working the Respond queue directly still sees
+    every affected row even while alerts are suppressed."""
+    global _last_fallback_alert_at, _fallback_suppressed_since_last_alert
+    now = datetime.now(timezone.utc)
+    if (
+        _last_fallback_alert_at is not None
+        and (now - _last_fallback_alert_at).total_seconds() < _FALLBACK_ALERT_COOLDOWN_SECONDS
+    ):
+        _fallback_suppressed_since_last_alert += 1
+        return False, 0
+
+    suppressed = _fallback_suppressed_since_last_alert
+    _last_fallback_alert_at = now
+    _fallback_suppressed_since_last_alert = 0
+    return True, suppressed
 
 
 def _route(
@@ -269,13 +310,25 @@ def _route(
         # stays 0). Deliberately does NOT halt the sequence: the true intent
         # is unknown, and halting on every transient LLM error would stall
         # live campaigns for no reason; a human reviewer halts it if warranted.
-        asyncio.run(_post_slack_alert(
-            "qa",
-            f":warning: *Classifier error — manual review required*\n"
-            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
-            f"Message ID: `{db_id}` — classification failed (LLM/SDK/API-key "
-            f"error); flagged for human review rather than auto-routed.",
-        ))
+        #
+        # PR #48 review finding: the alert itself is cooldown-throttled (see
+        # _should_alert_fallback) — requires_human_review above is NOT, so a
+        # sustained outage still flags every affected row for the queue, it
+        # just stops flooding #blackink-qa with one post per message.
+        should_alert, suppressed = _should_alert_fallback()
+        if should_alert:
+            suffix = (
+                f" ({suppressed} more suppressed in the last "
+                f"{_FALLBACK_ALERT_COOLDOWN_SECONDS // 60} min)"
+                if suppressed else ""
+            )
+            asyncio.run(_post_slack_alert(
+                "qa",
+                f":warning: *Classifier error — manual review required*{suffix}\n"
+                f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+                f"Message ID: `{db_id}` — classification failed (LLM/SDK/API-key "
+                f"error); flagged for human review rather than auto-routed.",
+            ))
 
     if result.intent in CONTEXT_CARD_INTENTS and sla_due_at:
         card_meta = asyncio.run(post_context_card(
