@@ -1808,21 +1808,45 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 		return
 
 	# Send the email via SMTP.
-	# On failure: release the claim so the message can be retried by another rep.
-	# On success: mark the message RESPONDED so it counts toward the mailbox
-	# rolling-24h cap (same row the per-mailbox cap query already watches).
+	# _send_kb_reply transitions the row to SENDING inside the advisory-lock
+	# transaction so concurrent approvals see the reserved cap slot immediately.
+	# On uncertain delivery (connection dropped mid-DATA): terminal SENT_UNCONFIRMED —
+	#   the email may already be in the recipient's inbox; never release the claim.
+	# On definite SMTP failure: release the claim and reset to ROUTED so another
+	#   rep can retry.
+	# On success: mark RESPONDED so it counts toward the rolling-24h cap.
+	from src.services.calendar_confirmation import UncertainDeliveryError
+
 	try:
 		used_mailbox_id = _send_kb_reply(
 			client_id=card_client_id,
+			message_id=db_id,
 			to_email=row["sender_email"],
 			subject=f"Re: {row['subject'] or 'Your enquiry'}",
 			body_html=template.replace("\n", "<br>"),
 		)
+	except UncertainDeliveryError:
+		logger.exception("approve_kb_response: SMTP uncertain for db_id=%s — marking SENT_UNCONFIRMED", db_id)
+		with get_system_db_context() as _s:
+			_s.execute(
+				text("UPDATE inbound_messages SET status = 'SENT_UNCONFIRMED' WHERE id = :id"),
+				{"id": db_id},
+			)
+			_s.commit()
+		await respond(
+			response_type="ephemeral",
+			text=":warning: Email status uncertain — connection dropped mid-send. Marked for manual reconciliation. Do not re-send.",
+		)
+		return
 	except Exception as exc:
 		logger.exception("approve_kb_response: SMTP send failed for db_id=%s", db_id)
 		with get_system_db_context() as _s:
 			_s.execute(
-				text("UPDATE inbound_messages SET claimed_at = NULL, claimed_by = NULL WHERE id = :id"),
+				text(
+					"UPDATE inbound_messages "
+					"SET status = 'ROUTED', claimed_at = NULL, claimed_by = NULL "
+					"WHERE id = :id"
+				),
 				{"id": db_id},
 			)
 			_s.commit()
@@ -1878,15 +1902,17 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 	await respond(response_type="ephemeral", text=f":white_check_mark: Reply sent to {row['sender_email']}.")
 
 
-def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: str) -> Optional[int]:
+def _send_kb_reply(*, client_id: str, message_id: int, to_email: str, subject: str, body_html: str) -> Optional[int]:
 	"""Send the KB auto-response. Returns the mailbox_id used, or None for env fallback.
 
 	Primary path: client's least-recently-used warmed DB mailbox.
 	Fallback: env-based SMTP credentials (SMTP_HOST / SMTP_PASSWORD / SMTP_USERNAME)
 	when no warmed DB mailbox is provisioned for this client yet.
 
-	The returned mailbox_id is stamped onto inbound_messages.mailbox_id by the
-	caller so the send counts toward the per-mailbox rolling-24h cap."""
+	Transitions the inbound_messages row to SENDING inside the same advisory-lock
+	transaction as mailbox selection, so concurrent approvals see the reserved cap
+	slot before SMTP returns. The caller owns the RESPONDED / SENT_UNCONFIRMED /
+	ROUTED transition after SMTP completes."""
 	from sqlalchemy import text as _text
 	from src.core.database import get_db_context
 	from src.core.token_crypto import decrypt_token
@@ -1904,6 +1930,11 @@ def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: st
 				),
 				{"mid": mailbox.mailbox_id},
 			).fetchone()
+			# Reserve the cap slot atomically inside the advisory-lock transaction.
+			db.execute(
+				_text("UPDATE inbound_messages SET status = 'SENDING' WHERE id = :mid"),
+				{"mid": message_id},
+			)
 
 		if not smtp_row or not smtp_row.smtp_host:
 			raise RuntimeError(f"No SMTP credentials for mailbox_id={mailbox.mailbox_id}")

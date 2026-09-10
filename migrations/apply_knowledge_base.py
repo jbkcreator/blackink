@@ -68,10 +68,9 @@ SEED_ENTRIES = [
             "what is the price",
             "how much do you charge",
             "what are your fees",
-            "pricing",
+            "what is the pricing",
             "how much is it",
             "what is your fee",
-            "cost",
         ],
         "approved_response_template": (
             "I appreciate you asking directly.\n\n"
@@ -117,7 +116,7 @@ SEED_ENTRIES = [
             "how quickly",
             "what is the timeline",
             "when will i see results",
-            "how fast",
+            "how fast will i see results",
             "turnaround time",
             "time to results",
         ],
@@ -137,9 +136,9 @@ SEED_ENTRIES = [
         "trigger_patterns": [
             "is this a guarantee",
             "do you guarantee",
-            "guaranteed",
-            "money back",
-            "refund",
+            "do you offer a guarantee",
+            "money back guarantee",
+            "do you offer a refund",
             "what if it doesn't work",
             "what happens if it doesnt work",
             "what happens if this doesnt work out",
@@ -174,7 +173,17 @@ def main() -> int:
                 {"topic": entry["topic"]},
             ).first()
             if existing:
-                print(f"  already exists: {entry['topic']!r} — skipping")
+                # Update trigger_patterns on every run so re-running the migration
+                # propagates pattern changes to already-seeded rows.
+                db.execute(
+                    text(
+                        "UPDATE knowledge_base_entries "
+                        "SET trigger_patterns = :patterns "
+                        "WHERE topic = :topic"
+                    ),
+                    {"patterns": entry["trigger_patterns"], "topic": entry["topic"]},
+                )
+                print(f"  updated patterns: {entry['topic']!r}")
                 continue
             db.execute(
                 text(
