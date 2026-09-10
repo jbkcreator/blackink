@@ -75,6 +75,8 @@ PYTHONPATH=. python migrations/apply_stl_cadence.py  # Task 4.2.2 — STL cadenc
 PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
 PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2 — Three-Touch Win-Back Sequence (winback_touch_dispatches, stop columns, calendar_connections.is_default_owner_booking; after apply_winback_imports.py and apply_calendar_connections.py, before RLS)
 PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
+PYTHONPATH=. python migrations/apply_winback_loss_est.py   # S-14 — adds custom_hook_text to winback_rows; after apply_winback_touch_sequence.py (audit_loss_dollars_est already exists there), before RLS
+PYTHONPATH=. python migrations/apply_band2_counters.py   # S-9 — Band 2 consecutive-clean-send tracker; not tenant-bearing, no RLS; any time after apply_clients.py
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -102,6 +104,7 @@ python -m src.tasks.billing_sweep               # Subtask 1.2.3 — $50 miss-cre
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches (one client)
 python -m src.tasks.work_order_execution_sweep  # Task 4.2.2 — all-tenant APPROVED work-order dispatcher (runs cmd_sweep per client); wired into the deployed background workers
 python -m src.tasks.enrichment_verification --client-id <id> [--import-id <id>] [--limit 10]  # Subtask 3.2.1 — owner-enrichment (skip-trace) sweep; must run before a Win-Back import can be armed, posts the pre-pilot summary to #blackink-qa
+python -m src.tasks.ovs_delta_alert  # S-7 — month-over-month OVS score delta alert; run after owner_visibility_sweep completes; posts to #blackink-economics
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most

@@ -223,10 +223,10 @@ def _mark_responded(
     session.execute(
         text(
             "UPDATE inbound_messages SET status = 'RESPONDED', "
-            "ack_latency_seconds = :ack, mailbox_id = :mb, responded_at = NOW() "
+            "mailbox_id = :mb, responded_at = NOW() "
             "WHERE id = :id"
         ),
-        {"ack": ack_latency, "mb": mailbox_id, "id": message_id},
+        {"mb": mailbox_id, "id": message_id},
     )
     session.commit()
 

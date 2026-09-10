@@ -39,12 +39,12 @@ _SUBDOMAIN_RE = re.compile(r"leads@([a-z0-9\-]+)\.getblackink\.com", re.IGNORECA
 
 
 def _verify_mailgun_signature(timestamp: str, token: str, signature: str) -> bool:
-    signing_key = get_settings().mailgun_webhook_signing_key
-    if not signing_key:
-        logger.error("[mailgun] MAILGUN_WEBHOOK_SIGNING_KEY not configured — rejecting all")
+    signing_key_secret = get_settings().mailgun_signing_key
+    if not signing_key_secret:
+        logger.error("[mailgun] MAILGUN_SIGNING_KEY not configured — rejecting all")
         return False
     expected = hmac.new(
-        signing_key.encode(),
+        signing_key_secret.get_secret_value().encode(),
         f"{timestamp}{token}".encode(),
         hashlib.sha256,
     ).hexdigest()

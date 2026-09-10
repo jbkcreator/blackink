@@ -56,11 +56,13 @@ _WINBACK_ACTION = "DISPATCH_WINBACK_TOUCH"
 _STL_ARM_ACTION = "STL_CADENCE_ARM"
 _STL_TOUCH_ACTION = "DISPATCH_STL_CADENCE_TOUCH"
 
-# Action classes the sweep actually surfaces. DIAL_TASK is excluded on purpose
-# (event-driven on Touch 1 approval, ADR 0001) — it is in _ACTION_CHANNEL only
-# for channel resolution, never swept.
+# Action classes the sweep surfaces. DIAL_TASK is included so that cards
+# deferred by the calling-hours gate (🔴 path in listeners.py) are posted when
+# due_at arrives. Immediately-posted DIAL_TASK cards (🟢 path) have
+# slack_message_ts already set and are skipped by the dedup guard at line ~285.
 # STL_CADENCE_ARM is auto-executed (no card) — listed separately in _ARM_ACTIONS.
-_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION, _STL_TOUCH_ACTION)
+_DIAL_TASK_ACTION = "DIAL_TASK"
+_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION, _STL_TOUCH_ACTION, _DIAL_TASK_ACTION)
 _ARM_ACTIONS = (_STL_ARM_ACTION,)
 
 
@@ -271,9 +273,9 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         executed = _run_arm_orders(arm_orders)
         logger.info("sequence_sweep: %d STL arm-check(s) executed", executed)
 
-    # DIAL_TASK is deliberately NOT swept — it is posted event-driven on Touch 1
-    # approval (docs/adr/0001-non-email-touch-posting-model.md); only email,
-    # LinkedIn, winback, and STL cadence touches surface here.
+    # DIAL_TASK is included — deferred cards (🔴 calling-hours path) are posted
+    # here when due_at arrives. Immediately-posted cards (🟢 path) have
+    # slack_message_ts set and are skipped by the dedup guard below.
     touch_orders = [o for o in batch if o.action_class in _SWEPT_ACTIONS]
 
     if not touch_orders:

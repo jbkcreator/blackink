@@ -31,6 +31,11 @@ sys.path.insert(0, ".")
 
 from src.agents.relay import halt_service
 from src.services import work_orders as wo
+from src.services.autonomy_band import (
+    TRACKED_CLASSES as _BAND2_TRACKED,
+    record_clean_send as _record_clean,
+    record_failed_send as _record_failed,
+)
 from src.services.work_orders.dispatchers import DISPATCHERS
 
 
@@ -206,6 +211,8 @@ def cmd_sweep(client_id: str) -> int:
 				_line(f"action_id={claimed.action_id} RECLAIMED MID-FLIGHT during fail-finalise — alert #blackink-qa")
 			else:
 				_line(f"action_id={claimed.action_id} FAILED (outcome={receipt.get('outcome')}) — alert #blackink-qa for reconciliation")
+			if claimed.action_class in _BAND2_TRACKED:
+				_record_failed(claimed.client_id, claimed.action_class, int(receipt.get("touch_step") or 0))
 			failed += 1
 			continue
 
@@ -228,6 +235,11 @@ def cmd_sweep(client_id: str) -> int:
 			failed += 1
 			continue
 		_line(f"action_id={claimed.action_id} DONE")
+		# SENT outcome builds trust toward BAND_3_AUTO promotion.
+		# COMPLIANCE_BLOCK / ALREADY_CLAIMED / other non-SENT DONE outcomes are
+		# not sends and must not count toward the streak.
+		if claimed.action_class in _BAND2_TRACKED and receipt.get("outcome") == "SENT":
+			_record_clean(claimed.client_id, claimed.action_class, int(receipt.get("touch_step") or 0))
 		sent += 1
 
 	_line(f"sweep: {sent} sent, {failed} failed, {deferred} deferred")

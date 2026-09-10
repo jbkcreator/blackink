@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.core.database import get_system_db_context
+from src.services.autonomy_band import resolve_band
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,7 @@ def enroll_contact(
             entity_id=str(contact_id),
             agent_id="cold_outbound_sequencer",
             action_class=action_class,
-            autonomy_band="BAND_2_ONE_TAP",
+            autonomy_band=resolve_band(client_id, action_class, touch_step=touch_step if is_email else 0),
             risk_class="LOW",
             recipient=contact_email,
             payload=payload,

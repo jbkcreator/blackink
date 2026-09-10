@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.services import work_orders as wo
+from src.services.autonomy_band import resolve_band
 from src.services.compliance_gate import PASS, GateCheckResult
 from src.services.email_sender import EmailSender, build_email_sender
 from src.services.email_unsubscribe import append_unsubscribe_footer, unsubscribe_url
@@ -309,7 +310,7 @@ def arm_winback_run(
 			entity_id=str(row.winback_row_id),
 			agent_id="winback_sequencer",
 			action_class="DISPATCH_WINBACK_TOUCH",
-			autonomy_band="BAND_2_ONE_TAP",
+			autonomy_band=resolve_band(client_id, "DISPATCH_WINBACK_TOUCH", touch_step=touch_step),
 			risk_class="LOW",
 			recipient=row.email,
 			payload=payload,
