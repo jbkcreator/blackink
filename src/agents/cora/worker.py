@@ -207,7 +207,7 @@ def _process_draft(msg: "queue.DraftMessage") -> None:
         )
 
     # 5. Backlog counter
-    count = notify_draft_queued()
+    count = notify_draft_queued(work_order_id)
     logger.info("cora.worker: approval_pending=%d after queuing work_order_id=%s", count, work_order_id)
 
 

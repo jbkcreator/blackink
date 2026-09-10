@@ -811,7 +811,12 @@ async def _finalize_terminal_decision(order: "wo.WorkOrder", *, decision: str, u
 	# "reviewed" — only a genuine approve or reject counts as a resolved draft.
 	if decision in {"APPROVED", "REJECTED"}:
 		from src.agents.cora.throttle import notify_approval_resolved
-		notify_approval_resolved()
+		# Code-review fix (PR #50, finding 7): pass this order's own
+		# action_id — this handler fires for every work-order type, not
+		# just Cora drafts, so a bare no-arg call would corrupt the
+		# age-tracking ZSET for an unrelated, still-unreviewed Cora draft.
+		# ZREM on an id never added by Cora's worker is a safe no-op.
+		notify_approval_resolved(order.action_id)
 	_log_event(order.client_id, "work_order_decided", entity_id=order.action_id, actor=f"slack:{user_id}", payload={"decision": decision})
 	if decided.slack_channel_id and decided.slack_message_ts:
 		await post.update_card(
@@ -936,6 +941,49 @@ def _load_inbound_message(session, inbound_id):
 	).first()
 
 
+def _claim_inbound_message_for_send(session, inbound_id, client_id) -> bool:
+	"""Code-review fix (PR #50, finding 5): atomically claims the row for a
+	send by flipping status to 'SENDING' (the same in-progress sentinel
+	value this shared column already uses for the Speed-to-Lead flow) —
+	`WHERE status NOT IN ('RESPONDED', 'SENDING')` means a second click, or
+	a Slack action replay, that races this one gets zero rows back and
+	must treat that as already-in-progress/already-sent, never a second
+	SMTP call. Commits immediately so the claim is visible to a genuinely
+	concurrent second request in its own session — a claim that only lives
+	in this transaction's uncommitted state protects against nothing (see
+	sequence_orchestrator.dispatch_touch()'s identical durability-boundary
+	reasoning). Re-asserts the RLS tenant binding after the commit, same
+	reason as that module's _reassert_tenant(): SET LOCAL is transaction-
+	scoped, so it's gone the instant this commits. Returns True if this
+	call won the claim."""
+	claimed = session.execute(
+		text(
+			"UPDATE inbound_messages SET status = 'SENDING' "
+			"WHERE id = :id AND status NOT IN ('RESPONDED', 'SENDING') "
+			"RETURNING id"
+		),
+		{"id": inbound_id},
+	).first()
+	session.commit()
+	if client_id:
+		session.execute(text("SET LOCAL app.current_client_id = :cid"), {"cid": client_id})
+	return claimed is not None
+
+
+def _release_inbound_message_claim(session, inbound_id, original_status: str, client_id) -> None:
+	"""Releases a claim made by _claim_inbound_message_for_send() after a
+	send failure, restoring the row's pre-claim status so a retry (a fresh
+	button click) is possible — leaving it stuck on 'SENDING' forever would
+	make a transient SMTP failure permanently block this message."""
+	session.execute(
+		text("UPDATE inbound_messages SET status = :status WHERE id = :id"),
+		{"id": inbound_id, "status": original_status},
+	)
+	session.commit()
+	if client_id:
+		session.execute(text("SET LOCAL app.current_client_id = :cid"), {"cid": client_id})
+
+
 def _is_opted_out(session, contact_id) -> bool:
 	if contact_id is None:
 		return False
@@ -1044,6 +1092,14 @@ async def handle_reply_thread_modal_submit(ack, body, view, client):
 			await ack(response_action="errors", errors={"reply_block": "No sending mailbox configured for this client."})
 			return
 
+		# Code-review fix (PR #50, finding 5): atomic claim before any SMTP
+		# call — closes the race a plain `if row.status == "RESPONDED"`
+		# check above can't (two near-simultaneous submits both reading
+		# PENDING before either writes).
+		if not _claim_inbound_message_for_send(session, inbound_id, client_id):
+			await ack(response_action="errors", errors={"reply_block": "Already replied to this message."})
+			return
+
 		unsub_url = unsubscribe_url(client_id, row.sender_email)
 		body_with_footer = append_unsubscribe_footer(text_val, unsub_url)
 		subject = row.subject or "Re: your message"
@@ -1062,12 +1118,16 @@ async def handle_reply_thread_modal_submit(ack, body, view, client):
 			)
 		except Exception as exc:  # noqa: BLE001 — surface as a modal error, never a silent send failure
 			logger.error("[listeners] reply send failed inbound_id=%s: %s", inbound_id, exc, exc_info=True)
+			_release_inbound_message_claim(session, inbound_id, row.status, client_id)
 			await ack(response_action="errors", errors={"reply_block": "Send failed — try again or contact support."})
 			return
 
 		session.execute(
-			text("UPDATE inbound_messages SET status = 'RESPONDED', responded_at = NOW() WHERE id = :id"),
-			{"id": inbound_id},
+			text(
+				"UPDATE inbound_messages SET status = 'RESPONDED', responded_at = NOW(), "
+				"mailbox_id = :mailbox_id WHERE id = :id"
+			),
+			{"id": inbound_id, "mailbox_id": mailbox.mailbox_id},
 		)
 		_shared_log_event(
 			client_id,
@@ -1142,6 +1202,14 @@ async def handle_book_meeting(ack, body, respond, action):
 			await respond(response_type="ephemeral", text=":warning: No sending mailbox configured for this client.")
 			return
 
+		# Code-review fix (PR #50, finding 5): this handler previously had
+		# NO idempotency check at all — re-clicking or replaying the action
+		# sent another booking email every time. Same atomic claim as
+		# Reply in Thread above.
+		if not _claim_inbound_message_for_send(session, inbound_id, client_id):
+			await respond(response_type="ephemeral", text=":warning: A booking link was already sent for this message.")
+			return
+
 		unsub_url = unsubscribe_url(client_id, row.sender_email)
 		body_text = (
 			f"Here's a link to grab a time that works for you: {link.url}\n\n"
@@ -1164,12 +1232,16 @@ async def handle_book_meeting(ack, body, respond, action):
 			)
 		except Exception as exc:  # noqa: BLE001
 			logger.error("[listeners] book_meeting send failed inbound_id=%s: %s", inbound_id, exc, exc_info=True)
+			_release_inbound_message_claim(session, inbound_id, row.status, client_id)
 			await respond(response_type="ephemeral", text=":warning: Send failed — try again or contact support.")
 			return
 
 		session.execute(
-			text("UPDATE inbound_messages SET status = 'RESPONDED', responded_at = NOW() WHERE id = :id"),
-			{"id": inbound_id},
+			text(
+				"UPDATE inbound_messages SET status = 'RESPONDED', responded_at = NOW(), "
+				"mailbox_id = :mailbox_id WHERE id = :id"
+			),
+			{"id": inbound_id, "mailbox_id": mailbox.mailbox_id},
 		)
 		_shared_log_event(
 			client_id,
@@ -2004,7 +2076,11 @@ async def _handle_ink_campaign_decision(
 
     # Decrement Cora's approval backlog counter
     from src.agents.cora.throttle import notify_approval_resolved
-    notify_approval_resolved()
+    # Code-review fix (PR #50, finding 7): same reasoning as
+    # _finalize_terminal_decision above — pass this specific draft's own
+    # work_order_id so an unrelated resolution never corrupts a different,
+    # still-unreviewed Cora draft's age entry.
+    notify_approval_resolved(work_order_id)
 
 
 @app.action("approve_ink_campaign")
@@ -2055,7 +2131,21 @@ async def handle_app_mention(event: dict, say) -> None:
     "reuse existing architecture" rule); this is a deliberately small,
     read-only first router, not the full macro-query surface implied by the
     blueprint's "command & intent dispatcher" language — see the module's
-    task-analysis plan for what's explicitly out of scope."""
+    task-analysis plan for what's explicitly out of scope.
+
+    Code-review fix (Important): this handler returns platform-wide pipeline
+    volume/engagement numbers and operational halt reasons/issuer identities
+    — the same class of sensitive, cross-tenant information every other
+    consequential action in this file gates on approver_authorized(). No
+    client_id scoping applies here (this is a genuinely platform-wide query,
+    same posture as /blackink-halt status's own bare approver_authorized(user_id)
+    call), so any unauthorized workspace member who could previously mention
+    the bot and read this now gets a plain rejection instead."""
+    user_id = event.get("user", "")
+    if not approver_authorized(user_id):
+        await say(text=":no_entry: Not authorized to query pipeline data.", thread_ts=event.get("thread_ts") or event.get("ts"))
+        return
+
     text_content = _mention_text_without_bot_id(event)
     thread_ts = event.get("thread_ts") or event.get("ts")
 

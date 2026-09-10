@@ -28,6 +28,9 @@ def _stub_unsubscribe():
         # above: pixel_url() needs EMAIL_TRACKING_SECRET configured, which
         # this suite deliberately never sets.
         patch("src.services.sequence_orchestrator.pixel_url", return_value="https://app.example.com/pixel?token=p"),
+        # Code-review fix (PR #50): dispatch_touch() now validates the
+        # tracking secret before claim_touch() — stub it the same way.
+        patch("src.services.sequence_orchestrator.assert_tracking_configured"),
     ):
         yield
 

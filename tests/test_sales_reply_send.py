@@ -47,13 +47,16 @@ def _inbound_row(*, status="PENDING", contact_id=7, sender_email="prospect@examp
     )
 
 
-def _fake_session(*, inbound_row, opted_out=False):
+def _fake_session(*, inbound_row, opted_out=False, claim_succeeds=True):
     session = MagicMock()
 
     def _execute(stmt, params=None, *a, **kw):
         sql = str(stmt)
         result = MagicMock()
-        if "FROM inbound_messages WHERE id" in sql:
+        if "SET status = 'SENDING'" in sql:
+            # Code-review fix (PR #50, finding 5): the atomic pre-send claim.
+            result.first.return_value = SimpleNamespace(id=inbound_row.id) if claim_succeeds else None
+        elif "FROM inbound_messages WHERE id" in sql:
             result.first.return_value = inbound_row
         elif "FROM contacts WHERE contact_id" in sql:
             result.first.return_value = SimpleNamespace(is_opted_out=opted_out)
@@ -125,6 +128,10 @@ def test_reply_send_success_emails_prospect_marks_responded_and_posts_thread():
     # Marked RESPONDED — mailbox_dispatcher's rolling-24h cap subquery counts this.
     responded_calls = [c for c in session.execute.call_args_list if "SET status = 'RESPONDED'" in str(c.args[0])]
     assert len(responded_calls) == 1
+    # Code-review fix (PR #50): mailbox_id must be persisted on the same
+    # UPDATE, or the per-mailbox cap subquery (im.mailbox_id = m.id) never
+    # matches this row and the send silently never counts toward the cap.
+    assert responded_calls[0].args[1]["mailbox_id"] == _mailbox().mailbox_id
     assert mock_log.call_args.args[1] == "sales_reply_sent"
     client.chat_postMessage.assert_awaited_once()
     assert "sent" in client.chat_postMessage.await_args.kwargs["text"].lower()
@@ -162,6 +169,61 @@ def test_reply_send_is_idempotent_on_already_responded():
     client.chat_postMessage.assert_not_awaited()
     ack.assert_awaited_once()
     assert ack.await_args.kwargs.get("response_action") == "errors"
+
+
+def test_reply_send_race_loses_atomic_claim_never_sends_twice():
+    """Code-review fix (Important, PR #50, finding 5): the plain
+    `row.status == "RESPONDED"` check above only catches a race that has
+    ALREADY completed — it can't catch two near-simultaneous submits both
+    reading PENDING before either writes. This proves the real fix: even
+    with a fresh PENDING row, a lost atomic claim (simulating a concurrent
+    second submit that flipped it first) must block the send exactly like
+    an already-RESPONDED row does."""
+    row = _inbound_row(status="PENDING")
+    session = _fake_session(inbound_row=row, claim_succeeds=False)
+    client = AsyncMock()
+    body, view = _submit_body()
+    ack = AsyncMock()
+
+    fake_sender = MagicMock()
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.get_active_mailbox_for_client", return_value=_mailbox()), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender):
+        _run(handle_reply_thread_modal_submit(ack=ack, body=body, view=view, client=client))
+
+    fake_sender.send.assert_not_called()
+    client.chat_postMessage.assert_not_awaited()
+    assert ack.await_args.kwargs.get("response_action") == "errors"
+
+
+def test_reply_send_release_claim_on_send_failure_allows_retry():
+    """A transient SMTP failure must release the claim back to its
+    pre-claim status, not strand the row on SENDING forever — a stuck
+    SENDING row would block every future retry, including a genuinely
+    later, successful one."""
+    row = _inbound_row(status="PENDING")
+    session = _fake_session(inbound_row=row)
+    body, view = _submit_body()
+    ack = AsyncMock()
+
+    fake_sender = MagicMock()
+    fake_sender.send.side_effect = RuntimeError("smtp timeout")
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.get_active_mailbox_for_client", return_value=_mailbox()), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender), \
+         patch("src.services.slack.listeners.unsubscribe_url", return_value="https://x/unsub"), \
+         patch("src.services.slack.listeners.append_unsubscribe_footer", side_effect=lambda b, u: b):
+        _run(handle_reply_thread_modal_submit(ack=ack, body=body, view=view, client=AsyncMock()))
+
+    assert ack.await_args.kwargs.get("response_action") == "errors"
+    release_calls = [
+        c for c in session.execute.call_args_list
+        if "UPDATE inbound_messages SET status = :status" in str(c.args[0])
+    ]
+    assert len(release_calls) == 1
+    assert release_calls[0].args[1] == {"id": "inbound-1", "status": "PENDING"}
 
 
 def test_reply_send_blocked_for_opted_out_contact():
@@ -230,6 +292,12 @@ def test_book_meeting_sends_real_link_when_resolved():
     assert mock_log.call_args.args[1] == "sales_meeting_link_sent"
     respond.assert_awaited_once()
     assert "sent" in respond.await_args.kwargs["text"].lower()
+    # Code-review fix (PR #50): same mailbox_id persistence as reply-send —
+    # otherwise Book Meeting sends silently never count toward the per-
+    # mailbox rolling-24h cap either.
+    responded_calls = [c for c in session.execute.call_args_list if "SET status = 'RESPONDED'" in str(c.args[0])]
+    assert len(responded_calls) == 1
+    assert responded_calls[0].args[1]["mailbox_id"] == _mailbox().mailbox_id
 
 
 def test_book_meeting_fails_visibly_when_no_default_connection_flagged():
@@ -252,6 +320,32 @@ def test_book_meeting_fails_visibly_when_no_default_connection_flagged():
     fake_sender.send.assert_not_called()
     respond.assert_awaited_once()
     assert "no default sales-booking" in respond.await_args.kwargs["text"].lower()
+
+
+def test_book_meeting_double_click_sends_exactly_once():
+    """Code-review fix (Critical->Important, PR #50, finding 5):
+    handle_book_meeting() previously had NO idempotency check at all — a
+    replayed or double-clicked action sent a second booking email every
+    time. This proves a lost claim (the second of two racing clicks)
+    blocks the send instead of dispatching a duplicate."""
+    row = _inbound_row(status="PENDING")
+    session = _fake_session(inbound_row=row, claim_succeeds=False)
+    respond = AsyncMock()
+    action = {"value": json.dumps({"inbound_id": "inbound-1", "contact_id": 7, "client_id": "acme_pm"})}
+    body = {"user": {"id": "U1"}}
+    fake_sender = MagicMock()
+    fake_link = SimpleNamespace(url="https://cal.example.com/book/rep", prefilled=False)
+
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.resolve_booking_link", return_value=fake_link), \
+         patch("src.services.slack.listeners.get_active_mailbox_for_client", return_value=_mailbox()), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender):
+        _run(handle_book_meeting(ack=AsyncMock(), body=body, respond=respond, action=action))
+
+    fake_sender.send.assert_not_called()
+    respond.assert_awaited_once()
+    assert "already sent" in respond.await_args.kwargs["text"].lower()
 
 
 def test_book_meeting_rejects_unauthorized_user():

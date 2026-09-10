@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.services.compliance_gate import evaluate_touch_gate
 from src.services.email_sender import EmailSender, build_email_sender
-from src.services.email_tracking import html_body_with_pixel, pixel_url
+from src.services.email_tracking import assert_tracking_configured, html_body_with_pixel, pixel_url
 from src.services.email_unsubscribe import append_unsubscribe_footer, unsubscribe_url
 from src.services.mailbox_dispatcher import (
     AllMailboxesCapped,
@@ -113,6 +113,15 @@ def dispatch_touch(
     except NoMailboxAvailable as exc:
         logger.error("sequence_orchestrator: no mailbox for client_id=%s — %s", client_id, exc)
         return TouchResult(contact_id=contact.contact_id, touch_step=touch_step, outcome="NO_MAILBOX")
+
+    # Code-review fix (Important, PR #50): validate the tracking secret is
+    # configured BEFORE claim_touch() commits a SENDING row — pixel_url()
+    # below needs dispatch_id (only available after the claim), but the
+    # secret itself doesn't, so checking it now means a missing secret
+    # fails here, before any durable state exists, instead of stranding an
+    # already-committed SENDING dispatch with no except around the failure
+    # and a UNIQUE claim that blocks any retry.
+    assert_tracking_configured()
 
     # Look up the prior touch's Message-ID so email clients thread the reply.
     # Done BEFORE the claim commit so it shares the RLS-scoped read transaction.

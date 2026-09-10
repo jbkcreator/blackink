@@ -20,11 +20,24 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _mention_event(text: str, thread_ts=None):
-    event = {"text": f"<@U0BOTID> {text}", "ts": "1700000000.0001"}
+def _mention_event(text: str, thread_ts=None, user="U_APPROVER"):
+    event = {"text": f"<@U0BOTID> {text}", "ts": "1700000000.0001", "user": user}
     if thread_ts:
         event["thread_ts"] = thread_ts
     return event
+
+
+@pytest.fixture(autouse=True)
+def _authorized_by_default():
+    """Code-review fix (Important, PR #50, finding 1): every test below
+    exercises what an AUTHORIZED user sees — the dedicated rejection test
+    overrides this explicitly. Without this check at all, any workspace
+    member who could mention the bot could read platform-wide pipeline
+    volume/engagement numbers and operational halt reasons/issuer
+    identities — the same class of cross-tenant/sensitive data every other
+    consequential action in this file already gates on approver_authorized()."""
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True):
+        yield
 
 
 @pytest.mark.parametrize("keyword", ["pipeline", "digest", "status", "numbers", "metrics", "PIPELINE"])
@@ -95,3 +108,28 @@ def test_mention_with_no_text_after_bot_id_gets_help():
     say = AsyncMock()
     _run(handle_app_mention({"text": "<@U0BOTID>", "ts": "1700000000.0003"}, say))
     assert "I understand" in say.await_args.kwargs["text"]
+
+
+def test_unauthorized_user_is_rejected_before_any_digest_or_halt_query():
+    """Code-review fix (Important, PR #50, finding 1): an unauthorized
+    workspace member mentioning the bot must be rejected outright — never
+    reach the digest computation or the halt-service query, regardless of
+    which keyword they use."""
+    say = AsyncMock()
+    with patch("src.services.slack.listeners.approver_authorized", return_value=False), \
+         patch("src.tasks.daily_digest.build_digest_text") as mock_build, \
+         patch("src.services.slack.listeners.halt_service.get_active_halts") as mock_halts:
+        _run(handle_app_mention(_mention_event("pipeline"), say))
+    mock_build.assert_not_called()
+    mock_halts.assert_not_called()
+    say.assert_awaited_once()
+    assert "not authorized" in say.await_args.kwargs["text"].lower()
+
+
+def test_unauthorized_user_rejected_for_halt_query_too():
+    say = AsyncMock()
+    with patch("src.services.slack.listeners.approver_authorized", return_value=False), \
+         patch("src.services.slack.listeners.halt_service.get_active_halts") as mock_halts:
+        _run(handle_app_mention(_mention_event("halt status"), say))
+    mock_halts.assert_not_called()
+    assert "not authorized" in say.await_args.kwargs["text"].lower()

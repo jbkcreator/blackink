@@ -10,12 +10,33 @@ Three Redis keys govern the throttle:
                            waiting for a Slack approval/rejection decision.
                            Incremented by notify_draft_queued(), decremented
                            by notify_approval_resolved().
-  cora:approval:queued_at — LIST, FIFO, oldest at index 0: one timestamp
-                           (str(time.time())) pushed per notify_draft_queued()
-                           call, popped per notify_approval_resolved() call.
-                           Never itself the source of the pause decision —
-                           is_auto_paused() reads only its HEAD, live, on
-                           every call.
+  cora:approval:queued_at — ZSET, member=draft_id, score=queued-at timestamp:
+                           one entry ZADDed per notify_draft_queued(draft_id)
+                           call, ZREMed by notify_approval_resolved(draft_id)
+                           when that SAME draft_id resolves. Never itself the
+                           source of the pause decision — is_auto_paused()
+                           reads only its lowest-score member, live, on every
+                           call.
+
+                           Code-review fix (PR #50, finding 7): this was
+                           previously a plain FIFO LIST with no identity —
+                           notify_approval_resolved() always popped whatever
+                           was at the head, regardless of which draft
+                           actually resolved. notify_approval_resolved() is
+                           called from more than one Slack decision handler,
+                           including a GENERIC work-order handler used for
+                           approval types that have nothing to do with Cora
+                           — an unrelated approval could therefore remove the
+                           timestamp for a still-unreviewed Cora draft,
+                           silently preventing the 24h pause from ever
+                           triggering for it. A ZSET keyed by the resolving
+                           order's own action_id makes this self-correcting
+                           without the caller needing to know whether a given
+                           order is actually a Cora draft: ZREM on an
+                           action_id that was never ZADDed by Cora's own
+                           worker (i.e. any non-Cora approval) is a normal,
+                           documented Redis no-op — it removes nothing,
+                           rather than corrupting an unrelated entry.
   cora:auto_paused       — presence-flag (value "1"): set when pending count
                            reaches DRAFT_QUEUE_CAPACITY, cleared when it falls
                            below RESUME_THRESHOLD. Governs ONLY the count
@@ -89,21 +110,22 @@ def approval_pending_count() -> int:
 
 def _oldest_queued_age_seconds() -> Optional[float]:
     """Age in seconds of the earliest still-outstanding queued draft (the
-    head of the FIFO list), or None if the list is empty or Redis is
-    unreachable/the stored value is corrupt. None means "no age-based pause
-    condition detected" — same fail-open posture is_auto_paused() already
-    documents for this automatic (non-compliance) guard."""
+    lowest-score member of the ZSET), or None if the set is empty or Redis
+    is unreachable/the stored value is corrupt. None means "no age-based
+    pause condition detected" — same fail-open posture is_auto_paused()
+    already documents for this automatic (non-compliance) guard."""
     try:
-        raw = get_redis_client().lindex(_QUEUED_AT_KEY, 0)
+        oldest = get_redis_client().zrange(_QUEUED_AT_KEY, 0, 0, withscores=True)
     except Exception as exc:
         logger.error("cora.throttle: failed to read oldest-queued timestamp: %s", exc)
         return None
-    if raw is None:
+    if not oldest:
         return None
+    _member, score = oldest[0]
     try:
-        return time.time() - float(raw)
+        return time.time() - float(score)
     except (TypeError, ValueError) as exc:
-        logger.error("cora.throttle: corrupt oldest-queued timestamp %r: %s", raw, exc)
+        logger.error("cora.throttle: corrupt oldest-queued score %r: %s", score, exc)
         return None
 
 
@@ -204,17 +226,23 @@ def _maybe_resume(count: int) -> None:
 
 # ── Event hooks (called by the worker / Slack bot) ────────────────────────────
 
-def notify_draft_queued() -> int:
+def notify_draft_queued(draft_id: str) -> int:
     """Call when a draft has been generated and sent to Slack for review.
 
-    Increments the approval backlog counter and pushes this draft's
-    queued-at timestamp onto the age-tracking FIFO list ATOMICALLY (a Redis
-    pipeline, not two independent calls) — code-review finding: two
-    separate calls left a crash window where a process death between them
-    permanently orphaned the counter and the FIFO list against each other
-    (the counter says N pending but only N-1 are ever tracked for
-    staleness, forever — nothing later re-syncs them). A pipeline closes
-    that window; either both writes land or neither does.
+    Increments the approval backlog counter and adds this draft's
+    queued-at timestamp to the age-tracking ZSET, keyed by draft_id,
+    ATOMICALLY (a Redis pipeline, not two independent calls) — code-review
+    finding: two separate calls left a crash window where a process death
+    between them permanently orphaned the counter and the ZSET against
+    each other (the counter says N pending but only N-1 are ever tracked
+    for staleness, forever — nothing later re-syncs them). A pipeline
+    closes that window; either both writes land or neither does.
+
+    `draft_id` must be a stable identifier for this specific draft (its
+    work order's own action_id) — notify_approval_resolved() uses the SAME
+    id to remove exactly this entry when it resolves, not whatever happens
+    to be oldest (see module docstring, PR #50 finding 7).
+
     Then enforces the count-based capacity trigger (the age trigger needs
     no enforcement call here — it is computed live by is_auto_paused() on
     every read; see module docstring). Returns the new count, or -1 on
@@ -224,7 +252,7 @@ def notify_draft_queued() -> int:
         r = get_redis_client()
         pipe = r.pipeline()
         pipe.incr(_PENDING_KEY)
-        pipe.rpush(_QUEUED_AT_KEY, str(time.time()))
+        pipe.zadd(_QUEUED_AT_KEY, {draft_id: time.time()})
         count, _ = pipe.execute()
         _check_capacity(count)
         return count
@@ -233,36 +261,44 @@ def notify_draft_queued() -> int:
         return -1
 
 
-def notify_approval_resolved() -> int:
+def notify_approval_resolved(draft_id: Optional[str] = None) -> int:
     """Call when an operator approves or rejects a draft in Slack (Dev 3).
 
-    Decrements the approval backlog counter and pops the OLDEST entry off
-    the age-tracking FIFO list ATOMICALLY (a Redis pipeline) — same
-    crash-window fix as notify_draft_queued(), and the more dangerous
-    direction of the two: an unpaired DECR-without-LPOP left one phantom
-    timestamp in the list forever, and once THAT one crossed 24h,
-    is_auto_paused() would return True indefinitely — a full, non-self-
-    healing stop on all new Cora drafting with no real backlog behind it,
-    fixable only by a manual Redis LPOP/DEL. Lifts the count-based
-    auto-pause if the backlog has dropped below RESUME_THRESHOLD (the
-    age-based pause, if any, lifts on its own the moment the popped entry
-    was the stale one — see is_auto_paused()). Popping the head rather
-    than a specific identified entry is a deliberate best-effort
-    approximation: this function is called from more than one Slack
-    decision handler (some of them for approval types unrelated to Cora's
-    own drafts — see docs/plans/2026-09-10-s2-cora-24h-age-throttle.md
-    §2), so there is no reliable per-item identity to remove by; retiring
-    the oldest tracked entry on any resolution event bounds the list's
-    growth and self-corrects over time. LPOP on an already-empty list is a
-    safe no-op — the pipeline still executes cleanly.
-    Returns the new count (floor 0), or -1 on Redis error.
+    Decrements the approval backlog counter and removes the matching entry
+    from the age-tracking ZSET ATOMICALLY (a Redis pipeline) — same
+    crash-window fix as notify_draft_queued().
+
+    Code-review fix (PR #50, finding 7): this used to unconditionally pop
+    the OLDEST entry off a FIFO list, with no identity check. This function
+    is called from more than one Slack decision handler, including a
+    GENERIC work-order handler used for approval types that have nothing
+    to do with Cora (see docs/plans/2026-09-10-s2-cora-24h-age-throttle.md
+    §2) — popping the head regardless of which draft actually resolved
+    meant an unrelated approval could silently remove the timestamp for a
+    still-unreviewed Cora draft, preventing its 24h pause from ever
+    triggering. Passing `draft_id` (the resolving order's own action_id)
+    fixes this: ZREM only removes that exact member, and is a safe no-op
+    if it was never ZADDed by Cora's own worker in the first place (i.e.
+    any non-Cora approval correctly touches nothing here). Callers that
+    genuinely cannot supply an id (none exist in this codebase currently,
+    but kept for backward compatibility) may omit it — the count still
+    decrements, but no ZSET entry is touched, which is the safe direction
+    (a stale entry lingering an extra cycle, never a wrongly-removed one).
+
+    Lifts the count-based auto-pause if the backlog has dropped below
+    RESUME_THRESHOLD (the age-based pause, if any, lifts on its own the
+    moment the matching entry is removed and it was the stale one — see
+    is_auto_paused()). Returns the new count (floor 0), or -1 on Redis
+    error.
     """
     try:
         r = get_redis_client()
         pipe = r.pipeline()
         pipe.decr(_PENDING_KEY)
-        pipe.lpop(_QUEUED_AT_KEY)
-        count, _ = pipe.execute()
+        if draft_id is not None:
+            pipe.zrem(_QUEUED_AT_KEY, draft_id)
+        results = pipe.execute()
+        count = results[0]
         if count < 0:
             r.set(_PENDING_KEY, "0")
             count = 0

@@ -51,6 +51,17 @@ def _secret() -> str:
     return secret.get_secret_value()
 
 
+def assert_tracking_configured() -> None:
+    """Code-review fix (Important, PR #50): raises the same RuntimeError as
+    _secret(), but meant to be called BEFORE a caller has committed any
+    durable state — sequence_orchestrator.dispatch_touch() previously only
+    discovered a missing secret via pixel_url() *after* claim_touch()'s
+    SENDING row was already committed, with no except around it, leaving
+    the dispatch permanently stranded (its UNIQUE claim blocks any retry).
+    Calling this first turns that into an ordinary, pre-claim failure."""
+    _secret()
+
+
 class PixelClaims(NamedTuple):
     client_id: str
     contact_id: int
