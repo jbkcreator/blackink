@@ -43,9 +43,10 @@ class _CountingSmsProvider(SmsProvider):
 
 
 class _FakeResult:
-    def __init__(self, row=None, scalar=None):
+    def __init__(self, row=None, scalar=None, fetchone=None):
         self._row = row
         self._scalar = scalar
+        self._fetchone = fetchone
 
     def one(self):
         return self._row
@@ -55,6 +56,9 @@ class _FakeResult:
 
     def scalar(self):
         return self._scalar
+
+    def fetchone(self):
+        return self._fetchone
 
 
 _NO_DISPATCH_ROWS = object()
@@ -89,12 +93,25 @@ class _FakeSession:
 
 
 class _FakeOutboxSession:
-    def __init__(self, insert_returns=1):
+    """D-7 fix: dispatch_sms() now also queries the events ledger on this
+    same outbox session (cold_sms_gate.get_inbound_sms_count()/
+    get_booked_appointment_id()) for the sms_dispatch_log audit-snapshot
+    columns, before its own INSERT — branch on SQL text so both shapes get
+    a sane fetchone() response distinct from the INSERT's scalar()."""
+
+    def __init__(self, insert_returns=1, inbound_sms_count=1, booked_appointment_id=None):
         self._insert_returns = insert_returns
+        self._inbound_sms_count = inbound_sms_count
+        self._booked_appointment_id = booked_appointment_id
         self.executed = []
 
     def execute(self, stmt, params=None):
-        self.executed.append((str(stmt), params))
+        sql = str(stmt)
+        self.executed.append((sql, params))
+        if "FROM events" in sql and "COUNT(*)" in sql:
+            return _FakeResult(fetchone=(self._inbound_sms_count,))
+        if "FROM events" in sql and "SELECT id" in sql:
+            return _FakeResult(fetchone=(self._booked_appointment_id,) if self._booked_appointment_id else None)
         return _FakeResult(scalar=self._insert_returns)
 
 

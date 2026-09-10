@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from sqlalchemy import text
 
 from config.settings import get_settings
+from src.agents.vera.health_gate import evaluate_settlement_health
 from src.core.database import get_system_db_context
 from src.services.billing.dispute_credit import (
 	DisputeWindowExpiredError,
@@ -26,6 +27,20 @@ from src.services.billing.miss_credit import claim_missed_acks, process_missed_a
 from src.services.billing.sit_invoice import charge_sit_for_appointment
 
 logger = logging.getLogger(__name__)
+
+
+def _halt_if_unhealthy(sweep_name: str) -> bool:
+	"""S-1 (W0 §3.0.2 A) — called FIRST in every sweep below, before opening
+	this module's own get_system_db_context() or making any Stripe call.
+	Returns True if the sweep must stop now. See
+	src/agents/vera/health_gate.py's module docstring for what counts as a
+	halting state (ABSTAIN / NO_HEALTH_RUN / STALE_HEALTH_RUN — UNKNOWN does
+	NOT halt)."""
+	decision = evaluate_settlement_health()
+	if not decision.ok:
+		logger.warning("billing_sweep.%s: HALTED by Vera health gate — %s", sweep_name, decision.detail)
+		return True
+	return False
 
 
 def run_miss_credit_sweep(limit: int = 100, *, claim_time: datetime | None = None) -> int:
@@ -42,6 +57,8 @@ def run_miss_credit_sweep(limit: int = 100, *, claim_time: datetime | None = Non
 			"acked_at is not yet written by any automated-ack sender, so this sweep would treat "
 			"every unclassified message as a miss. Skipping."
 		)
+		return 0
+	if _halt_if_unhealthy("run_miss_credit_sweep"):
 		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	credited = 0
@@ -79,6 +96,8 @@ def run_dispute_credit_sweep(limit: int = 100, *, claim_time: datetime | None = 
 	everything else since the savepoint, no matter how it's nested inside
 	credit_dispute_on_flag itself — the write can only survive by not being
 	inside a savepoint that gets rolled back at all."""
+	if _halt_if_unhealthy("run_dispute_credit_sweep"):
+		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	credited = 0
 	with get_system_db_context() as session:
@@ -106,6 +125,8 @@ def run_dispute_credit_sweep(limit: int = 100, *, claim_time: datetime | None = 
 
 
 def run_guarantee_sweep(limit: int = 100, *, claim_time: datetime | None = None) -> int:
+	if _halt_if_unhealthy("run_guarantee_sweep"):
+		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	applied = 0
 	with get_system_db_context() as session:
@@ -148,6 +169,8 @@ def run_sit_invoice_sweep(limit: int = 100, *, claim_time: datetime | None = Non
 	    docstring for the full reasoning on both.
 	Any OTHER (future) block reason stays excluded until its own condition
 	is added here, same fail-closed posture as today."""
+	if _halt_if_unhealthy("run_sit_invoice_sweep"):
+		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	invoiced = 0
 	with get_system_db_context() as session:

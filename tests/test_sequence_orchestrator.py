@@ -23,6 +23,10 @@ def _stub_unsubscribe():
     with (
         patch("src.services.sequence_orchestrator.unsubscribe_url", return_value="https://app.example.com/unsub?token=t"),
         patch("src.services.sequence_orchestrator.append_unsubscribe_footer", side_effect=lambda body, url: body),
+        # S-8's tracking pixel — same reasoning as the unsubscribe stub
+        # above: pixel_url() needs EMAIL_TRACKING_SECRET configured, which
+        # this suite deliberately never sets.
+        patch("src.services.sequence_orchestrator.pixel_url", return_value="https://app.example.com/pixel?token=p"),
     ):
         yield
 
@@ -311,6 +315,28 @@ def test_supplied_content_is_sent_verbatim():
         )
     assert sender.calls[0]["subject"] == "Approved subject"
     assert sender.calls[0]["body"] == "Approved body"
+
+
+def test_html_body_with_pixel_is_passed_to_sender():
+    """S-8 — dispatch_touch must pass html_body= to sender.send() so a
+    tracking pixel can be embedded; previously omitted entirely."""
+    session = MagicMock()
+    sender = _Sender()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+    ):
+        dispatch_touch(
+            session, _contact(), "client_a", touch_step=1, run_id="run-1", sender=sender,
+            subject="Approved subject", body="Approved body",
+        )
+    html_body = sender.calls[0]["html_body"]
+    assert html_body is not None
+    assert "https://app.example.com/pixel?token=p" in html_body
+    assert "Approved body" in html_body
 
 
 # ---------------------------------------------------------------------------

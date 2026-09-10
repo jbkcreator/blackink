@@ -6,24 +6,12 @@ name: Compliance gates (Dev 4)
 # causes the build to fail before merge.
 
 on:
-  pull_request:
-    paths:
-      - "src/services/cold_sms_gate.py"
-      - "src/services/sms_quiet_hours.py"
-      - "src/services/outbound_templates.py"
-      - "src/services/email_suppression.py"
-      - "src/services/mailbox_dispatcher.py"
-      - "src/services/audit_report.py"
-      - "src/tasks/dnc_refresh.py"
-      - "config/prompt_variants.py"
-      - "tests/test_cold_sms_gate.py"
-      - "tests/test_sms_quiet_hours.py"
-      - "tests/test_outbound_templates.py"
-      - "tests/test_email_suppression.py"
-      - "tests/test_mailbox_dispatcher.py"
-      - "tests/test_audit_report.py"
-      - "tests/test_dnc_refresh.py"
-      - "tests/test_prompt_variants.py"
+  # Deliberately unfiltered (Dev Item D-6, audit 2026-09-10): an earlier
+  # path filter here only ran this gate on 8 named files, so a PR adding a
+  # new SMS send path elsewhere (e.g. src/services/sms_dispatch.py's own
+  # readiness-check wiring, the exact class of bug D-7 fixed) would never
+  # trigger it. Matches tests.yml's own unfiltered "every PR" posture.
+  pull_request: {}
   push:
     branches:
       - main

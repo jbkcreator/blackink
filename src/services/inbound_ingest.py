@@ -12,9 +12,8 @@ All DB access uses sqlalchemy.text() with named binds.
 
 from __future__ import annotations
 
-import json
+import hashlib
 import logging
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -22,6 +21,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from src.core.database import get_system_db_context
+from src.services.events import already_logged_for_dispatch, log_event
 from src.services.inbound_attribution import (
     attribute,
     is_bcc_echo,
@@ -34,6 +34,16 @@ from src.services.slack.listeners import sales_reply_content_blocks
 from src.services.stl_cadence import stop_active_stl_cadences
 
 logger = logging.getLogger(__name__)
+
+
+def _idempotency_key(destination_address: str, original_message_id: str) -> str:
+    """Same derivation as src/api/inbound_router.py's own helper — kept as a
+    separate copy rather than a shared import because that module's version
+    is private (leading underscore, not meant as a public API) and this repo
+    has no third shared home for it yet; both must stay byte-for-byte
+    identical since they key the SAME UNIQUE(idempotency_key) constraint."""
+    raw = f"{destination_address}:{original_message_id}"
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 @dataclass
@@ -91,12 +101,25 @@ async def ingest_inbound_reply(parsed: InboundParsed) -> dict:
             )
             return {"status": "discarded", "reason": "bcc_echo"}
 
+        # Dedup key matches src/api/inbound_router.py's own derivation exactly
+        # (see _idempotency_key's docstring) — this is the actual UNIQUE
+        # constraint on inbound_messages (uq_inbound_messages_idempotency),
+        # not a UNIQUE on original_message_id alone. Bug fix (found during
+        # S-8/S-11 task-analysis): this function previously deduped and
+        # inserted against column names (message_id/from_address/to_alias/
+        # raw_body) and a manually-assigned UUID `id` that do not exist on
+        # the real table (BIGSERIAL id; original_message_id/sender_email/
+        # destination_address/body_text instead) — every call would have
+        # raised UndefinedColumn against a real Postgres. Fixed to the real
+        # schema; see docs/plans/2026-09-10-s8-s11-tracking-and-reply-send.md
+        # "Shared blocking prerequisite".
+        idem_key = _idempotency_key(parsed.to_alias, parsed.inbound_message_id)
         existing = session.execute(
-            text("SELECT id FROM inbound_messages WHERE message_id = :mid LIMIT 1"),
-            {"mid": parsed.inbound_message_id},
+            text("SELECT id FROM inbound_messages WHERE idempotency_key = :key LIMIT 1"),
+            {"key": idem_key},
         ).first()
         if existing is not None:
-            logger.info("[inbound_ingest] duplicate message_id — already stored, no-op")
+            logger.info("[inbound_ingest] duplicate idempotency_key — already stored, no-op")
             return {"status": "discarded", "reason": "duplicate"}
 
         result = attribute(
@@ -106,65 +129,112 @@ async def ingest_inbound_reply(parsed: InboundParsed) -> dict:
             from_address=from_address,
         )
 
-        inbound_id = str(uuid.uuid4())
-        try:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO inbound_messages
-                        (id, message_id, client_id, contact_id, run_id,
-                         from_address, to_alias, in_reply_to, subject, raw_body,
-                         attribution_status, received_at)
-                    VALUES
-                        (:id, :message_id, :client_id, :contact_id, :run_id,
-                         :from_address, :to_alias, :in_reply_to, :subject, :raw_body,
-                         :attribution_status, :received_at)
-                    """
-                ),
-                {
-                    "id": inbound_id,
-                    "message_id": parsed.inbound_message_id,
-                    "client_id": result.client_id,
-                    "contact_id": result.contact_id,
-                    "run_id": result.run_id,
-                    "from_address": from_address,
-                    "to_alias": parsed.to_alias,
-                    "in_reply_to": parsed.in_reply_to,
-                    "subject": parsed.subject,
-                    "raw_body": parsed.raw_body,
-                    "attribution_status": result.attribution_status,
-                    "received_at": received_at,
-                },
-            )
-        except Exception:
-            # UNIQUE(message_id) race between the dedup read above and this insert.
-            logger.warning("[inbound_ingest] INSERT conflict on message_id — concurrent duplicate")
-            return {"status": "discarded", "reason": "duplicate_race"}
-
-        session.execute(
+        inserted = session.execute(
             text(
-                "INSERT INTO events (client_id, event_type, entity_type, entity_id, actor, payload) "
-                "VALUES (:client_id, 'inbound_reply_received', 'inbound_message', :entity_id, 'mailgun_inbound', :payload)"
+                """
+                INSERT INTO inbound_messages
+                    (client_id, idempotency_key, destination_address, original_message_id,
+                     contact_id, run_id, sender_email, in_reply_to, subject, body_text,
+                     attribution_status, received_at)
+                VALUES
+                    (:client_id, :idempotency_key, :destination_address, :original_message_id,
+                     :contact_id, :run_id, :sender_email, :in_reply_to, :subject, :body_text,
+                     :attribution_status, :received_at)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                RETURNING id
+                """
             ),
             {
                 "client_id": result.client_id,
-                "entity_id": inbound_id,
-                "payload": json.dumps(
-                    {
-                        "inbound_id": inbound_id,
-                        "message_id": parsed.inbound_message_id,
-                        "from_address": from_address,
-                        "attribution_status": result.attribution_status,
-                        "contact_id": result.contact_id,
-                        "run_id": result.run_id,
-                        "channel": "email",
-                        "raw_body": parsed.raw_body,
-                    }
-                ),
+                "idempotency_key": idem_key,
+                "destination_address": parsed.to_alias,
+                "original_message_id": parsed.inbound_message_id,
+                "contact_id": result.contact_id,
+                "run_id": result.run_id,
+                "sender_email": from_address,
+                "in_reply_to": parsed.in_reply_to,
+                "subject": parsed.subject,
+                "body_text": parsed.raw_body,
+                "attribution_status": result.attribution_status,
+                "received_at": received_at,
             },
+        ).first()
+        if inserted is None:
+            # ON CONFLICT DO NOTHING fired — a concurrent duplicate raced the
+            # dedup read above and won the insert. Not an error, just a no-op,
+            # same outcome as the pre-existing `existing is not None` branch.
+            logger.warning("[inbound_ingest] INSERT conflict on idempotency_key — concurrent duplicate")
+            return {"status": "discarded", "reason": "duplicate_race"}
+        # `id` is BIGSERIAL, not the UUID this code used to assume — keep the
+        # real int for any query comparing against the bigint column
+        # (_recent_thread's exclude_id), and a str only for JSON/Slack/log
+        # contexts (a bigint compared against a text bind has no implicit
+        # cast in Postgres and would raise).
+        inbound_id_int = inserted.id
+        inbound_id = str(inbound_id_int)
+
+        # Single write path for `events` (src/services/events.py's own
+        # invariant) — this call site used to INSERT raw SQL directly; folded
+        # onto log_event() while fixing the column-mismatch bug above rather
+        # than leaving one old-style and one new-style events write
+        # side by side in the same function.
+        log_event(
+            result.client_id,
+            "inbound_reply_received",
+            entity_type="inbound_message",
+            entity_id=inbound_id,
+            payload={
+                "inbound_id": inbound_id,
+                "original_message_id": parsed.inbound_message_id,
+                "sender_email": from_address,
+                "attribution_status": result.attribution_status,
+                "contact_id": result.contact_id,
+                "run_id": result.run_id,
+                "channel": "email",
+            },
+            actor="mailgun_inbound",
+            session=session,
         )
 
-        thread_lines = _recent_thread(session, contact_id=result.contact_id, run_id=result.run_id, exclude_id=inbound_id)
+        # S-8 — email_replied, ONLY for a Tier-1 (message-id/In-Reply-To)
+        # attributed reply, which is the only case with a resolvable
+        # dispatch_id to attribute the reply to. A Tier-2 (sender-email-only)
+        # match still posts to #sales-replies as usual, above — it just
+        # doesn't count toward the digest's reply-rate metric, since there is
+        # no specific outbound send to credit it against. See
+        # docs/plans/2026-09-10-s8-s11-tracking-and-reply-send.md's S-8
+        # section for why this is a stated scope line, not a silent gap.
+        if result.run_id and result.touch_step:
+            dispatch_row = session.execute(
+                text(
+                    "SELECT dispatch_id FROM sequence_touch_dispatches "
+                    "WHERE run_id = :run_id AND touch_step = :touch_step AND status = 'SENT'"
+                ),
+                {"run_id": result.run_id, "touch_step": result.touch_step},
+            ).first()
+            if dispatch_row is not None:
+                dispatch_id = str(dispatch_row.dispatch_id)
+                # Code-review fix: a prospect replying more than once to the
+                # SAME touch (two separate inbound_messages rows, each its
+                # own idempotency_key, both Tier-1 attributed to this
+                # dispatch_id) would otherwise double-count toward
+                # daily_digest.py's reply_rate_pct — the exact class of
+                # inflation email_opened/email_clicked already guard
+                # against. Shared helper + a real DB-level partial unique
+                # index (migrations/apply_events_dispatch_dedup_index.py)
+                # back this the same way for all three event types.
+                if not already_logged_for_dispatch(session, result.client_id, "email_replied", dispatch_id):
+                    log_event(
+                        result.client_id,
+                        "email_replied",
+                        entity_type="contact",
+                        entity_id=str(result.contact_id),
+                        payload={"dispatch_id": dispatch_id},
+                        actor="mailgun_inbound",
+                        session=session,
+                    )
+
+        thread_lines = _recent_thread(session, contact_id=result.contact_id, run_id=result.run_id, exclude_id=inbound_id_int)
         ovs_lines = ovs_card_lines(fetch_latest_ovs(session, result.firm_company_id))
 
         session.commit()
@@ -209,16 +279,18 @@ async def ingest_inbound_reply(parsed: InboundParsed) -> dict:
 
     logger.info(
         "[inbound_ingest] stored inbound_id=%s attribution=%s",
-        inbound_id[:8],
+        inbound_id,
         result.attribution_status,
     )
     return {"status": "ok", "inbound_id": inbound_id}
 
 
-def _recent_thread(session, *, contact_id, run_id, exclude_id) -> list[str]:
+def _recent_thread(session, *, contact_id, run_id, exclude_id: int) -> list[str]:
     """Last 3 messages for this contact's thread (v2 §3.1.3): prior inbound
     replies plus our own outbound touches, newest-first, rendered as card lines.
-    Empty when the reply is unattributed (no contact to gather a thread for)."""
+    Empty when the reply is unattributed (no contact to gather a thread for).
+    exclude_id is the real BIGINT inbound_messages.id (not a string) — see
+    ingest_inbound_reply's own comment on why that distinction matters here."""
     if not contact_id:
         return []
 
@@ -226,14 +298,14 @@ def _recent_thread(session, *, contact_id, run_id, exclude_id) -> list[str]:
 
     inbound = session.execute(
         text(
-            "SELECT received_at, subject, raw_body FROM inbound_messages "
+            "SELECT received_at, subject, body_text FROM inbound_messages "
             "WHERE contact_id = :cid AND id <> :exclude "
             "ORDER BY received_at DESC LIMIT 3"
         ),
         {"cid": contact_id, "exclude": exclude_id},
     ).mappings().all()
     for r in inbound:
-        snippet = (r["raw_body"] or r["subject"] or "").strip().replace("\n", " ")[:80]
+        snippet = (r["body_text"] or r["subject"] or "").strip().replace("\n", " ")[:80]
         events.append((r["received_at"], f"⬅️ _{r['received_at']:%b %d}_ — {snippet}"))
 
     if run_id:

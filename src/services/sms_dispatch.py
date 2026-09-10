@@ -114,6 +114,7 @@ from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context
 from src.services.campaign_readiness_gate import evaluate_full_readiness
+from src.services.cold_sms_gate import get_booked_appointment_id, get_inbound_sms_count
 from src.services.compliance_gate import DncProvider
 
 _ELIGIBLE = "TRANSACTIONAL_SMS_ONLY"
@@ -239,13 +240,19 @@ def dispatch_sms(
         )
 
     contact = session.execute(
-        text(
-            "SELECT phone, inbound_sms_count, booked_appointment_id "
-            "FROM contacts WHERE contact_id = :contact_id"
-        ),
+        text("SELECT phone FROM contacts WHERE contact_id = :contact_id"),
         {"contact_id": contact_id},
     ).one()
 
+    # D-7 fix (audit 2026-09-10), same source of truth as
+    # campaign_readiness_gate.evaluate_full_readiness() above: the
+    # sms_dispatch_log audit snapshot must reflect the SAME engagement
+    # signal that just decided this contact was eligible, not the separate,
+    # never-written contacts.inbound_sms_count/booked_appointment_id
+    # columns — reading those here (as this line used to) is what caused
+    # ck_sms_dispatch_log_not_cold to reject a genuinely-engaged contact's
+    # own PENDING insert the moment evaluate_full_readiness() was fixed to
+    # read the events ledger instead, since the two would then disagree.
     resolved_key = idempotency_key or uuid.uuid4().hex
 
     with open_outbox_session() as outbox_session:
@@ -262,8 +269,8 @@ def dispatch_sms(
             {
                 "client_id": client_id,
                 "contact_id": contact_id,
-                "inbound_sms_count": contact.inbound_sms_count,
-                "booked_appointment_id": contact.booked_appointment_id,
+                "inbound_sms_count": get_inbound_sms_count(outbox_session, contact_id),
+                "booked_appointment_id": get_booked_appointment_id(outbox_session, contact_id),
                 "idempotency_key": resolved_key,
             },
         ).scalar()

@@ -47,6 +47,7 @@ from src.api.inbound_lead_router import router as inbound_lead_router
 from src.api.mailgun_inbound_router import router as mailgun_inbound_router
 from src.api.winback_router import router as winback_router
 from src.api.unsubscribe_router import router as unsubscribe_router
+from src.api.email_tracking_router import router as email_tracking_router
 from src.services.events import flush_pending
 from src.services.slack import listeners  # noqa: F401 — import registers the Bolt @app.* listeners
 from src.services.slack.bolt_app import run_socket_mode_task, stop_socket_mode
@@ -91,6 +92,10 @@ _BILLING_MISS_CREDIT_SWEEP_INTERVAL_SECONDS = 60
 _BILLING_DISPUTE_CREDIT_SWEEP_INTERVAL_SECONDS = 60
 _BILLING_GUARANTEE_SWEEP_INTERVAL_SECONDS = 3600
 _BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS = 300
+# S-1 (W0 §3.0.2 A) — Vera health checks. 5-minute tick; the halt gate's
+# staleness bound (settings.vera_health_max_age_minutes, default 30) is
+# sized around this cadence tolerating several missed ticks before halting.
+_VERA_HEALTH_SWEEP_INTERVAL_SECONDS = 300
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -127,6 +132,7 @@ def _start_background_workers() -> None:
 		run_miss_credit_sweep as billing_miss_credit_sweep,
 		run_sit_invoice_sweep as billing_sit_invoice_sweep,
 	)
+	from src.tasks.vera_health_sweep import run_sweep as vera_health_sweep
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -155,6 +161,12 @@ def _start_background_workers() -> None:
 		("billing_sweep.run_dispute_credit_sweep", _BILLING_DISPUTE_CREDIT_SWEEP_INTERVAL_SECONDS, billing_dispute_credit_sweep),
 		("billing_sweep.run_guarantee_sweep", _BILLING_GUARANTEE_SWEEP_INTERVAL_SECONDS, billing_guarantee_sweep),
 		("billing_sweep.run_sit_invoice_sweep", _BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS, billing_sit_invoice_sweep),
+		# S-1 — must be registered so settlement/billing sweeps above have a
+		# health run to read; on a cold start there is no vera_health_runs
+		# row until this thread's first tick completes, so every gated sweep
+		# correctly halts on NO_HEALTH_RUN for up to one tick after startup
+		# rather than assuming health — see health_gate.py's module docstring.
+		("vera_health_sweep.run_sweep", _VERA_HEALTH_SWEEP_INTERVAL_SECONDS, vera_health_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)
@@ -244,6 +256,7 @@ app.include_router(inbound_lead_router)
 app.include_router(mailgun_inbound_router)
 app.include_router(winback_router)
 app.include_router(unsubscribe_router)
+app.include_router(email_tracking_router)
 
 
 @app.get("/healthz")

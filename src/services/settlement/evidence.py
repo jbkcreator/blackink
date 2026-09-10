@@ -140,15 +140,44 @@ def _section_2_engagement(session: Session, txn) -> EvidenceSection:
 		{"company_id": txn.company_id},
 	).first()
 
+	# S-8 — open/click/reply are now instrumented (src/services/email_tracking.py,
+	# src/api/email_tracking_router.py, src/services/inbound_ingest.py). Query
+	# `events` for this transaction's contacts before deciding the gap line,
+	# rather than always claiming the gap unconditionally.
+	engagement = session.execute(
+		text(
+			"SELECT "
+			"  COUNT(*) FILTER (WHERE e.event_type = 'email_opened')  AS opens, "
+			"  COUNT(*) FILTER (WHERE e.event_type = 'email_clicked') AS clicks, "
+			"  COUNT(*) FILTER (WHERE e.event_type = 'email_replied') AS replies, "
+			"  MIN(e.created_at) FILTER (WHERE e.event_type = 'email_opened') AS first_open "
+			"FROM events e "
+			"JOIN contacts ct ON ct.contact_id::text = e.entity_id AND e.entity_type = 'contact' "
+			"WHERE ct.company_id = :company_id "
+			"  AND e.event_type IN ('email_opened', 'email_clicked', 'email_replied')"
+		),
+		{"company_id": txn.company_id},
+	).first()
+	has_engagement = bool(engagement and (engagement.opens or engagement.clicks or engagement.replies))
+
 	fields = [
 		_f("Sequence touches recorded", touches.n if touches else None, "sequence_runs"),
 		_f("Last touch", touches.last_touch if touches else None, "sequence_runs"),
+	]
+	if has_engagement:
+		fields.extend([
+			_f("Total opens", engagement.opens, "events"),
+			_f("First open", engagement.first_open, "events"),
+			_f("Total clicks", engagement.clicks, "events"),
+			_f("Replied", "Yes" if engagement.replies else "No", "events"),
+		])
+	fields.extend([
 		_f("Booking provider", booking.provider if booking else None, "bookings"),
 		_f("Booking scheduled at", booking.scheduled_at if booking else None, "bookings"),
 		_f("Booking status", booking.status if booking else None, "bookings"),
 		_f("Assigned rep", booking.client_rep_name if booking else None, "bookings"),
-	]
-	gaps = ["DATA GAP: open/click/reply tracking not instrumented - dispatch records only."]
+	])
+	gaps = () if has_engagement else ("DATA GAP: no open/click/reply events recorded for this company's contacts.",)
 	return EvidenceSection(number=2, title="Engagement & Booking Record", fields=tuple(fields), gaps=tuple(gaps))
 
 

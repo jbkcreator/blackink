@@ -30,6 +30,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from config.settings import get_settings
+from src.services.cold_sms_gate import get_booked_appointment_id, get_inbound_sms_count
 from src.services.compliance_gate import DncProvider, StubDncProvider
 
 OPT_OUT = "OPT_OUT"
@@ -102,7 +103,22 @@ def _resolve_dnc_listed(
 def is_engaged(inbound_sms_count: int, booked_appointment_id: Optional[str]) -> bool:
 	"""Literal predicate from the master blueprint §3.0.4. Public — also
 	reused by src/services/sms_dispatch.py's application-layer cold-SMS
-	linter (Subtask 1.2.3), so the rule has one definition, not two."""
+	linter (Subtask 1.2.3), so the rule has one definition, not two.
+
+	Code-review fix (Dev Item D-7, audit 2026-09-10): the two INPUTS to this
+	predicate must also have one source, not two. evaluate_full_readiness()
+	below now derives them via cold_sms_gate.get_inbound_sms_count()/
+	get_booked_appointment_id() — the events ledger, cold_sms_gate.py's own
+	documented "source of record" — rather than reading contacts.
+	inbound_sms_count/booked_appointment_id, denormalized columns that no
+	production code path ever writes (confirmed by search: only this file's
+	old SELECT and test fixtures ever referenced them). Reading those dead
+	columns meant is_engaged() was always called with (0, None) in
+	production, so evaluate_full_readiness() could never yield
+	TRANSACTIONAL_SMS_ONLY for any contact — sms_dispatch.dispatch_sms() was
+	silently guaranteed to raise ColdSMSBlockedError for every contact,
+	regardless of real engagement. This function's own signature is
+	unchanged; only its caller's data source changed."""
 	return inbound_sms_count > 0 or booked_appointment_id is not None
 
 
@@ -201,15 +217,15 @@ def evaluate_full_readiness(
 		return FullReadinessResult(contact_id, False, "BLOCKED", reason_code)
 
 	contact = session.execute(
-		text(
-			"SELECT phone, inbound_sms_count, booked_appointment_id "
-			"FROM contacts WHERE contact_id = :contact_id"
-		),
+		text("SELECT phone FROM contacts WHERE contact_id = :contact_id"),
 		{"contact_id": contact_id},
 	).one()
 
 	dnc_listed = _resolve_dnc_listed(session, contact_id, contact.phone, dnc_provider)
-	engaged = is_engaged(contact.inbound_sms_count, contact.booked_appointment_id)
+	engaged = is_engaged(
+		get_inbound_sms_count(session, contact_id),
+		get_booked_appointment_id(session, contact_id),
+	)
 	quiet_hours_active = engaged and dnc_listed is False and _in_quiet_hours(session, contact.phone)
 
 	eligibility, reason_code = _decide_channel(engaged, dnc_listed, quiet_hours_active)

@@ -56,12 +56,14 @@ jobs:
           PYTHONPATH=. python migrations/apply_clients.py
           PYTHONPATH=. python migrations/apply_clients_stl_fields.py
           PYTHONPATH=. python migrations/apply_relay_halts.py
+          PYTHONPATH=. python migrations/apply_vera_health_runs.py
           PYTHONPATH=. python migrations/apply_companies.py
           PYTHONPATH=. python migrations/apply_contacts.py
           PYTHONPATH=. python migrations/apply_pm_profiles.py
           PYTHONPATH=. python migrations/apply_owner_entities.py
           PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
           PYTHONPATH=. python migrations/apply_events.py
+          PYTHONPATH=. python migrations/apply_events_dispatch_dedup_index.py
           PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
           PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
           PYTHONPATH=. python migrations/apply_sms_dispatch_log.py

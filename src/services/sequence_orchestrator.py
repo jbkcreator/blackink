@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.services.compliance_gate import evaluate_touch_gate
 from src.services.email_sender import EmailSender, build_email_sender
+from src.services.email_tracking import html_body_with_pixel, pixel_url
 from src.services.email_unsubscribe import append_unsubscribe_footer, unsubscribe_url
 from src.services.mailbox_dispatcher import (
     AllMailboxesCapped,
@@ -141,6 +142,19 @@ def dispatch_touch(
     unsub_url = unsubscribe_url(client_id, contact.email)
     body_with_footer = append_unsubscribe_footer(body, unsub_url)
 
+    # S-8 — tracking pixel (W1 §3.1.4 "tracking pixel active"). Deliberately
+    # NOT click-wrapping the unsubscribe link in the HTML render — RFC 8058/
+    # Gmail-Yahoo bulk-sender rules govern that link's own behavior, and an
+    # extra redirect hop there adds risk for no benefit (see
+    # email_tracking.py's wrap_link docstring). No other link exists in
+    # today's touch copy to wrap (sequence_content.py is plain text, no
+    # links besides the footer) — that's dev items S-4/S-5's job, not this
+    # one; the click-wrap mechanism itself (email_tracking.wrap_link) is
+    # built and tested but has no real caller yet, stated here rather than
+    # silently left unwired.
+    pixel_img_url = pixel_url(client_id, contact.contact_id, dispatch_id)
+    html_body = html_body_with_pixel(body_with_footer, pixel_img_url)
+
     # send → UPDATE SENT/FAILED, each in the fresh (post-claim-commit) txn.
     try:
         result = sender.send(
@@ -148,6 +162,7 @@ def dispatch_touch(
             to_address=contact.email,
             subject=subject,
             body=body_with_footer,
+            html_body=html_body,
             sending_domain=mailbox.sending_domain,
             in_reply_to=in_reply_to,
             list_unsubscribe_url=unsub_url,

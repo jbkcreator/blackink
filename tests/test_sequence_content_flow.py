@@ -24,6 +24,10 @@ def _stub_unsubscribe():
     with (
         patch("src.services.sequence_orchestrator.unsubscribe_url", return_value="https://app.example.com/unsub?token=t"),
         patch("src.services.sequence_orchestrator.append_unsubscribe_footer", side_effect=lambda body, url: body),
+        # S-8's tracking pixel — same reasoning as the unsubscribe stub
+        # above: pixel_url() needs EMAIL_TRACKING_SECRET configured, which
+        # this suite deliberately never sets.
+        patch("src.services.sequence_orchestrator.pixel_url", return_value="https://app.example.com/pixel?token=p"),
     ):
         yield
 

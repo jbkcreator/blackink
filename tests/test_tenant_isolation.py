@@ -472,14 +472,36 @@ def test_campaign_readiness_rejects_cross_tenant_contact_id(canary_tenants):
 
 
 def _cleanup_compliance_events(contact_id):
-	# compliance_gate_evaluated rows are append-only (blackink_app/system
-	# have no DELETE grant on events) — same cleanup pattern as the
+	# compliance_gate_evaluated (and, for the "engaged" tests below,
+	# meeting_booked) rows are append-only (blackink_app/system have no
+	# DELETE grant on events) — same cleanup pattern as the
 	# non_poach_suppressed tests above, via the owner context, before the
 	# canary_tenants fixture's own teardown deletes the referencing client.
 	with get_owner_db_context() as session:
 		session.execute(
-			text("DELETE FROM events WHERE event_type = 'compliance_gate_evaluated' AND entity_id = :cid"),
+			text(
+				"DELETE FROM events WHERE event_type IN ('compliance_gate_evaluated', 'meeting_booked') "
+				"AND entity_id = :cid"
+			),
 			{"cid": str(contact_id)},
+		)
+		session.commit()
+
+
+def _seed_meeting_booked_event(contact_id, client_id):
+	# D-7 fix (audit 2026-09-10): is_engaged()'s booked-appointment signal
+	# now comes from cold_sms_gate.get_booked_appointment_id(), which reads
+	# the events ledger (event_type='meeting_booked'), not the
+	# contacts.booked_appointment_id column — that denormalized column is
+	# never written by any production path, so setting it directly (the
+	# pre-fix version of these tests) would silently prove nothing anymore.
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"INSERT INTO events (client_id, event_type, entity_type, entity_id, payload) "
+				"VALUES (:client_id, 'meeting_booked', 'contact', :cid, '{}'::jsonb)"
+			),
+			{"client_id": client_id, "cid": str(contact_id)},
 		)
 		session.commit()
 
@@ -488,12 +510,10 @@ def test_full_readiness_florida_dnc_listed_engaged_contact_withholds_sms_not_blo
 	contact_id = canary_tenants[CANARY_A]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text(
-				"UPDATE contacts SET phone = '+18135550100', booked_appointment_id = 'appt_1' "
-				"WHERE contact_id = :cid"
-			),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	_seed_meeting_booked_event(contact_id, CANARY_A)
 	try:
 		with get_db_context(client_id=CANARY_A) as session:
 			result = evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=_FixedDnc(listed=True))
@@ -527,12 +547,10 @@ def test_full_readiness_booked_contact_daytime_gets_transactional_sms(canary_ten
 	contact_id = canary_tenants[CANARY_A]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text(
-				"UPDATE contacts SET phone = '+18135550100', booked_appointment_id = 'appt_2' "
-				"WHERE contact_id = :cid"
-			),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	_seed_meeting_booked_event(contact_id, CANARY_A)
 	try:
 		with get_db_context(client_id=CANARY_A) as session:
 			result = evaluate_full_readiness(session, contact_id, CANARY_A, dnc_provider=_FixedDnc(listed=False))
@@ -550,12 +568,10 @@ def test_full_readiness_booked_contact_quiet_hours_withholds_sms(canary_tenants,
 	contact_id = canary_tenants[CANARY_B]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text(
-				"UPDATE contacts SET phone = '+18135550100', booked_appointment_id = 'appt_3' "
-				"WHERE contact_id = :cid"
-			),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	_seed_meeting_booked_event(contact_id, CANARY_B)
 	try:
 		with get_db_context(client_id=CANARY_B) as session:
 			result = evaluate_full_readiness(session, contact_id, CANARY_B, dnc_provider=_FixedDnc(listed=False))
@@ -643,12 +659,31 @@ def _cleanup_cold_sms_events(contact_id):
 	with get_owner_db_context() as session:
 		session.execute(
 			text(
-				"DELETE FROM events WHERE event_type IN ('cold_sms_blocked', 'compliance_gate_evaluated') "
+				"DELETE FROM events WHERE event_type IN "
+				"('cold_sms_blocked', 'compliance_gate_evaluated', 'sms_inbound') "
 				"AND entity_id = :cid"
 			),
 			{"cid": str(contact_id)},
 		)
 		session.execute(text("DELETE FROM sms_dispatch_log WHERE contact_id = :cid"), {"cid": contact_id})
+		session.commit()
+
+
+def _seed_inbound_sms_event(contact_id, client_id):
+	# D-7 fix (audit 2026-09-10): is_engaged()'s inbound-SMS signal now comes
+	# from cold_sms_gate.get_inbound_sms_count(), which reads the events
+	# ledger (event_type in reply_received/sms_inbound), not the
+	# contacts.inbound_sms_count column — that denormalized column is never
+	# written by any production path, so setting it directly (the pre-fix
+	# version of these tests) would silently prove nothing anymore.
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"INSERT INTO events (client_id, event_type, entity_type, entity_id, payload) "
+				"VALUES (:client_id, 'sms_inbound', 'contact', :cid, '{}'::jsonb)"
+			),
+			{"client_id": client_id, "cid": str(contact_id)},
+		)
 		session.commit()
 
 
@@ -745,12 +780,10 @@ def test_dispatch_sms_engaged_contact_passes_all_layers_and_reaches_provider(can
 	contact_id = canary_tenants[CANARY_B]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text(
-				"UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 "
-				"WHERE contact_id = :cid"
-			),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	_seed_inbound_sms_event(contact_id, CANARY_B)
 	provider = _CountingSmsProvider()
 	try:
 		with get_db_context(client_id=CANARY_B) as session:
@@ -796,9 +829,10 @@ def test_dispatch_sms_writes_a_unique_idempotency_key_before_sending(canary_tena
 	contact_id = canary_tenants[CANARY_A]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text("UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 WHERE contact_id = :cid"),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	_seed_inbound_sms_event(contact_id, CANARY_A)
 	provider = _CountingSmsProvider()
 	try:
 		with get_db_context(client_id=CANARY_A) as session:
@@ -833,11 +867,12 @@ def test_dispatch_sms_blocks_opted_out_engaged_contact_end_to_end(canary_tenants
 	with get_system_db_context() as session:
 		session.execute(
 			text(
-				"UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1, is_opted_out = TRUE "
+				"UPDATE contacts SET phone = '+18135550100', is_opted_out = TRUE "
 				"WHERE contact_id = :cid"
 			),
 			{"cid": contact_id},
 		)
+	_seed_inbound_sms_event(contact_id, CANARY_B)
 	provider = _CountingSmsProvider()
 	try:
 		with get_db_context(client_id=CANARY_B) as session:
@@ -896,9 +931,10 @@ def test_dispatch_sms_retry_with_sent_idempotency_key_does_not_call_provider_aga
 	contact_id = canary_tenants[CANARY_B]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text("UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 WHERE contact_id = :cid"),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	_seed_inbound_sms_event(contact_id, CANARY_B)
 	provider = _CountingSmsProvider()
 	try:
 		with get_db_context(client_id=CANARY_B) as session:
@@ -937,9 +973,13 @@ def test_dispatch_sms_concurrent_same_idempotency_key_is_rejected_by_unique_cons
 	contact_id = canary_tenants[CANARY_A]["contact_id"]
 	with get_system_db_context() as session:
 		session.execute(
-			text("UPDATE contacts SET phone = '+18135550100', inbound_sms_count = 1 WHERE contact_id = :cid"),
+			text("UPDATE contacts SET phone = '+18135550100' WHERE contact_id = :cid"),
 			{"cid": contact_id},
 		)
+	# Note: no engagement event is seeded here on purpose — the idempotency
+	# lookup below short-circuits dispatch_sms() before evaluate_full_
+	# readiness() is ever called, so engagement status is irrelevant to
+	# this test (see dispatch_sms()'s own ordering).
 	try:
 		with get_owner_db_context() as owner_session:
 			owner_session.execute(

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import text
 
+from src.agents.vera.health_gate import evaluate_settlement_health
 from src.core.database import get_system_db_context
 from src.services.pms_sync import StubPmsProvider
 from src.services.settlement.charge import charge_installment
@@ -23,11 +24,27 @@ from src.services.settlement.ledger import claim_installment_1, claim_installmen
 logger = logging.getLogger(__name__)
 
 
+def _halt_if_unhealthy(sweep_name: str) -> bool:
+	"""S-1 (W0 §3.0.2 A) — called FIRST in every sweep below, before opening
+	this module's own get_system_db_context() or making any Stripe call.
+	Returns True if the sweep must stop now. See
+	src/agents/vera/health_gate.py's module docstring for what counts as a
+	halting state (ABSTAIN / NO_HEALTH_RUN / STALE_HEALTH_RUN — UNKNOWN does
+	NOT halt)."""
+	decision = evaluate_settlement_health()
+	if not decision.ok:
+		logger.warning("settlement_sweep.%s: HALTED by Vera health gate — %s", sweep_name, decision.detail)
+		return True
+	return False
+
+
 def run_door_signed_sweep(limit: int = 20, *, claim_time: datetime | None = None) -> int:
 	"""Polls the (stubbed) PmsProvider for newly-confirmed door_signed
 	agreements and opens a settlement for each. With StubPmsProvider (the
 	only implementation today) this always returns 0 — no PMS integration
 	is contracted, so nothing opens from a real sync."""
+	if _halt_if_unhealthy("run_door_signed_sweep"):
+		return 0
 	from src.services.settlement.ledger import open_settlement, record_door_signed
 
 	pms = StubPmsProvider()
@@ -53,6 +70,8 @@ def run_door_signed_sweep(limit: int = 20, *, claim_time: datetime | None = None
 
 
 def run_installment_1_sweep(limit: int = 20, *, claim_time: datetime | None = None) -> int:
+	if _halt_if_unhealthy("run_installment_1_sweep"):
+		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	charged = 0
 	with get_system_db_context() as session:
@@ -73,6 +92,8 @@ def run_installment_2_sweep(limit: int = 20, *, claim_time: datetime | None = No
 	CHARGING for it and abort the whole bulk UPDATE, taking every other
 	transaction in the same claim batch down with it), so this is what
 	actually reaches VOIDED_CLAWBACK for it instead."""
+	if _halt_if_unhealthy("run_installment_2_sweep"):
+		return 0
 	claim_time = claim_time or datetime.now(timezone.utc)
 	pms = StubPmsProvider()
 	processed = 0

@@ -136,3 +136,6 @@ TENANT_POLICIES = {
 #   entitlement_offers, settlement_offer_config, payment_auth_offer_config —
 #     global commercial-terms config rows, not tenant data. An operator flips
 #     one per confirmed offer; none carries a client_id of its own.
+#   vera_health_runs — platform-wide health-check results (S-1); every check
+#     it records spans all clients (pm_feed, pipeline) or the single shared
+#     Instantly account (campaign_feed), so there is no client_id to scope by.

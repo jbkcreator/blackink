@@ -360,6 +360,12 @@ class AppSettings(BaseSettings):
 	# rationale as calendar_oauth_state_secret above: a public-facing token
 	# must not share a signing key with an internal-admin-scoped one.
 	email_unsubscribe_secret: Optional[SecretStr] = Field(default=None, env="EMAIL_UNSUBSCRIBE_SECRET")
+	# S-8 — tracking pixel/click tokens (src/services/email_tracking.py).
+	# Deliberately its own secret, not a reuse of email_unsubscribe_secret —
+	# same "unrelated token families must rotate independently" rationale
+	# CLAUDE.md states for that secret; a pixel/click token compromise must
+	# never let an attacker forge unsubscribe tokens or vice versa.
+	email_tracking_secret: Optional[SecretStr] = Field(default=None, env="EMAIL_TRACKING_SECRET")
 	# ── Rent valuation adapter ───────────────────────────────────────────────
 	# The client's "provider row disabled" (Week 1 Open Item #5). MUST ship
 	# False: no valuation vendor is under contract, so enabling this would
@@ -467,6 +473,15 @@ class AppSettings(BaseSettings):
 	# rather than run on an unmet precondition. Flip to True only once the
 	# automated-ack sender is live and acked_at is confirmed being written.
 	billing_miss_credit_sweep_enabled: bool = Field(default=False, env="BILLING_MISS_CREDIT_SWEEP_ENABLED")
+
+	# ── Vera health gate (S-1 / W0 §3.0.2 A) ─────────────────────────────────
+	# src/tasks/vera_health_sweep.py runs every 5 minutes; a health run older
+	# than this is treated as STALE_HEALTH_RUN by src/agents/vera/health_gate.py
+	# and halts settlement/billing sweeps — a health job that silently stopped
+	# running must not look identical to "everything is fine". Default of 30
+	# tolerates 6 missed ticks before halting, which is generous enough to
+	# absorb a single deploy/restart without a false-positive halt.
+	vera_health_max_age_minutes: int = Field(default=30, env="VERA_HEALTH_MAX_AGE_MINUTES")
 
 
 @lru_cache

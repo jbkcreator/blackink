@@ -40,3 +40,12 @@ def test_core_booking_workers_are_registered():
 		"show_rate_reminder_sender.run_sweep",
 	):
 		assert expected in names, f"{expected} not registered"
+
+
+def test_vera_health_sweep_is_registered():
+	"""S-1 regression guard, same class as the show-rate reminder one above:
+	settlement_sweep.py / billing_sweep.py's gate reads vera_health_runs, but
+	nothing writes to it unless this worker actually runs in the deployed
+	process — an unregistered health sweep means every gated sweep halts
+	forever on NO_HEALTH_RUN, silently freezing settlement and billing."""
+	assert "vera_health_sweep.run_sweep" in _registered_worker_names()
