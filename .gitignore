@@ -53,4 +53,5 @@ Thumbs.db
 
 # Local scratch files and test data (never committed)
 /scratch/
+/.scratch/
 /data/
