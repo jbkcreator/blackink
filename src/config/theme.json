@@ -1,0 +1,55 @@
+{
+  "brand": {
+    "name": "Blackink",
+    "shortName": "BI",
+    "tagline": "Property Management Growth Intelligence",
+    "supportEmail": "support@blackink.ai"
+  },
+  "colors": {
+    "primary": "#fbbf24",
+    "primaryHover": "#fde68a",
+    "primaryDark": "#f59e0b",
+    "accent": "#a855f7",
+    "accentLight": "#c084fc",
+    "bg": {
+      "base": "#070b14",
+      "surface": "#0f172a",
+      "surfaceLight": "#1e293b",
+      "card": "rgba(255,255,255,0.04)",
+      "cardHover": "rgba(255,255,255,0.06)"
+    },
+    "border": {
+      "subtle": "rgba(255,255,255,0.06)",
+      "default": "rgba(255,255,255,0.08)",
+      "emphasis": "rgba(255,255,255,0.12)"
+    },
+    "text": {
+      "primary": "#ffffff",
+      "secondary": "#94a3b8",
+      "muted": "#64748b",
+      "dimmed": "#475569"
+    },
+    "status": {
+      "ok": "#22c55e",
+      "warn": "#f59e0b",
+      "danger": "#ef4444"
+    }
+  },
+  "gradients": {
+    "background": "linear-gradient(135deg, #070b14 0%, #0f172a 30%, #131c33 50%, #0c1322 70%, #070b14 100%)",
+    "backgroundDashboard": "linear-gradient(135deg, #0f172a 0%, #1a2340 25%, #1e293b 50%, #172035 75%, #0f172a 100%)",
+    "primaryButton": "linear-gradient(135deg, #fbbf24, #f59e0b)",
+    "text": "linear-gradient(135deg, #fbbf24 0%, #f59e0b 40%, #fcd34d 70%, #fbbf24 100%)"
+  },
+  "fonts": {
+    "family": "'Inter', sans-serif",
+    "importUrl": "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+  },
+  "borderRadius": {
+    "sm": "0.5rem",
+    "md": "0.75rem",
+    "lg": "1rem",
+    "xl": "1.25rem",
+    "full": "999px"
+  }
+}
