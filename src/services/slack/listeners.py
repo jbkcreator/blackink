@@ -1735,6 +1735,10 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 		await respond(response_type="ephemeral", text=":warning: Malformed button payload — missing required fields.")
 		return
 
+	if not approver_authorized(user_id, client_id=card_client_id):
+		await respond(response_type="ephemeral", text=":no_entry: You are not authorized to approve KB responses for this client.")
+		return
+
 	with get_system_db_context() as session:
 		row = session.execute(
 			text(
@@ -1803,9 +1807,12 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 		await respond(response_type="ephemeral", text=":information_source: Another rep just approved this draft.")
 		return
 
-	# Send the email via SMTP
+	# Send the email via SMTP.
+	# On failure: release the claim so the message can be retried by another rep.
+	# On success: mark the message RESPONDED so it counts toward the mailbox
+	# rolling-24h cap (same row the per-mailbox cap query already watches).
 	try:
-		_send_kb_reply(
+		used_mailbox_id = _send_kb_reply(
 			client_id=card_client_id,
 			to_email=row["sender_email"],
 			subject=f"Re: {row['subject'] or 'Your enquiry'}",
@@ -1813,8 +1820,25 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 		)
 	except Exception as exc:
 		logger.exception("approve_kb_response: SMTP send failed for db_id=%s", db_id)
+		with get_system_db_context() as _s:
+			_s.execute(
+				text("UPDATE inbound_messages SET claimed_at = NULL, claimed_by = NULL WHERE id = :id"),
+				{"id": db_id},
+			)
+			_s.commit()
 		await respond(response_type="ephemeral", text=f":x: Failed to send email: {exc}")
 		return
+
+	with get_system_db_context() as _s:
+		_s.execute(
+			text(
+				"UPDATE inbound_messages "
+				"SET status = 'RESPONDED', responded_at = NOW(), mailbox_id = :mid "
+				"WHERE id = :id"
+			),
+			{"mid": used_mailbox_id, "id": db_id},
+		)
+		_s.commit()
 
 	# Log the outbound event
 	try:
@@ -1854,13 +1878,15 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 	await respond(response_type="ephemeral", text=f":white_check_mark: Reply sent to {row['sender_email']}.")
 
 
-def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: str) -> None:
-	"""Send the KB auto-response.
+def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: str) -> Optional[int]:
+	"""Send the KB auto-response. Returns the mailbox_id used, or None for env fallback.
 
 	Primary path: client's least-recently-used warmed DB mailbox.
 	Fallback: env-based SMTP credentials (SMTP_HOST / SMTP_PASSWORD / SMTP_USERNAME)
 	when no warmed DB mailbox is provisioned for this client yet.
-	"""
+
+	The returned mailbox_id is stamped onto inbound_messages.mailbox_id by the
+	caller so the send counts toward the per-mailbox rolling-24h cap."""
 	from sqlalchemy import text as _text
 	from src.core.database import get_db_context
 	from src.core.token_crypto import decrypt_token
@@ -1890,6 +1916,7 @@ def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: st
 			from_address=mailbox.mailbox_address,
 		)
 		from_address = mailbox.mailbox_address
+		used_mailbox_id: Optional[int] = mailbox.mailbox_id
 
 	except NoMailboxAvailable:
 		# Fall back to env-based SMTP when no DB mailbox is provisioned yet.
@@ -1906,6 +1933,7 @@ def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: st
 			password=settings.smtp_password.get_secret_value(),
 			from_address=from_address,
 		)
+		used_mailbox_id = None
 		logger.info("_send_kb_reply: using env SMTP fallback for client_id=%s", client_id)
 
 	provider.send_plain(
@@ -1915,6 +1943,7 @@ def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: st
 		subject=subject,
 		html_body=body_html,
 	)
+	return used_mailbox_id
 
 
 # ── KB Auto-Response — Mark Reviewed (Subtask 2.1.3) ─────────────────────────
@@ -1940,6 +1969,10 @@ async def handle_kb_mark_reviewed(ack, body, respond, action, client):
 
 	if not db_id or not card_client_id:
 		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	if not approver_authorized(user_id, client_id=card_client_id):
+		await respond(response_type="ephemeral", text=":no_entry: You are not authorized to perform this action.")
 		return
 
 	with get_system_db_context() as session:

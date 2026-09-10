@@ -32,6 +32,9 @@ def _clean(text_body: str) -> str:
     return re.sub(r"\s+", " ", text_body).strip()
 
 
+_MIN_PATTERN_TOKENS = 4   # patterns shorter than this match too broadly
+
+
 def _score_entry(cleaned_body: str, patterns: list[str]) -> float:
     """Return the best score across all patterns, normalised 0–1.
 
@@ -41,10 +44,17 @@ def _score_entry(cleaned_body: str, patterns: list[str]) -> float:
     longer owner message ("hi I wanted to ask how does this work exactly?")
     without the false-positive inflation that token_set_ratio produces for
     short patterns sharing common stopwords with unrelated messages.
+
+    Patterns with fewer than _MIN_PATTERN_TOKENS words are skipped — they are
+    too short to distinguish the intended topic from incidental word overlap
+    (e.g. a 3-word fragment like "what happens if" scores 100% on any question
+    that happens to include those words).
     """
     best = 0.0
     for pattern in patterns:
         cleaned_pattern = _clean(pattern)
+        if len(cleaned_pattern.split()) < _MIN_PATTERN_TOKENS:
+            continue
         score = fuzz.partial_ratio(cleaned_body, cleaned_pattern)
         if score > best:
             best = score
