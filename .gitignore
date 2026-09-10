@@ -10,6 +10,9 @@ secrets/
 # Task docs/reports — local only, never push
 /Tasks
 
+# Project docs — local only, never push
+/docs
+
 # Python bytecode
 __pycache__/
 *.py[cod]
