@@ -1312,6 +1312,30 @@ If any answer is no, fix the naming before proceeding.
 
 ---
 
+## Commit Hygiene — STRICT RULES
+
+These two rules are **non-negotiable and enforced at commit time**. No exceptions, no "just this once."
+
+### Rule 1 — Naming conventions apply to every identifier in the repo
+
+The full naming standard is in **Naming & Code Quality** above. The short form: every name — function, variable, constant, class, column, branch, migration file, comment — must describe what the thing **is or does**. No ticket numbers, sprint labels, local paths, PR numbers, author names, or placeholder names anywhere in committed code. Violating this is a commit blocker, not a style note.
+
+### Rule 2 — Local documentation and context files are NEVER committed
+
+Any file used only during development — notes, planning docs, context summaries, local reference files, task lists, AI-session context, scratch analysis — **must never appear in a git commit**. This includes:
+
+- Files named `context*.md`, `notes*.md`, `plan*.md`, `todo*.txt`, `*.local.*`, or any derivative
+- Session transcripts, AI-generated summaries, or ephemeral working documents
+- Developer-environment-specific configs or path files
+
+**Where they go instead:** a single, gitignored local folder (e.g. `_local/` or `docs/_dev/`). Add the folder pattern to `.gitignore` once and never touch it again. Files in that folder never enter `git add`, never appear in `git status` staged output, and never land in a commit.
+
+**Why this is strict:** committing these files pollutes history, leaks internal context into the public diff, causes merge noise on every rebase, and signals to reviewers that the branch is not production-ready. It is a trust issue, not a cleanup item.
+
+**Pre-commit check:** before `git add`, run `git status` and confirm no file from a local docs/context folder is staged. If you see one, move it to the gitignored folder before proceeding — never stage-then-remove in a follow-up commit.
+
+---
+
 ## Tooling Rules
 
 - **Language/runtime**: Python 3.11+.
