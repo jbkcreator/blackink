@@ -50,7 +50,14 @@ def test_post_send_write_failure_marks_sent_unconfirmed_not_received():
     actually sent it (mailbox_id=9 here), even though the UPDATE that would
     normally have persisted it is exactly what failed — otherwise a
     SENT_UNCONFIRMED row can never count against that mailbox's rolling-24h
-    cap (src/services/mailbox_dispatcher.py)."""
+    cap (src/services/mailbox_dispatcher.py).
+
+    PR #48 re-review: the real send timestamp (sent_at) must also be
+    carried through, not just mailbox_id — without it, mailbox_dispatcher.py's
+    cap query falls back to received_at, which for a lead that waited >24h
+    for capacity is already outside the rolling window by send time. See
+    test_mark_sent_unconfirmed_writes_responded_at_and_acked_at_from_sent_at
+    for the direct UPDATE-shape assertion."""
     row = _row()
     session = MagicMock()
     # clients template lookup → no custom template
@@ -69,7 +76,11 @@ def test_post_send_write_failure_marks_sent_unconfirmed_not_received():
          patch.object(sweep, "_reset_to_received") as reset:
         sweep.run_sweep()
 
-    mark_unconf.assert_called_once_with(row.id, mailbox_id=9)
+    mark_unconf.assert_called_once()
+    call_args, call_kwargs = mark_unconf.call_args
+    assert call_args == (row.id,)
+    assert call_kwargs["mailbox_id"] == 9
+    assert isinstance(call_kwargs["sent_at"], datetime), "sent_at must be a real timestamp, not None"
     reset.assert_not_called()
 
 
