@@ -1225,6 +1225,93 @@ future onboarding flow cannot silently default a real founding client to
 `False`; `tests/test_billing_structural.py` asserts both the missing default
 and that no other production code path INSERTs into `clients`.
 
+## Naming & Code Quality
+
+These rules apply to every line written in this repo — identifiers, comments,
+branch names, migration file names, SQL function names, log messages. No
+exceptions.
+
+### The core rule
+
+A name must describe what the thing **is or does**, not which ticket introduced
+it, which sprint it belongs to, or where the code lives on a developer's machine.
+
+### What is never allowed
+
+| Pattern | Examples | Why |
+|---|---|---|
+| Internal ticket / dev labels | `dev1_`, `dev3_`, `DEV_1`, `subtask_2_1_3`, `week2_`, `task_4_2` | Meaningless outside the sprint; rots immediately |
+| Local file paths | `C:/Users/Amal/...`, `~/Codebases/...` | Non-reproducible, exposes developer environment |
+| Sprint / iteration references | `week1_fix`, `sprint3_cleanup` | Describes timing, not the concept |
+| Raw PR / issue numbers | `pr37_fix`, `issue_123_handler` | That belongs in git history |
+| Author names or initials | `amal_patch`, `jd_refactor` | git blame exists |
+| Unresolved placeholders | `foo`, `bar`, `test123`, `FIXME_RENAME` | Not real names; fix before committing |
+
+### Identifiers
+
+- **Functions/methods**: verb + noun describing the operation — `calculate_score`,
+  `fetch_calendar_events`, `mark_job_complete`. Never named after a ticket.
+- **Variables**: readable English describing the value's role —
+  `active_client_ids`, `booking_start_time`. Single-letter only inside tight
+  loops or established math notation.
+- **Constants**: `SCREAMING_SNAKE_CASE`, descriptive —
+  `CLAIM_LEASE_MINUTES`, `MAX_ENRICHMENT_ATTEMPTS`. Never `DEV3_MAX_RETRIES`.
+- **Classes**: PascalCase noun naming the concept —
+  `BookingReminderJob`, `OwnerVisibilityScore`. Never named after the task.
+- **DB columns / tables**: `snake_case`, singular table names, full English
+  words. No sprint-derived abbreviations.
+
+### Branch names
+
+One of two patterns, no others:
+
+```
+feature/<descriptive-slug>    # new capability
+fix/<descriptive-slug>        # bug fix
+```
+
+The slug is a kebab-case phrase naming the feature or bug — not the ticket:
+
+| Wrong | Right |
+|---|---|
+| `dev-3` | `feature/sequence-work-order-approval` |
+| `subtask-2-1-3` | `feature/ovs-score-engine` |
+| `week2-fix` | `fix/settlement-clawback-race` |
+
+Check `git branch -a` and match the length and style already in use.
+
+### Migration file names
+
+`apply_<descriptive_noun_phrase>.py` — what the migration adds or changes, not
+which sprint it was in:
+
+| Wrong | Right |
+|---|---|
+| `apply_dev3_tables.py` | `apply_sequence_runs.py` |
+| `apply_week2_billing.py` | `apply_entitlements_billing.py` |
+
+### Comments
+
+Comments explain **why**, not what (the code shows what; the name shows what).
+- A comment referencing a ticket, sprint, or task number belongs in the commit
+  message or PR description, not the source file.
+- `# Added for Dev 3` — delete it.
+- `# TODO(dev-3): rename this` — resolve it before committing, not later.
+- `# Deferred to Week 4` — PR description, not source.
+
+### Pre-write self-check
+
+Before writing a single line of code, confirm:
+
+1. Every new name describes the concept with no sprint or ticket leakage.
+2. A developer with no sprint context would understand every name.
+3. Branch name and migration file name follow the patterns above.
+4. No placeholder or temporary names from a prior pass need renaming first.
+
+If any answer is no, fix the naming before proceeding.
+
+---
+
 ## Tooling Rules
 
 - **Language/runtime**: Python 3.11+.
