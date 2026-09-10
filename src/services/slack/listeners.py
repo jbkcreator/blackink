@@ -1855,37 +1855,63 @@ async def handle_approve_kb_response(ack, body, respond, action, client):
 
 
 def _send_kb_reply(*, client_id: str, to_email: str, subject: str, body_html: str) -> None:
-	"""Send the KB auto-response via the client's least-recently-used SMTP mailbox."""
+	"""Send the KB auto-response.
+
+	Primary path: client's least-recently-used warmed DB mailbox.
+	Fallback: env-based SMTP credentials (SMTP_HOST / SMTP_PASSWORD / SMTP_USERNAME)
+	when no warmed DB mailbox is provisioned for this client yet.
+	"""
 	from sqlalchemy import text as _text
-	from src.core.database import get_db_context, get_system_db_context as _sys
+	from src.core.database import get_db_context
 	from src.core.token_crypto import decrypt_token
 	from src.services.email_dispatch import SmtpEmailProvider
 	from src.services.mailbox_dispatcher import get_active_mailbox_for_client, NoMailboxAvailable
+	from config.settings import get_settings
 
-	with get_db_context(client_id=client_id) as db:
-		mailbox = get_active_mailbox_for_client(db, client_id)
-		smtp_row = db.execute(
-			_text(
-				"SELECT smtp_host, smtp_port, smtp_username, smtp_password_encrypted "
-				"FROM mailboxes WHERE id = :mid"
-			),
-			{"mid": mailbox.mailbox_id},
-		).fetchone()
+	try:
+		with get_db_context(client_id=client_id) as db:
+			mailbox = get_active_mailbox_for_client(db, client_id)
+			smtp_row = db.execute(
+				_text(
+					"SELECT smtp_host, smtp_port, smtp_username, smtp_password_encrypted "
+					"FROM mailboxes WHERE id = :mid"
+				),
+				{"mid": mailbox.mailbox_id},
+			).fetchone()
 
-	if not smtp_row or not smtp_row.smtp_host:
-		raise RuntimeError(f"No SMTP credentials for mailbox_id={mailbox.mailbox_id}")
+		if not smtp_row or not smtp_row.smtp_host:
+			raise RuntimeError(f"No SMTP credentials for mailbox_id={mailbox.mailbox_id}")
 
-	provider = SmtpEmailProvider(
-		host=smtp_row.smtp_host,
-		port=smtp_row.smtp_port or 587,
-		username=smtp_row.smtp_username,
-		password=decrypt_token(smtp_row.smtp_password_encrypted),
-		from_address=mailbox.mailbox_address,
-	)
+		provider = SmtpEmailProvider(
+			host=smtp_row.smtp_host,
+			port=smtp_row.smtp_port or 587,
+			username=smtp_row.smtp_username,
+			password=decrypt_token(smtp_row.smtp_password_encrypted),
+			from_address=mailbox.mailbox_address,
+		)
+		from_address = mailbox.mailbox_address
+
+	except NoMailboxAvailable:
+		# Fall back to env-based SMTP when no DB mailbox is provisioned yet.
+		settings = get_settings()
+		if not settings.smtp_host or not settings.smtp_password:
+			raise RuntimeError(
+				f"No mailboxes provisioned for client_id={client_id} and no env SMTP fallback configured."
+			)
+		from_address = settings.smtp_username or ""
+		provider = SmtpEmailProvider(
+			host=settings.smtp_host,
+			port=settings.smtp_port,
+			username=from_address,
+			password=settings.smtp_password.get_secret_value(),
+			from_address=from_address,
+		)
+		logger.info("_send_kb_reply: using env SMTP fallback for client_id=%s", client_id)
+
 	provider.send_plain(
 		to=to_email,
-		reply_to=mailbox.mailbox_address,
-		bcc=mailbox.mailbox_address,
+		reply_to=from_address,
+		bcc=from_address,
 		subject=subject,
 		html_body=body_html,
 	)
