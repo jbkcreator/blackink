@@ -283,10 +283,32 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         return 0
 
     posted = 0
+    auto_approved = 0
     for order in touch_orders:
         if order.slack_message_ts:
             # Card already posted — skip to avoid duplicate cards.
             logger.debug("sequence_sweep: action_id=%s already has a card, skipping", order.action_id)
+            continue
+        # BAND_3_AUTO orders earned auto-dispatch after 50 consecutive clean
+        # sends. Skip the Slack approval card entirely and flip to APPROVED so
+        # the execution sweep dispatches on the next tick.
+        if order.autonomy_band == "BAND_3_AUTO":
+            approved = wo.record_decision(
+                order.client_id, order.action_id,
+                decision="APPROVED",
+                decided_by="system:band3_auto",
+            )
+            if approved is not None:
+                auto_approved += 1
+                logger.info(
+                    "sequence_sweep: BAND_3_AUTO auto-approved action_id=%s class=%s",
+                    order.action_id, order.action_class,
+                )
+            else:
+                logger.warning(
+                    "sequence_sweep: BAND_3_AUTO auto-approve no-op action_id=%s (already decided)",
+                    order.action_id,
+                )
             continue
         if order.action_class == _WINBACK_ACTION and not _winback_touch_still_ready(order):
             # DoD requires the card never be QUEUED after a stop — not just
@@ -320,7 +342,10 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         else:
             logger.warning("sequence_sweep: card NOT posted action_id=%s — Slack error", order.action_id)
 
-    logger.info("sequence_sweep: %d/%d cards posted", posted, len(touch_orders))
+    logger.info(
+        "sequence_sweep: %d/%d cards posted, %d auto-approved (BAND_3_AUTO)",
+        posted, len(touch_orders), auto_approved,
+    )
     return posted
 
 

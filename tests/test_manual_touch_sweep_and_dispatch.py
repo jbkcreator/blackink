@@ -24,6 +24,7 @@ from src.services.work_orders.dispatchers import (
 def _order(action_class, action_id="a1"):
     return SimpleNamespace(
         action_id=action_id, entity_id="1", action_class=action_class, slack_message_ts=None,
+        autonomy_band="BAND_2_ONE_TAP",
         payload={"touch_step": 4, "run_id": "r1"},
     )
 
