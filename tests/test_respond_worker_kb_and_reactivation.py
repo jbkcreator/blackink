@@ -108,9 +108,22 @@ def test_later_with_competing_pause_preserves_requested_date_and_flags_review():
     classification_meta for a human to action, and the message must be
     flagged for review, exactly as if no date had been extracted at all."""
     db = _mock_db()
+
+    def _execute(stmt, params=None, *a, **kw):
+        sql = str(stmt)
+        result = MagicMock()
+        if "SELECT outbound_pause_reason" in sql:
+            result.first.return_value = ("NO_SHOW_RECOVERY",)
+        else:
+            result.first.return_value = MagicMock()
+        return result
+
+    db.execute.side_effect = _execute
+
     target = datetime(2026, 9, 1, tzinfo=timezone.utc)
     with patch("src.services.reactivation.extract_target_date", return_value=target), \
          patch("src.services.reactivation.pause_contact_until", return_value=False) as mock_pause, \
+         patch("src.agents.respond.worker._post_slack_alert") as mock_alert, \
          patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
         _route(
             db=db, db_id=73, client_id="CL1", sender_email="owner@co.com",
@@ -130,6 +143,16 @@ def test_later_with_competing_pause_preserves_requested_date_and_flags_review():
     import json as _json
     meta = _json.loads(write_call[0][1]["meta"])
     assert meta["requested_reactivation_date"] == target.isoformat()
+
+    # Review fix: requires_human_review/classification_meta have no reader
+    # anywhere in this repo, so a human must be paged directly — the same
+    # posture this file already uses for LEGAL_GRIEF/COMPLAINT/PARTNER.
+    mock_alert.assert_called_once()
+    channel, alert_text = mock_alert.call_args.args
+    assert channel == "command"
+    assert target.isoformat() in alert_text
+    assert "NO_SHOW_RECOVERY" in alert_text
+    assert "55" in alert_text
 
 
 # ---------------------------------------------------------------------------
