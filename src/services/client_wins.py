@@ -64,7 +64,10 @@ _WINS_DETAIL_SQL = """
            pa.door_count,
            pa.agreement_source,
            pa.status,
-           COALESCE(st.evidence_packet_url, '') AS evidence_packet_url
+           -- Never emit an empty string: an all-blank column is dropped by the
+           -- Google Sheets schema inference, so Looker never sees the field. A
+           -- dash keeps the column materialised until a real packet URL exists.
+           COALESCE(NULLIF(st.evidence_packet_url, ''), '—') AS evidence_packet_url
     FROM pms_agreements pa
     LEFT JOIN settlement_transactions st
       ON st.client_id = pa.client_id AND st.pms_agreement_id = pa.pms_agreement_id

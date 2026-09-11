@@ -93,16 +93,19 @@ def test_compute_kpis_wide_is_header_plus_one_numeric_row():
 # ── Wins tab (detail rows with evidence links) ────────────────────────────────
 
 def test_compute_wins_detail_rows_with_evidence():
+    # The SQL COALESCE(NULLIF(url,''),'—') means the DB never hands compute a
+    # blank — a published packet returns its URL, an unpublished one returns '—'
+    # (keeps the column from being dropped by Sheets schema inference).
     detail = [
         ("2026-09-05", 30, "PMS_SYNC", "ACTIVE", "https://files.example/packet1.pdf"),
-        ("2026-09-01", 17, "SYNTHETIC", "ACTIVE", ""),
+        ("2026-09-01", 17, "SYNTHETIC", "ACTIVE", "—"),
     ]
     with patch("src.services.client_wins.get_system_db_context", _ctx(_fetchall_session(detail))):
         out = compute_wins_detail("ACME")
     assert out[0] == WINS_DETAIL_HEADER
     assert out[1][1] == 30
     assert out[1][4] == "https://files.example/packet1.pdf"
-    assert out[2][4] == ""  # unpublished packet -> blank, not a fake link
+    assert out[2][4] == "—"  # unpublished packet -> dash, never blank/fake link
 
 
 # ── Trend tab (weekly, merged across three series) ────────────────────────────
