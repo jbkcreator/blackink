@@ -483,6 +483,21 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
             contact_id=row.get("contact_id"),
         )
 
+    # S-20 (W2 §3.2.5 Stage 5) — receipt-to-routed latency, the evidence the
+    # "<60s hot-lead routing" acceptance criterion needs. Measured from
+    # received_at (set at actual intake, before any queueing) to right now
+    # (after _route() has already posted the #blackink-setter context card
+    # for HOT_LEAD/WHALE_OWNER/OBJECTION and persisted card_posted_at) — so
+    # this captures the FULL pipeline latency including any queue wait, not
+    # just this function's own processing time. Written for every intent,
+    # not only hot leads: a digest/Evidence-Packet reader filters to
+    # intent IN (HOT_LEAD, WHALE_OWNER) to evidence the specific SLA claim,
+    # but the field costs nothing to record for every row.
+    received_at_for_latency = row.get("received_at") or datetime.now(timezone.utc)
+    if received_at_for_latency.tzinfo is None:
+        received_at_for_latency = received_at_for_latency.replace(tzinfo=timezone.utc)
+    routing_latency_seconds = (datetime.now(timezone.utc) - received_at_for_latency).total_seconds()
+
     try:
         log_event(
             row["client_id"],
@@ -495,6 +510,7 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
                 "final_status":      final_status,
                 "objection_subtype": result.objection_subtype,
                 "path":              result.meta.get("path", "llm"),
+                "routing_latency_seconds": routing_latency_seconds,
             },
             actor="respond_worker",
         )

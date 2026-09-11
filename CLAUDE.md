@@ -21,6 +21,7 @@ uvicorn src.api.main:app --reload --port 8000
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
 PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py   # Subtask 3.1.1 — Akrash staging feed, not tenant-bearing, any time after counties
+PYTHONPATH=. python migrations/apply_assessor_roll_imports.py   # S-24 — audit trail for the assessor-roll loader sweep + blackink_system INSERT/DELETE grant on raw_assessor_parcels; not tenant-bearing, any time after apply_raw_assessor_parcels.py
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
@@ -91,6 +92,7 @@ PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
+python -m src.tasks.assessor_roll_refresh_sweep  # S-24 — monthly county assessor roll change-detection + reimport
 python -m src.tasks.hunter_nightly_sweep
 python -m src.tasks.calendar_subscription_renewal
 python -m src.tasks.calendar_sync_worker
@@ -1453,6 +1455,86 @@ worked correctly via `sla_due_at`, which was already computed from
 back to the pre-S-13 terminal
 `REALLOCATED` status with the original manual-assign note — fail-closed,
 never inventing an assignee.
+
+### Reply-routing SLA evidence (S-20, W2 §3.2.5 Stage 5)
+
+`src/agents/respond/worker.py`'s `inbound_reply_classified` event now carries
+`routing_latency_seconds` — `NOW() - received_at`, measured after `_route()`
+has already posted the `#blackink-setter` context card for a hot-lead-class
+intent, so it captures the FULL receipt-to-routed latency (including any
+Redis-stream queue wait), not just this function's own processing time.
+Written for every intent, not only `HOT_LEAD`/`WHALE_OWNER` — a digest or
+Evidence Packet reader filters to those two to evidence the "<60 seconds"
+acceptance criterion specifically; the field costs nothing to record more
+broadly. No schema change, no new event type — an additive, non-required
+payload field on an event that already fires for every classified reply.
+
+### Assessor roll loader (S-24, W2 §3.2.4 A)
+
+`raw_assessor_parcels` (Subtask 3.1.1) sat empty because Akrash was never
+contracted to supply it. Reclassified from an external (Akrash) blocker to
+platform dev work, since the underlying data is public county tax-roll
+information — but it is **not** a stable self-serve HTTP download:
+Hillsborough County's own property-appraiser site sells its full assessment
+extract as a paid, manually-ordered product (email/phone/in-person, not a
+direct download link), and Florida DOR's exact current-year statewide NAL
+download path could not be confirmed live. `src/services/
+assessor_roll_loader.py` therefore does not scrape any vendor/county URL —
+acquisition is a manual operator step (buy or obtain the county's roll
+extract, place it at the path `config/settings.py`'s
+`assessor_roll_path_hillsborough`/`assessor_roll_path_pinellas` names for
+that county), mirroring this repo's own posture for other un-automatable
+external inputs rather than guessing at an unverified integration.
+
+`src/tasks/assessor_roll_refresh_sweep.py` runs monthly via
+`scripts/crontab.txt` (not an in-process `_start_background_workers`
+thread — matching how `daily_digest`/`county_allocation_reassessment`/
+`deliverability_sentinel` are all cron-scheduled, not threaded, for
+daily-or-less-frequent work). It hashes each configured county's file
+(sha256, not mtime — a redeploy that doesn't change content must never
+trigger a needless reimport) and only reimports on a genuine content
+change; every tick writes one row to `assessor_roll_imports`
+(`migrations/apply_assessor_roll_imports.py`; not tenant-bearing, same
+class as `raw_assessor_parcels` itself) recording `SUCCESS`, `UNCHANGED`,
+`FAILED`, or `MISSING` — a successful no-op is recorded, not silently
+skipped, so "the sweep ran and found nothing to do" is as visible in the
+audit trail as an actual import. Alerts `#blackink-qa` on `MISSING`
+(configured path unreadable), `FAILED` (parse/validation error — existing
+rows for that county are left completely untouched, a fail-closed
+guarantee that a bad new file can never wipe good existing data), and
+`STALE` (no `SUCCESS` for a county within `settings.assessor_roll_
+staleness_days`, default 400 — county rolls are certified annually, so a
+healthy county shows one `SUCCESS` at least once a year).
+
+A tax roll is a full point-in-time snapshot, not an incremental feed — a
+genuine content change means `import_county_roll()` does a transactional
+`DELETE` of that county's prior `raw_assessor_parcels` rows followed by a
+bulk `INSERT` of the new file's rows, never a merge (a merge would leave
+`check_still_owns()`'s own `ORDER BY ingested_at DESC LIMIT 1` picking
+between two potentially-conflicting rows for the same address instead of
+there being exactly one live snapshot per county). `blackink_system` was
+granted `INSERT`/`DELETE` on `raw_assessor_parcels` for this (previously
+`SELECT`-only, since Akrash was the sole intended writer before this
+reclassification).
+
+Column parsing is deliberately alias-tolerant, not a fixed schema.
+**Hillsborough's real column layout is now confirmed, not guessed**:
+`FOLIO`/`OWNER`/`SITE_ADDR`/`SITE_CITY`/`SITE_ZIP` is HCPA's actual bulk
+parcel export schema, verified against `jbkcreator/Forced-action-`'s
+`src/loaders/column_mapper.py` — a sibling system (same lineage as this
+repo's own Forced Action fork) that has previously downloaded and loaded
+this exact county's real parcel data via a browser-automation pipeline
+(`src/scrappers/master/master_engine.py`). All three of those column names
+were already covered by this loader's existing alias sets, confirmed by a
+regression test (`test_parses_real_hillsborough_hcpa_column_schema`) rather
+than by inspection alone. **Pinellas's real layout remains unverified** —
+it uses a different portal, and the sibling repo's `bulk_tables` config for
+it lives in a database this repo has no access to, not in code. A Pinellas
+file with different headers still raises `UnrecognizedColumnsError` naming
+exactly which required field it couldn't find, rather than silently
+importing a partial or wrong mapping — extending
+`_ADDRESS_ALIASES`/`_OWNER_ALIASES`/`_PARCEL_ID_ALIASES` is the expected
+fix once a real Pinellas file's headers are known.
 
 ## Tooling Rules
 

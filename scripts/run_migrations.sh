@@ -43,6 +43,7 @@ MIGRATIONS=(
   apply_db_roles
   apply_counties
   apply_raw_assessor_parcels
+  apply_assessor_roll_imports
   apply_area_code_timezones
   apply_clients
   apply_clients_stl_fields
