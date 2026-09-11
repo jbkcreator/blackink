@@ -68,9 +68,11 @@ def test_metrics_sql_excludes_the_demo_sandbox_client():
     demo sandbox reported synthetic sandbox activity (cold emails,
     appointments) as if it were real cross-client pipeline data, because
     this platform-wide query has no client_id filter at all. The sandbox's
-    client_id must be explicitly excluded."""
-    assert "DEMO_FRIDAY_SANDBOX" in _METRICS_SQL
-    assert "client_id != 'DEMO_FRIDAY_SANDBOX'" in _METRICS_SQL or "client_id <> 'DEMO_FRIDAY_SANDBOX'" in _METRICS_SQL
+    client_id must be excluded — now via the central DEMO_CLIENT_IDS registry
+    (PR #53 review finding 1), which also covers DEMO_CLIENT_WINS."""
+    from src.core.demo_clients import DEMO_CLIENT_IDS
+    assert "client_id <> ALL(:demo_client_ids)" in _METRICS_SQL
+    assert "DEMO_FRIDAY_SANDBOX" in DEMO_CLIENT_IDS
 
 
 def test_metrics_sql_uses_owner_visibility_score_calculated_not_ghost_shopper():

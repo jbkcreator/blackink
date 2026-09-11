@@ -33,6 +33,7 @@ from src.api.inbound_email_router import router as inbound_email_router
 from src.api.auth_router import router as auth_router
 from src.api.sandbox_router import router as sandbox_router
 from src.api.metrics_router import router as metrics_router
+from src.api.client_wins_router import router as client_wins_router
 from src.api.meetings_router import router as meetings_router
 from src.api.ovs_router import router as ovs_router
 from src.api.booking_webhook_router import router as booking_webhook_router
@@ -316,6 +317,7 @@ app.include_router(inbound_email_router)
 app.include_router(auth_router)
 app.include_router(sandbox_router)
 app.include_router(metrics_router)
+app.include_router(client_wins_router)
 app.include_router(meetings_router)
 app.include_router(ovs_router)
 app.include_router(calendar_oauth_router)

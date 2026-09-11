@@ -25,6 +25,7 @@ PYTHONPATH=. python migrations/apply_assessor_roll_imports.py   # S-24 — audit
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
+PYTHONPATH=. python migrations/apply_clients_wins_sheet.py  # Subtask 3.2.5 Stage 6 (S-21) — clients.wins_sheet_id for the per-client Client Wins Dashboard export; additive, any time after apply_clients.py
 PYTHONPATH=. python migrations/apply_relay_halts.py   # not tenant-bearing, any time after clients
 PYTHONPATH=. python migrations/apply_vera_health_runs.py   # S-1 (W0 §3.0.2 A) — Vera health-check results; not tenant-bearing, any time, no dependency on any other table
 PYTHONPATH=. python migrations/apply_companies.py
@@ -102,6 +103,7 @@ python -m src.tasks.no_show_prompt_sender
 python -m src.tasks.no_show_recovery_sender
 python -m src.tasks.self_serve_audit_worker
 python -m src.tasks.meeting_outcome_prompt_sender
+python -m src.tasks.client_wins_sweep         # Subtask 3.2.5 Stage 6 (S-21) — refreshes each active client's wins Google Sheet (Looker Studio); skips clients with NULL wins_sheet_id
 python -m src.agents.cora.worker           # Cora draft-generation worker (LLM sequence + Slack card)
 python -m src.agents.relay.worker          # Relay dispatch worker (Instantly / SMTP send)
 python -m src.agents.respond.worker        # Reply Triage Agent classifier worker

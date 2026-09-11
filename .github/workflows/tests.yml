@@ -81,6 +81,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_area_code_timezones.py
           PYTHONPATH=. python migrations/apply_clients.py
           PYTHONPATH=. python migrations/apply_clients_stl_fields.py
+          PYTHONPATH=. python migrations/apply_clients_wins_sheet.py
           PYTHONPATH=. python migrations/apply_relay_halts.py
           PYTHONPATH=. python migrations/apply_vera_health_runs.py
           PYTHONPATH=. python migrations/apply_companies.py

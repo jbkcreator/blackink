@@ -28,4 +28,8 @@ def test_metrics_sql_open_click_reply_rate_are_null_not_a_fabricated_zero():
 
 
 def test_metrics_sql_excludes_the_demo_sandbox_client():
-    assert "DEMO_FRIDAY_SANDBOX" in _METRICS_SQL
+    # Excluded via the central DEMO_CLIENT_IDS registry (PR #53 finding 1),
+    # which also covers DEMO_CLIENT_WINS.
+    from src.core.demo_clients import DEMO_CLIENT_IDS
+    assert "client_id <> ALL(:demo_client_ids)" in _METRICS_SQL
+    assert "DEMO_FRIDAY_SANDBOX" in DEMO_CLIENT_IDS
