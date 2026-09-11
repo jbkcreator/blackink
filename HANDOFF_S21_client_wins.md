@@ -133,6 +133,38 @@ Confirm it's in the server crontab if you want automatic refresh.
 Paste the `Results: N passed, M failed` line (and any `FAIL`). If green, I run
 `blackink-review` and open the PR (per the rule: PR only after e2e passes).
 
+## v2 — client-grade dashboard (4 tabs) + demo seed
+
+The export now writes **four tabs** to the client's Sheet:
+- **Summary** — honest Metric/Value table incl `NOT RECORDED`.
+- **KPIs** — one wide numeric row → Looker **Scorecards** + funnel.
+- **Wins** — one row per signed agreement (date, doors, source, status, Evidence Packet URL).
+- **Trend** — weekly meetings / attended / doors → a **line chart**.
+
+### Seed realistic demo data (run on the server)
+
+```bash
+PYTHONPATH=. GOOGLE_SHEETS_CREDENTIALS_PATH=/root/blackink/gsheets-sa.json \
+  python scripts/seed_client_wins_demo.py --sheet-id 1_HHeaCyXDxASDcHqv2tsPq_sDk4YX3CBqlgMx5hrruY
+```
+Seeds a persistent `DEMO_CLIENT_WINS` tenant: 3 signed agreements (72 doors) over
+3 weeks, 5 attended appointments, 8 meetings — then exports all 4 tabs. Re-run to
+refresh. Remove it with:
+```bash
+PYTHONPATH=. python scripts/seed_client_wins_demo.py --cleanup
+```
+(Evidence-packet links stay blank — settlement packets aren't seeded; they
+populate once a real packet is published.)
+
+### Build the Looker report off the tabs
+Add a **separate data source per tab** (Add data → Google Sheets → same file →
+pick the worksheet):
+- **KPIs** → drop 4–5 **Scorecards** (Total Doors Signed, Signed Agreements,
+  Attended Appointments, Meetings Booked). Funnel = a bar chart over the same row.
+- **Wins** → a **Table**; set the Evidence Packet field type to **URL / Hyperlink**.
+- **Trend** → a **Time series / line chart**, dimension = Week, metrics = the three counts.
+- **Summary** → a plain table (keeps the NOT RECORDED context).
+
 ## Files in this branch
 - `migrations/apply_clients_wins_sheet.py` — clients.wins_sheet_id
 - `src/services/client_wins.py` — compute_wins / export_client_wins / wins_csv
