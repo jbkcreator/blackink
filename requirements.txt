@@ -69,3 +69,9 @@ aioimaplib>=1.0
 # Zero-Deposit Card Auth & ACH Mandate Capture (Subtask 1.2.1)
 stripe>=10.0
 
+# S-10 — LATER-intent reactivation date extraction from free-text replies
+# (src/services/reactivation.py). Was already present transitively (a
+# dependency of another package) in dev environments, so this had never been
+# missed until now — declaring it explicitly since it's a new direct import.
+python-dateutil>=2.9
+

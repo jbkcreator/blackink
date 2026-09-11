@@ -104,6 +104,8 @@ MIGRATIONS=(
   apply_winback_loss_est
   apply_band2_counters
   apply_knowledge_base
+  apply_reactivation_pause
+  apply_backup_closer_roster
   apply_rls_policies
   apply_akrash_grant
 )

@@ -82,6 +82,8 @@ PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2
 PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
 PYTHONPATH=. python migrations/apply_winback_loss_est.py   # S-14 — adds custom_hook_text to winback_rows; after apply_winback_touch_sequence.py (audit_loss_dollars_est already exists there), before RLS
 PYTHONPATH=. python migrations/apply_band2_counters.py   # S-9 — Band 2 consecutive-clean-send tracker; not tenant-bearing, no RLS; any time after apply_clients.py
+PYTHONPATH=. python migrations/apply_reactivation_pause.py   # S-10 — contacts.outbound_pause_until (additive column on an already-registered table); any time after apply_bookings.py
+PYTHONPATH=. python migrations/apply_backup_closer_roster.py   # S-13 — new tenant-bearing backup_closer_roster table + inbound_messages reallocation columns; before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -101,7 +103,8 @@ python -m src.tasks.meeting_outcome_prompt_sender
 python -m src.agents.cora.worker           # Cora draft-generation worker (LLM sequence + Slack card)
 python -m src.agents.relay.worker          # Relay dispatch worker (Instantly / SMTP send)
 python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
-python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
+python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min to backup_closer_roster, S-13)
+python -m src.tasks.reactivation_resume_sweep  # S-10 — clears a LATER-intent REACTIVATION pause once its target date arrives
 python -m src.tasks.imap_listener          # Ghost Shopper IMAP listener — monitors audit-bot inbox; requires IMAP_ENABLED=True
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
@@ -1375,6 +1378,81 @@ Any file used only during development — notes, planning docs, context summarie
 **Pre-commit check:** before `git add`, run `git status` and confirm no file from a local docs/context folder is staged. If you see one, move it to the gitignored folder before proceeding — never stage-then-remove in a follow-up commit.
 
 ---
+
+### Reply Triage Agent — reactivation, and SLA reallocation (Week 2 §3.2.1, Dev Items S-10/S-12/S-13)
+
+Three gaps in `src/agents/respond/worker.py`'s intent routing, found by the
+Week 0-2 implementation audit. S-10's QUESTION piece (a KB auto-response
+engine) collided with Subtask 2.1.3's own already-merged implementation
+(`knowledge_base_entries` / `match_kb()` / `post_kb_card()` /
+`approve_kb_response` — see that section elsewhere in this doc) once this
+branch was rebased onto current `main`: this S-10 change originally
+duplicated that entire feature with an incompatible (per-client) schema,
+built without visibility into 2.1.3 having already shipped. The duplicate
+was dropped on rebase — only S-10's LATER/NURTURE pieces (genuinely
+non-overlapping) survive here, alongside S-12 and S-13.
+
+**S-10 — LATER/NURTURE.** LATER extracts a target reactivation date from the reply body
+(`src/services/reactivation.py::extract_target_date`, `dateutil.parser`
+with `fuzzy=True`, bounded to `(now, now+365 days]` — outside that window
+or unparseable is treated as no-date-found, never guessed) and pauses the
+contact via the EXISTING `contacts.outbound_paused_at` mechanism (Subtask
+3.2.3's No-Show Handler; already enforced at send time by
+`compliance_gate._check_not_paused`, so no new gate check was needed) plus
+a NEW `contacts.outbound_pause_until` column
+(`migrations/apply_reactivation_pause.py`) that
+`src/tasks/reactivation_resume_sweep.py` clears once due. `pause_contact_
+until()` deliberately never overwrites an existing pause for a DIFFERENT
+reason (e.g. an active `NO_SHOW_RECOVERY` pause) — reactivation defers to
+that pause rather than silently clobbering it, and the resume sweep only
+ever clears a pause whose reason is EXACTLY `'REACTIVATION'`, for the same
+reason. No date extracted (or no known `contact_id` for the reply) sets
+`requires_human_review = TRUE` instead of guessing.
+
+NURTURE is **explicitly deferred, not silently missing**: no monthly
+educational content exists anywhere in this repo, and inventing placeholder
+copy for a real prospect-facing nurture stream was rejected — it continues
+to fall through to plain `ROUTED`, same as before this change, pending a
+real content decision.
+
+**S-12 — UNSUBSCRIBE domain suppression + proof-ledger event.**
+`email_suppression.suppress_by_domain()` already existed but was only ever
+called for `COMPLAINT`; `UNSUBSCRIBE` now calls it too (an opt-out
+suppresses the sender's whole domain, not just their own address — same
+behavior `COMPLAINT` already had). `contacts.is_opted_out`/
+`suppression_state` remain the GLOBAL (cross-tenant) suppression record of
+truth per `email_suppression.py`'s own docstring — this reconciles with
+`events.client_id` being `NOT NULL` by writing the new `suppression_applied`
+event scoped to the `client_id` of the INBOUND MESSAGE that triggered the
+suppression, documenting per-tenant *when* a suppression was observed
+without claiming the suppression EFFECT itself is tenant-scoped.
+
+**S-13 — SLA tier-3 backup-closer reallocation.** `respond_sla_sweep.py`'s
+240-minute tier-3 escalation previously only posted "assign to backup
+closer queue manually" with no roster or real reassignment behind it.
+`backup_closer_roster` (`migrations/apply_backup_closer_roster.py`) is each
+PAYING CLIENT's own pool of backup closers (direct `client_id` column,
+registered in `TENANT_POLICIES` — per-tenant operational data, not global
+config like the KB table above). Tier-3 now claims the
+least-recently-assigned active roster row
+(`SELECT ... FOR UPDATE SKIP LOCKED`, round-robin) and, on a real
+assignment, resets `escalation_level` to 0 and starts a fresh SLA window
+under the new assignee (`assigned_closer_slack_user_id`, `reallocated_at`
+columns) — a settled decision that a reallocated lead should re-enter SLA
+tracking rather than sit in a dead terminal status. **Code-review fix**:
+tier2/tier3's own escalation predicates were still anchored to the
+ORIGINAL, immutable `received_at` — since a once-reallocated lead's
+`received_at` is by definition already older than both thresholds, this
+collapsed the "fresh window" to a ~60-120 second reallocation-churn loop
+(verified live: the lead cascaded to a second closer within two sweep
+ticks instead of after a genuine 240-minute wait). Both predicates now key
+off `COALESCE(reallocated_at, received_at)`, giving each successive backup
+closer a real 240-minute window before the next handoff — tier1 already
+worked correctly via `sla_due_at`, which was already computed from
+`reallocated_at` when set. A client with no active roster configured falls
+back to the pre-S-13 terminal
+`REALLOCATED` status with the original manual-assign note — fail-closed,
+never inventing an assignee.
 
 ## Tooling Rules
 

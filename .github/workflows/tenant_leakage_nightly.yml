@@ -110,6 +110,8 @@ jobs:
           PYTHONPATH=. python migrations/apply_winback_imports.py
           PYTHONPATH=. python migrations/apply_winback_touch_sequence.py
           PYTHONPATH=. python migrations/apply_winback_enrichment.py
+          PYTHONPATH=. python migrations/apply_reactivation_pause.py
+          PYTHONPATH=. python migrations/apply_backup_closer_roster.py
           PYTHONPATH=. python migrations/apply_rls_policies.py
           PYTHONPATH=. python migrations/apply_akrash_grant.py
       - name: Run tenant leakage suite

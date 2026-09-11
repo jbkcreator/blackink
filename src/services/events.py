@@ -148,6 +148,15 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"owner_enrichment_completed": frozenset(
 		{"provider", "signal_source", "email_found", "phone_found", "requires_review"}
 	),
+	# S-12 — UNSUBSCRIBE now also suppresses the sender's whole domain (not
+	# just their email), and this event is the proof-ledger record of that
+	# action. contacts.is_opted_out/suppression_state remain the GLOBAL
+	# (cross-tenant) record of truth per email_suppression.py's own
+	# docstring — this event is deliberately scoped to the client_id of the
+	# INBOUND MESSAGE that triggered the suppression (events.client_id is
+	# NOT NULL), documenting per-tenant *when a suppression was observed*,
+	# not claiming the suppression itself is tenant-scoped.
+	"suppression_applied": frozenset({"scope", "sender_email", "reason"}),
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is

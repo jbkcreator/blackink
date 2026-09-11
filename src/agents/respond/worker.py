@@ -3,16 +3,23 @@
 Reads from the respond:inbound Redis Stream, loads the inbound_messages DB
 row, classifies the intent, writes the result back, then routes:
 
-  UNSUBSCRIBE  → SUPPRESSED  + contact suppressed + Slack #command alert
+  UNSUBSCRIBE  → SUPPRESSED  + contact AND domain suppressed (S-12) + proof-ledger event + Slack #command alert
   LEGAL_GRIEF  → ESCALATED   + CLIENT relay halt  + Slack #command P0 alert
   COMPLAINT    → ROUTED      + domain suppressed  + sequence halted + #blackink-qa alert
   HOT_LEAD     → ROUTED      + context card       + sequence halted
   WHALE_OWNER  → ROUTED      + context card
   OBJECTION    → ROUTED      + context card
   QUESTION     → ROUTED      + requires_human_review=TRUE if confidence < 0.90
+                             + KB-matched draft card posted to #sales-replies (Subtask 2.1.3 /
+                               PR #46's knowledge_base_entries + match_kb()/post_kb_card() —
+                               NOT this S-10 change; S-10's own duplicate implementation of this
+                               piece was dropped when this branch was rebased onto main and the
+                               collision was found)
   PARTNER      → ROUTED      + Slack #client-growth notice
-  LATER        → DEFERRED
-  NURTURE      → ROUTED
+  LATER        → DEFERRED    + (S-10) contact paused until an extracted target date, or
+                               requires_human_review=TRUE if no date could be extracted
+  NURTURE      → ROUTED      (S-10's monthly nurture stream is explicitly DEFERRED — no
+                               content/enrollment exists yet; falls through unchanged)
 
 Control flow per iteration:
   1. read_batch()      — claim one message from the stream.
@@ -87,7 +94,7 @@ def _consumer_name() -> str:
 def _load_row(db: Any, db_id: int) -> Optional[Dict[str, Any]]:
     row = db.execute(
         text(
-            "SELECT id, client_id, sender_email, subject, body_text, status, received_at "
+            "SELECT id, client_id, contact_id, sender_email, subject, body_text, status, received_at "
             "FROM inbound_messages WHERE id = :id"
         ),
         {"id": db_id},
@@ -217,6 +224,9 @@ def _route(
     sender_email: str,
     received_at: Any,
     result: ClassificationResult,
+    *,
+    body_text: str = "",
+    contact_id: Optional[int] = None,
 ) -> str:
     """Determine terminal status, write it, fire any side-effects. Returns final status."""
     if isinstance(received_at, datetime):
@@ -248,10 +258,47 @@ def _route(
             logger.exception("respond.worker: kb match failed for db_id=%s", db_id)
         requires_human_review = result.confidence < 0.90 or is_fallback
 
+    # S-10 — LATER: extract a target reactivation date and pause the
+    # contact's outbound sequence until then. No clean date, or no known
+    # contact_id (an inbound reply doesn't always resolve to one) -> flag
+    # for human review rather than guessing.
+    if result.intent == Intent.LATER:
+        from src.services.reactivation import extract_target_date, pause_contact_until
+        target_date = extract_target_date(body_text, as_of=received_at_dt)
+        if target_date is not None and contact_id is not None:
+            pause_contact_until(db, contact_id, target_date)
+        else:
+            requires_human_review = True
+
     # Pre-commit side-effects that must be atomic with the status write.
     if result.intent == Intent.UNSUBSCRIBE:
-        from src.services.email_suppression import suppress_by_email
+        from src.services.email_suppression import suppress_by_email, suppress_by_domain
         suppress_by_email(db, sender_email, reason="inbound_opt_out")
+        # S-12 — an opt-out suppresses the WHOLE domain, not just the
+        # sender's own address (previously only COMPLAINT did this).
+        domain = sender_email.split("@")[-1].strip().lower() if "@" in sender_email else ""
+        if domain:
+            suppress_by_domain(db, domain, reason="inbound_opt_out")
+        # S-12 — proof-ledger event. Scoped to THIS message's client_id
+        # (events.client_id is NOT NULL) even though the suppression effect
+        # itself is global/cross-tenant — see events.py's REQUIRED_PAYLOAD_
+        # FIELDS entry for suppression_applied and email_suppression.py's
+        # own docstring for why the contacts row, not events, is the
+        # suppression record of truth.
+        log_event(
+            client_id,
+            "suppression_applied",
+            entity_type="inbound_message",
+            entity_id=str(db_id),
+            payload={
+                "scope": "EMAIL_AND_DOMAIN" if domain else "EMAIL",
+                "sender_email": sender_email,
+                "domain": domain,
+                "reason": "inbound_opt_out",
+            },
+            actor="respond_worker",
+            session=db,
+        )
 
     elif result.intent == Intent.COMPLAINT:
         from src.services.email_suppression import suppress_by_domain
@@ -432,6 +479,8 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
             sender_email=row.get("sender_email") or "",
             received_at=row.get("received_at") or datetime.now(timezone.utc),
             result=result,
+            body_text=row.get("body_text") or "",
+            contact_id=row.get("contact_id"),
         )
 
     try:
