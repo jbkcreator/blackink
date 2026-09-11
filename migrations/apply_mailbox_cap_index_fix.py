@@ -47,7 +47,7 @@ build is interrupted (killed, or errors partway), Postgres leaves behind
 an INVALID index rather than cleanly rolling back — a subsequent run of
 this script's CREATE INDEX CONCURRENTLY IF NOT EXISTS would then no-op
 against that invalid index rather than fixing it. Recovery is a manual
-`DROP INDEX CONCURRENTLY ix_inbound_messages_mailbox_cap` followed by
+`DROP INDEX CONCURRENTLY ix_inbound_messages_mailbox_cap_v2` followed by
 re-running this script — not automated here, since detecting and
 self-healing an invalid index is more machinery than a one-time index
 swap on a still-small table warrants.
@@ -75,12 +75,24 @@ from sqlalchemy import text
 
 from src.core.database import db
 
+# Merge note (PR #48 x main's 2.1.3 KB Auto-Response Engine): the cap subquery
+# these indexes serve now also counts in-flight 'SENDING' rows and falls back
+# through claimed_at before received_at, so the shape above no longer matches
+# it — a partial index on status IN ('RESPONDED','SENT_UNCONFIRMED') is not
+# implied by the merged query's `status = 'SENDING' OR (...)` predicate, and a
+# functional index on COALESCE(responded_at, received_at) cannot serve a filter
+# on COALESCE(responded_at, claimed_at, received_at). Hence the _v2 name: the
+# v1 index may already exist live with the stale definition, and
+# CREATE INDEX ... IF NOT EXISTS would silently no-op against it.
 DDL = [
     "DROP INDEX CONCURRENTLY IF EXISTS ix_inbound_messages_mailbox_responded",
+    "DROP INDEX CONCURRENTLY IF EXISTS ix_inbound_messages_mailbox_cap",
     """
-    CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_inbound_messages_mailbox_cap
-        ON inbound_messages (mailbox_id, COALESCE(responded_at, received_at))
-        WHERE status IN ('RESPONDED', 'SENT_UNCONFIRMED')
+    CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_inbound_messages_mailbox_cap_v2
+        ON inbound_messages (
+            mailbox_id, status, COALESCE(responded_at, claimed_at, received_at)
+        )
+        WHERE status IN ('SENDING', 'RESPONDED', 'SENT_UNCONFIRMED')
     """,
 ]
 

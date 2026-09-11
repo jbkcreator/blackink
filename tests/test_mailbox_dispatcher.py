@@ -259,7 +259,7 @@ def test_cap_query_falls_back_to_received_at_for_unconfirmed_rows():
     session = _session_with_mailbox(client_id="client_a")
     get_active_mailbox_for_client(session, "client_a")
     join_sql = str(session.execute.call_args_list[3][0][0])
-    assert "COALESCE(im.responded_at, im.received_at)" in join_sql
+    assert "COALESCE(im.responded_at, im.claimed_at, im.received_at)" in join_sql
 
 
 # ---------------------------------------------------------------------------

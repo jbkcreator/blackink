@@ -99,6 +99,7 @@ MIGRATIONS=(
   apply_winback_imports
   apply_winback_touch_sequence
   apply_winback_enrichment
+  apply_knowledge_base
   apply_rls_policies
   apply_akrash_grant
 )
