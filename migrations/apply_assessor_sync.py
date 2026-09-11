@@ -71,10 +71,35 @@ from src.core.database import get_owner_db_context
 
 DDL = [
 	# ── 1. Rename the table (free — never held data) ───────────────────────
+	# Guarded by an existence check rather than catching undefined_table:
+	# run_migrations.sh always runs apply_raw_assessor_parcels.py (CREATE
+	# TABLE IF NOT EXISTS) immediately before this script, on every re-run
+	# of the whole sequence — including runs after this rename already
+	# happened once. That recreates an empty raw_assessor_parcels every
+	# time, which made the old exception-based rename fail with
+	# DuplicateTable on the second full run (caught live on the deploy
+	# server). This version only renames when assessor_parcels doesn't
+	# already exist, and is otherwise a clean no-op.
 	"""
 	DO $$ BEGIN
-	  ALTER TABLE raw_assessor_parcels RENAME TO assessor_parcels;
-	EXCEPTION WHEN undefined_table THEN NULL; END $$;
+	  IF to_regclass('public.assessor_parcels') IS NULL
+	     AND to_regclass('public.raw_assessor_parcels') IS NOT NULL THEN
+	    ALTER TABLE raw_assessor_parcels RENAME TO assessor_parcels;
+	  END IF;
+	END $$;
+	""",
+	# The stray empty raw_assessor_parcels that apply_raw_assessor_parcels.py
+	# recreates on every subsequent run (see above) is never written to by
+	# anything post-rename — safe to drop once assessor_parcels is the real
+	# table. Guarded to only ever drop it when it's genuinely empty.
+	"""
+	DO $$ BEGIN
+	  IF to_regclass('public.assessor_parcels') IS NOT NULL
+	     AND to_regclass('public.raw_assessor_parcels') IS NOT NULL
+	     AND (SELECT COUNT(*) FROM raw_assessor_parcels) = 0 THEN
+	    DROP TABLE raw_assessor_parcels;
+	  END IF;
+	END $$;
 	""",
 	"DROP INDEX IF EXISTS ix_raw_assessor_parcels_lookup",
 
