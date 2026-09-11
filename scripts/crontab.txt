@@ -52,6 +52,12 @@
 # sweep allowed) — see scripts/cron_work_orders_sweep_all_clients.py.
 */5 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m scripts.cron_work_orders_sweep_all_clients >> /root/blackink/logs/work_orders_sweep.log 2>&1
 
+# ── Client Wins Dashboard export (all active clients) ────────────────────
+# Every 15 min. Refreshes each active client's wins Google Sheet for Looker
+# Studio (Subtask 3.2.5 Stage 6 / S-21). Skips clients with NULL wins_sheet_id
+# and never raises on a Sheets outage.
+*/15 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.client_wins_sweep >> /root/blackink/logs/client_wins_sweep.log 2>&1
+
 # ── DNC re-scrub ──────────────────────────────────────────────────────────
 # 1st and 15th of the month. Keeps contacts.dnc_clean fresh within the
 # FTC's 31-day safe-harbor window — a once-monthly run risks a >31-day gap

@@ -46,6 +46,7 @@ MIGRATIONS=(
   apply_area_code_timezones
   apply_clients
   apply_clients_stl_fields
+  apply_clients_wins_sheet
   apply_relay_halts
   apply_vera_health_runs
   apply_companies
