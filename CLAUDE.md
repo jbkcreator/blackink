@@ -20,8 +20,8 @@ uvicorn src.api.main:app --reload --port 8000
 # Migrations (idempotent scripts, no Alembic) — run in this order:
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
-PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py   # Subtask 3.1.1 — Akrash staging feed, not tenant-bearing, any time after counties
-PYTHONPATH=. python migrations/apply_assessor_roll_imports.py   # S-24 — audit trail for the assessor-roll loader sweep + blackink_system INSERT/DELETE grant on raw_assessor_parcels; not tenant-bearing, any time after apply_raw_assessor_parcels.py
+PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py   # creates the table this repo later renames to assessor_parcels; not tenant-bearing, any time after counties
+PYTHONPATH=. python migrations/apply_assessor_sync.py   # renames raw_assessor_parcels -> assessor_parcels, extends it, adds assessor_sync_state; run right after apply_raw_assessor_parcels.py
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
@@ -86,13 +86,13 @@ PYTHONPATH=. python migrations/apply_band2_counters.py   # S-9 — Band 2 consec
 PYTHONPATH=. python migrations/apply_reactivation_pause.py   # S-10 — contacts.outbound_pause_until (additive column on an already-registered table); any time after apply_bookings.py
 PYTHONPATH=. python migrations/apply_backup_closer_roster.py   # S-13 — new tenant-bearing backup_closer_roster table + inbound_messages reallocation columns; before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
-PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
+PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS; grants only raw_prospect_companies/raw_prospect_contacts as of 2026-09-11 — assessor_parcels is no longer Akrash's to write, see Architecture below
 
 # Background jobs
 python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
+python -m src.tasks.assessor_sync             # daily county assessor roll sync (Pinellas + Hillsborough); requires ASSESSOR_SYNC_ENABLED=True
 python -m src.tasks.deliverability_sentinel
-python -m src.tasks.assessor_roll_refresh_sweep  # S-24 — monthly county assessor roll change-detection + reimport
 python -m src.tasks.hunter_nightly_sweep
 python -m src.tasks.calendar_subscription_renewal
 python -m src.tasks.calendar_sync_worker
@@ -256,6 +256,61 @@ the canonical `companies`/`contacts` tables — a company can promote with
 only one of its two contacts clean (confirmed behavior). Nothing is ever
 silently dropped: every row that doesn't promote carries a
 `reject_reason_code`.
+
+### Automated County Assessor Data Sync (Pinellas + Hillsborough)
+`assessor_parcels` (renamed 2026-09-11 from `raw_assessor_parcels`) is
+**not** an Akrash-staged feed — that was always an unverified assumption,
+never traceable to the client's build spec, and left the table permanently
+empty since nothing actually granted Akrash a working write path (see
+`apply_akrash_grant.py`'s own docstring for how that grant would have been
+silently wiped anyway). `src/tasks/assessor_sync.py` is the real, confirmed
+source: a daily sweep that checks each county's official bulk-download page,
+downloads only when the published version changed, and upserts a normalized,
+eligibility-flagged roll. One task, one cron entry, both counties — Pinellas's
+two files (`RP_PROPERTY_INFO`, `RP_EXEMPTIONS`) are two calls into the same
+Pinellas functions with a different dataset name, not separate code paths.
+Full design rationale, source verification, and review history:
+`docs/plans/2026-09-11-automated-county-assessor-data-sync.md`.
+
+**Hillsborough's `PARCEL_SPREADSHEET.xls` is not Excel** — verified
+byte-for-byte against the live download: it's a dBase III `.dbf` file (magic
+byte `0x03`, not OLE2/ZIP), which Excel opens natively (hence the misleading
+name/icon on the county's own page), but `pandas.read_excel()`/`xlrd`/`openpyxl`
+all reject outright. `src/services/assessor/dbase.py` is a small streaming
+`struct`-based reader — dBase III is a frozen format and the file's records are
+fixed-width, so this parses the 500+ MB file at constant memory with no
+dependency install.
+
+**Per-county use-code allowlist — county-scoped namespaces, never a shared
+vocabulary.** The same 4-digit code means different, sometimes opposite,
+things per county (Hillsborough `0111` = "Residential permit pending",
+excluded; Pinellas `0111` = "Single Family Community Land Trust", a real
+residential use excluded only by a separate business decision). `mapping.py`'s
+allowlists are keyed `(county_slug, code)`; collapsing this into one shared
+dict would silently apply one county's rules to the other's parcels.
+
+**Column ownership is the load-bearing design.** Two independently-scheduled
+Pinellas files write the same `assessor_parcels` rows. `RP_PROPERTY_INFO`
+(the row-identifying import; also Hillsborough's single file) owns
+identity/owner/mailing/use/status/source-tracking columns and is the only
+import that ever retires a vanished parcel. `RP_EXEMPTIONS` owns only
+`homestead_*`/`property_exemption_raw`/`exemption_excluded`, via a pure
+`UPDATE` (never an upsert — it has no address/owner data, so an INSERT would
+violate `NOT NULL` constraints) that never touches `source_dataset`/
+`last_seen_at`/`retired_at`. `is_blackink_eligible` is a STORED generated
+column, `property_class IS NOT NULL AND exemption_excluded IS FALSE` — this
+split (rather than one Python-computed eligibility field both imports could
+race on) is what makes the two-file write conflict structurally impossible
+rather than merely avoided by convention. `exemption_excluded` defaults `NULL`
+("not yet evaluated") so a brand-new Pinellas parcel is ineligible by
+default until `RP_EXEMPTIONS` has actually run for it — fail-closed, never a
+transient false-eligible window.
+
+`winback_ingest.StagingTableAssessorProvider` is the sole reader
+(`check_still_owns()`), filtered to `retired_at IS NULL AND
+is_blackink_eligible` — this is what makes Win-Back's ownership check return
+real `True`/`False`/`None` answers instead of the pre-sync unconditional
+`None`.
 
 ### Compliance gate vs. quarantine gate — two different lifecycle stages
 - `src/services/quarantine_gate.py` — is a freshly-ingested row eligible
@@ -1469,42 +1524,15 @@ acceptance criterion specifically; the field costs nothing to record more
 broadly. No schema change, no new event type — an additive, non-required
 payload field on an event that already fires for every classified reply.
 
-### Assessor roll loader (S-24, W2 §3.2.4 A)
+### Assessor roll loader — superseded
 
-`raw_assessor_parcels` (Subtask 3.1.1) sat empty because Akrash was never
-contracted to supply it. Reclassified from an external (Akrash) blocker to
-platform dev work, since the underlying data is public county tax-roll
-information — but it is **not** a stable self-serve HTTP download:
-Hillsborough County's own property-appraiser site sells its full assessment
-extract as a paid, manually-ordered product (email/phone/in-person, not a
-direct download link), and Florida DOR's exact current-year statewide NAL
-download path could not be confirmed live. `src/services/
-assessor_roll_loader.py` therefore does not scrape any vendor/county URL —
-acquisition is a manual operator step (buy or obtain the county's roll
-extract, place it at the path `config/settings.py`'s
-`assessor_roll_path_hillsborough`/`assessor_roll_path_pinellas` names for
-that county), mirroring this repo's own posture for other un-automatable
-external inputs rather than guessing at an unverified integration.
-
-`src/tasks/assessor_roll_refresh_sweep.py` runs monthly via
-`scripts/crontab.txt` (not an in-process `_start_background_workers`
-thread — matching how `daily_digest`/`county_allocation_reassessment`/
-`deliverability_sentinel` are all cron-scheduled, not threaded, for
-daily-or-less-frequent work). It hashes each configured county's file
-(sha256, not mtime — a redeploy that doesn't change content must never
-trigger a needless reimport) and only reimports on a genuine content
-change; every tick writes one row to `assessor_roll_imports`
-(`migrations/apply_assessor_roll_imports.py`; not tenant-bearing, same
-class as `raw_assessor_parcels` itself) recording `SUCCESS`, `UNCHANGED`,
-`FAILED`, or `MISSING` — a successful no-op is recorded, not silently
-skipped, so "the sweep ran and found nothing to do" is as visible in the
-audit trail as an actual import. Alerts `#blackink-qa` on `MISSING`
-(configured path unreadable), `FAILED` (parse/validation error — existing
-rows for that county are left completely untouched, a fail-closed
-guarantee that a bad new file can never wipe good existing data), and
-`STALE` (no `SUCCESS` for a county within `settings.assessor_roll_
-staleness_days`, default 400 — county rolls are certified annually, so a
-healthy county shows one `SUCCESS` at least once a year).
+An earlier PR (S-24, W2 §3.2.4 A) shipped a manual-file loader here
+(`assessor_roll_loader.py`, `assessor_roll_refresh_sweep.py`,
+`assessor_roll_imports`) under the assumption that neither county exposes a
+stable free bulk download. That assumption was wrong — see "Automated
+County Assessor Data Sync" below, which replaces this entirely with a live
+scraper verified against both counties' real sites. The manual-file
+loader, its monthly sweep, and `assessor_roll_imports` have been removed.
 
 A tax roll is a full point-in-time snapshot, not an incremental feed — a
 genuine content change means `import_county_roll()` does a transactional

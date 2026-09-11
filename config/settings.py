@@ -310,6 +310,26 @@ class AppSettings(BaseSettings):
 	def booking_redirect_allowed_hosts(self) -> Tuple[str, ...]:
 		return tuple(v.strip().lower() for v in self.booking_redirect_allowed_hosts_raw.split(",") if v.strip())
 
+	# ── County Assessor Data Sync ────────────────────────────────────────────
+	# Default False: fail-closed until an operator explicitly enables the
+	# daily sync, same posture as email_sending_enabled.
+	assessor_sync_enabled: bool = Field(default=False, env="ASSESSOR_SYNC_ENABLED")
+	# pcpao.gov actively 403s the default python-requests UA (confirmed
+	# 2026-09-11) — a real browser UA is mandatory there, not cosmetic.
+	assessor_http_user_agent: str = Field(
+		default=(
+			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+			"(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+		),
+		env="ASSESSOR_HTTP_USER_AGENT",
+	)
+	assessor_download_dir: str = Field(default="tmp/assessor_sync", env="ASSESSOR_DOWNLOAD_DIR")
+	# Current largest file (Hillsborough's PARCEL_SPREADSHEET) is ~563 MB —
+	# capped well above that so a legitimate future roll growth doesn't trip
+	# it, but still bounded rather than trusting an arbitrarily large response.
+	assessor_max_download_bytes: int = Field(default=1_500_000_000, env="ASSESSOR_MAX_DOWNLOAD_BYTES")
+	assessor_sync_max_attempts: int = Field(default=3, env="ASSESSOR_SYNC_MAX_ATTEMPTS")
+
 	# Optional — the /audit landing page renders no pixel <script> at all
 	# when unset (see src/api/public_landing_router.py), never a broken tag.
 	meta_pixel_id: Optional[str] = Field(default=None, env="META_PIXEL_ID")
@@ -412,26 +432,6 @@ class AppSettings(BaseSettings):
 	# Set PDF_LOCAL_DIR to a writable path; swap get_pdf_store() for S3PdfStore
 	# once AWS credentials exist.
 	pdf_local_dir: str = Field(default="tmp/pdf", env="PDF_LOCAL_DIR")
-
-	# ── S-24 (W2 §3.2.4 A) — Assessor roll loader ────────────────────────────
-	# A county tax-roll extract is not a stable self-serve HTTP download —
-	# Hillsborough's own site sells its full assessment data as a paid,
-	# manually-ordered product, and the FL DOR statewide portal's exact
-	# current-year download path is unverified. So acquisition is a manual
-	# operator step (buy/download the file, place it at this path) — these
-	# settings name where the loader looks, not how the file got there.
-	# Empty/missing path -> that county is skipped (fail closed, matching
-	# EMAIL_SENDING_ENABLED's own "unset means don't guess" posture) rather
-	# than the sweep silently doing nothing with no signal.
-	assessor_roll_path_hillsborough: str = Field(
-		default="data/assessor_rolls/hillsborough_fl.csv", env="ASSESSOR_ROLL_PATH_HILLSBOROUGH"
-	)
-	assessor_roll_path_pinellas: str = Field(
-		default="data/assessor_rolls/pinellas_fl.csv", env="ASSESSOR_ROLL_PATH_PINELLAS"
-	)
-	# County tax rolls are certified/updated annually — an import older than
-	# this is stale and worth a human's attention, not a silent gap.
-	assessor_roll_staleness_days: int = Field(default=400, env="ASSESSOR_ROLL_STALENESS_DAYS")
 
 	# ── Ink Sendspark ─────────────────────────────────────────────────────────
 	# Fail-closed: if either is unset, node_sendspark logs SENDSPARK_SKIPPED and
