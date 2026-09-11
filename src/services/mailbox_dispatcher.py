@@ -185,13 +185,18 @@ def get_active_mailbox_for_client(
             "        AND d.status IN ('SENDING', 'SENT') "
             "        AND d.created_at >= NOW() - INTERVAL '24 hours' "
             "    ) + ( "
-            # Speed-to-Lead auto-responses (Task 4.2.1) also consume this
-            # mailbox's rolling-24h capacity — count them here, or repeated
-            # inbound responses could blow past the cap while every check passes.
+            # Inbound auto-responses (Speed-to-Lead and KB replies) consume this
+            # mailbox's rolling-24h capacity. SENDING rows are in-flight sends that
+            # have reserved cap inside the advisory-lock transaction but whose SMTP
+            # call has not yet returned — counting them prevents concurrent approvals
+            # from racing past the cap before any of them writes RESPONDED.
             "      SELECT COUNT(*) FROM inbound_messages im "
             "      WHERE im.mailbox_id = m.id "
-            "        AND im.status = 'RESPONDED' "
-            "        AND im.responded_at >= NOW() - INTERVAL '24 hours' "
+            "        AND ( "
+            "          im.status = 'SENDING' "
+            "          OR (im.status IN ('RESPONDED', 'SENT_UNCONFIRMED') "
+            "              AND COALESCE(im.responded_at, im.claimed_at) >= NOW() - INTERVAL '24 hours') "
+            "        ) "
             "    ) + ( "
             # Speed-to-Lead cadence follow-ups (Task 4.2.2) also consume this
             # mailbox's rolling-24h capacity — without this a mailbox at cap

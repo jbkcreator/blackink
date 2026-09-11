@@ -1,4 +1,4 @@
-name: Compliance gates (Dev 4)
+name: Compliance gates
 
 # Sprint spec: "CI/CD gate — build MUST FAIL if outbound SMS is attempted
 # for a contact where inbound_sms_count=0 AND booked_appointment_id IS NULL"
