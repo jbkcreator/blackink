@@ -168,8 +168,10 @@ def test_export_writes_four_tabs():
 
     titles = [c.args[0] for c in sh.worksheet.call_args_list]
     assert titles == ["Summary", "KPIs", "Wins", "Trend"]
-    assert ws.clear.call_count == 4
+    # write-then-trim: update BEFORE resize on every tab, and no clear-then-write
     assert ws.update.call_count == 4
+    assert ws.resize.call_count == 4
+    assert ws.clear.call_count == 0
     assert result == 1  # len(summary rows)
 
 

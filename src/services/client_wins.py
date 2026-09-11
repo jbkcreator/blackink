@@ -145,14 +145,20 @@ def compute_weekly_trend(client_id: str) -> List[list]:
 
 def _write_tab(spreadsheet, title: str, values: List[list]) -> None:
     """Write `values` (header + rows) to the named worksheet tab, creating it if
-    absent. Cleared first so a shrinking dataset never leaves stale trailing
-    rows."""
+    absent.
+
+    Write-then-trim, never clear-then-write: the new values overwrite from A1
+    FIRST, then the tab is resized down to exactly the new row count to drop any
+    stale trailing rows. If the write fails, the prior data is left intact rather
+    than blanked (PR #53 review finding 2 — a clear() that succeeded before a
+    failed update() left a dashboard tab empty). resize() failing after a
+    successful update only leaves harmless stale trailing rows, never a blank."""
     try:
         ws = spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = spreadsheet.add_worksheet(title=title, rows=max(len(values) + 5, 20), cols=max(len(values[0]) if values else 2, 5))
-    ws.clear()
     ws.update(values)
+    ws.resize(rows=max(len(values), 1))
 
 
 def export_client_wins(client_id: str, sheet_id: str) -> int:
