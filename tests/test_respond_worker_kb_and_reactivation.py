@@ -100,6 +100,38 @@ def test_later_with_date_but_no_contact_id_flags_human_review_instead_of_pausing
     assert write_call[0][1]["human_review"] is True
 
 
+def test_later_with_competing_pause_preserves_requested_date_and_flags_review():
+    """Review fix: a contact already paused for a DIFFERENT reason (e.g.
+    NO_SHOW_RECOVERY) replies with a valid LATER date. pause_contact_until()
+    correctly refuses to clobber the existing pause and returns False — but
+    the requested date must not be silently discarded: it must land in
+    classification_meta for a human to action, and the message must be
+    flagged for review, exactly as if no date had been extracted at all."""
+    db = _mock_db()
+    target = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    with patch("src.services.reactivation.extract_target_date", return_value=target), \
+         patch("src.services.reactivation.pause_contact_until", return_value=False) as mock_pause, \
+         patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
+        _route(
+            db=db, db_id=73, client_id="CL1", sender_email="owner@co.com",
+            received_at=datetime.now(timezone.utc),
+            result=_result(Intent.LATER),
+            body_text="contact me in three months", contact_id=55,
+        )
+    # pause_contact_until was actually attempted (contact_id + date both known).
+    mock_pause.assert_called_once_with(db, 55, target)
+
+    write_call = next(
+        c for c in db.execute.call_args_list
+        if "requires_human_review" in _sql_text_of_call(c)
+    )
+    assert write_call[0][1]["human_review"] is True
+
+    import json as _json
+    meta = _json.loads(write_call[0][1]["meta"])
+    assert meta["requested_reactivation_date"] == target.isoformat()
+
+
 # ---------------------------------------------------------------------------
 # S-12 — UNSUBSCRIBE domain suppression + proof-ledger event
 # ---------------------------------------------------------------------------

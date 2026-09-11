@@ -266,7 +266,20 @@ def _route(
         from src.services.reactivation import extract_target_date, pause_contact_until
         target_date = extract_target_date(body_text, as_of=received_at_dt)
         if target_date is not None and contact_id is not None:
-            pause_contact_until(db, contact_id, target_date)
+            paused = pause_contact_until(db, contact_id, target_date)
+            if not paused:
+                # Review-fix: pause_contact_until() correctly refuses to
+                # clobber an existing non-REACTIVATION pause (e.g. a
+                # NO_SHOW_RECOVERY pause) and returns False — but the
+                # requested date must not be silently discarded just
+                # because it lost to a competing pause. Stash it in
+                # classification_meta (no schema change, no conflict with
+                # the other pause's own columns) so a human reviewing this
+                # message can see and act on the requested date once the
+                # competing pause clears, and flag for review since no
+                # automated pause was actually applied.
+                result.meta["requested_reactivation_date"] = target_date.isoformat()
+                requires_human_review = True
         else:
             requires_human_review = True
 
