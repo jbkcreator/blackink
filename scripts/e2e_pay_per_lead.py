@@ -89,6 +89,16 @@ APM_HTML = """<html><body>
 <p>Owner Name: Holly HTML</p><p>Email: holly.html@example.test</p>
 <p>Phone: 303-555-0104</p><p>Property Address: 40 HTML Rd, Denver, CO</p>
 <p>Message: HTML-only lead notification.</p></body></html>"""
+# Zillow Rental Manager lead (Zillow Group: also covers Trulia/HotPads). Phone is
+# deliberately absent and the email is the anonymised relay — a name + relay
+# email is still a usable, auto-dispatchable lead.
+ZILLOW_BODY = """Name: Zoe Zillow
+Email: zms-90210@reply.zillow.com
+Property Address: 50 Zillow Way, Tampa, FL
+Move-in: 2026-10-15
+Tour Requested: Sat Sep 20, 3:00 PM
+Message: Interested in this rental.
+"""
 
 
 class Results:
@@ -225,6 +235,7 @@ def main() -> int:
         ("mmp-plain", "Leads <notify@managemyproperty.com>", MMP_BODY, "", "MANAGE_MY_PROPERTY", "Milo MMP", "milo.mmp@example.test"),
         ("thumbtack-plain", "Thumbtack <no-reply@thumbtack.com>", THUMBTACK_BODY, "", "THUMBTACK", "Tia Thumbtack", "tia.thumbtack@example.test"),
         ("apm-html", "APM Leads <leads@allpropertymanagement.com>", "", APM_HTML, "APM", "Holly HTML", "holly.html@example.test"),
+        ("zillow-plain", "Zillow <zms-90210@reply.zillow.com>", ZILLOW_BODY, "", "ZILLOW", "Zoe Zillow", "zms-90210@reply.zillow.com"),
     )
 
     print("[portal ingress] recognized payloads")
@@ -284,7 +295,7 @@ def main() -> int:
         client_id=CLIENT_ID,
     )
     dispatched = speed_to_lead_sweep.run_sweep(limit=20)
-    R.check("sweep dispatches all four parsed leads", dispatched == 4, str(dispatched))
+    R.check("sweep dispatches all five parsed leads", dispatched == 5, str(dispatched))
     dispatched_rows = {row.idempotency_key: row.status for row in message_rows()}
     for message_id, *_ in cases:
         key = next((key for key in dispatched_rows if key.endswith(f":{message_id}@e2e.test")), None)

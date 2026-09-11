@@ -10,6 +10,7 @@ from src.services.portal_parsers import (
     parse_apm,
     parse_manage_my_property,
     parse_thumbtack,
+    parse_zillow,
 )
 
 
@@ -48,6 +49,28 @@ Location: Denver, CO
 Job: Property management for 2-unit residential
 Budget: $150/month
 """
+
+# Representative Zillow Rental Manager lead notification. Phone is deliberately
+# absent (Zillow routes calls through a separate number) and the email is the
+# anonymised relay address — matching the documented real field set.
+ZILLOW_BODY = """\
+Name: Carla Mendez
+Email: zms-77421@reply.zillow.com
+Property Address: 900 Bayshore Blvd, Tampa, FL 33606
+Move-in: 2026-10-01
+Tour Requested: Sat Sep 20, 2:00 PM
+Message: Interested in touring this rental this weekend.
+"""
+
+ZILLOW_HTML_ONLY = (
+    "<html><body>"
+    "<p>Name: Carla Mendez</p>"
+    "<p>Email: zms-77421@reply.zillow.com</p>"
+    "<p>Property Address: 900 Bayshore Blvd, Tampa, FL 33606</p>"
+    "<p>Move-in: 2026-10-01</p>"
+    "<p>Message: Interested in touring this rental this weekend.</p>"
+    "</body></html>"
+)
 
 
 # ── APM parser ────────────────────────────────────────────────────────────────
@@ -118,6 +141,33 @@ class TestParseThumbTack:
         assert result.inquiry_text is not None and "$200" in result.inquiry_text
 
 
+# ── Zillow (Zillow Group: Zillow / Trulia / HotPads) parser ───────────────────
+
+class TestParseZillow:
+    def test_extracts_fields_phone_optional(self):
+        result = parse_zillow(_parts(body=ZILLOW_BODY))
+        assert result.source_channel == "ZILLOW"
+        assert result.prospect_name == "Carla Mendez"
+        assert result.email == "zms-77421@reply.zillow.com"
+        assert result.property_address is not None and "Bayshore" in result.property_address
+        # Phone absent from a Zillow notification is normal — name + relay email
+        # is a usable lead, so it must NOT be flagged for review.
+        assert result.phone is None
+        assert result.requires_human_review is False
+
+    def test_move_in_and_tour_folded_into_inquiry(self):
+        result = parse_zillow(_parts(body=ZILLOW_BODY))
+        assert result.inquiry_text is not None
+        assert "Move-in" in result.inquiry_text
+        assert "Tour requested" in result.inquiry_text
+
+    def test_missing_name_degrades_to_review(self):
+        body = "Email: zms-1@reply.zillow.com\nProperty Address: 1 Main St"
+        result = parse_zillow(_parts(body=body))
+        assert result.source_channel == "ZILLOW"
+        assert result.requires_human_review is True
+
+
 # ── Dispatcher: matching ──────────────────────────────────────────────────────
 
 class TestClassifyAndParse:
@@ -141,6 +191,44 @@ class TestClassifyAndParse:
             body=THUMBTACK_BODY,
         ))
         assert result.source_channel == "THUMBTACK"
+
+    def test_zillow_relay_subdomain_sender_matches(self):
+        # Real Zillow leads arrive from the anonymised relay reply.zillow.com,
+        # a subdomain of zillow.com — must match the Zillow Group config.
+        result = classify_and_parse(_parts(
+            sender="Zillow <zms-77421@reply.zillow.com>",
+            body=ZILLOW_BODY,
+        ))
+        assert result.source_channel == "ZILLOW"
+        assert result.prospect_name == "Carla Mendez"
+
+    def test_trulia_and_hotpads_domains_route_to_zillow(self):
+        # Trulia/HotPads leads syndicate through Zillow Rental Manager; the
+        # alias domains resolve to the single ZILLOW channel/parser.
+        for sender in ("noreply@trulia.com", "info@hotpads.com"):
+            result = classify_and_parse(_parts(sender=sender, body=ZILLOW_BODY))
+            assert result.source_channel == "ZILLOW", sender
+
+    def test_zillow_html_only_is_parsed(self):
+        result = classify_and_parse(_parts(
+            sender="zms-1@reply.zillow.com",
+            subject="You have a new rental lead",
+            body="",
+            html=ZILLOW_HTML_ONLY,
+        ))
+        assert result.source_channel == "ZILLOW"
+        assert result.prospect_name == "Carla Mendez"
+        assert result.email == "zms-77421@reply.zillow.com"
+        assert result.requires_human_review is False
+
+    def test_spoofed_zillow_display_name_rejected(self):
+        result = classify_and_parse(_parts(
+            sender="Zillow <attacker@evil.example>",
+            subject="New lead",
+            body=ZILLOW_BODY,
+        ))
+        assert result.source_channel == UNCLASSIFIED
+        assert result.requires_human_review is True
 
     # ── UNCLASSIFIED fallback ─────────────────────────────────────────────────
 

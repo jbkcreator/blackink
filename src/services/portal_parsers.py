@@ -298,6 +298,53 @@ def parse_thumbtack(parts: EmailParts) -> ParsedLead:
     return _finalize("THUMBTACK", name=name, email=email, phone=phone, address=address, inquiry=inquiry)
 
 
+def parse_zillow(parts: EmailParts) -> ParsedLead:
+    """Zillow Rental Manager — the single lead pipe for Zillow, Trulia and HotPads.
+
+    Trulia and HotPads do NOT send their own PM-lead notifications: all three
+    listing sites syndicate through Zillow Rental Manager and the lead arrives as
+    ONE Zillow email (HotPads' landlord tools were migrated into Zillow Rental
+    Manager). So one parser + one config (three sender domains) covers the whole
+    Zillow Group, rather than three parsers where two would be dead code.
+
+    Real-format notes (public field set — Zillow help center / partner parse
+    docs, HITL sample capture still open, ticket 11):
+      * Sender is an anonymised relay, e.g. ``zms-1234@reply.zillow.com``.
+      * The renter EMAIL is a generated relay address — still the correct,
+        replyable contact handle, so we keep it as ``email``.
+      * PHONE is typically NOT present in the notification body (Zillow routes
+        calls through a separate routing number); a name + relay email is still
+        a usable lead, so its absence must not force human review.
+      * Move-in date and tour request date/time are common; we fold them into
+        ``inquiry_text`` since inbound_messages has no dedicated column.
+    """
+    body = parts.text_body()
+    name = _labeled(body, "Name", "Renter Name", "Contact Name", "Lead Name", "From")
+    email = _first_email(_labeled(body, "Email", "Email Address", "Reply to", "Reply-To")) or _first_email(body)
+    phone = _first_phone(_labeled(body, "Phone", "Phone Number")) or _first_phone(body)
+    address = _labeled(
+        body, "Property Address", "Property", "Address", "Listing", "Listing Address", "Location"
+    )
+    move_in = _labeled(body, "Move-in", "Move In", "Move-in Date", "Desired Move-in")
+    tour = _labeled(body, "Tour", "Tour Requested", "Tour Date", "Requested Tour", "Showing")
+    message = _labeled(body, "Message", "Comments", "Note", "Notes", "Inquiry")
+
+    extras = []
+    if move_in:
+        extras.append(f"Move-in: {move_in}")
+    if tour:
+        extras.append(f"Tour requested: {tour}")
+    if message:
+        extras.append(message)
+    inquiry = "\n".join(extras) if extras else None
+    if inquiry:
+        inquiry = f"{inquiry}\n\n{body}".strip()
+    else:
+        inquiry = body
+
+    return _finalize("ZILLOW", name=name, email=email, phone=phone, address=address, inquiry=inquiry)
+
+
 # ── The registry (the config-driven surface) ─────────────────────────────────
 #
 # Adding a 4th portal = append one PortalConfig here + write its parser fn above.
@@ -321,6 +368,17 @@ PORTAL_REGISTRY: List[PortalConfig] = [
         source_channel="THUMBTACK",
         parser=parse_thumbtack,
         sender_domains=("thumbtack.com",),
+    ),
+    PortalConfig(
+        # Zillow Group: Zillow, Trulia and HotPads all deliver leads through
+        # Zillow Rental Manager as a single Zillow email. reply.zillow.com is the
+        # anonymised relay sender; zillow.com covers direct notifications;
+        # trulia.com/hotpads.com are kept as aliases in case a legacy send path
+        # ever fires (harmless if it never does). See parse_zillow docstring.
+        name="Zillow Group (Zillow / Trulia / HotPads)",
+        source_channel="ZILLOW",
+        parser=parse_zillow,
+        sender_domains=("zillow.com", "trulia.com", "hotpads.com"),
     ),
 ]
 
