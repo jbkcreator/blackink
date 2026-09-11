@@ -71,4 +71,9 @@
 # second, independently-scheduled copy would defeat the point of having one
 # process own both the health producer and its consumers' reliability class.
 
+# ── OVS month-over-month delta alert ─────────────────────────────────────
+# 1st of the month at 7 AM, 2 hours after the OVS sweep (5 AM). Compares
+# current vs prior month scores; posts movers >10 pts to #blackink-economics.
+0 7 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.ovs_delta_alert >> /root/blackink/logs/ovs_delta_alert.log 2>&1
+
 # ── Add future scheduled jobs below this line ───────────────────────────

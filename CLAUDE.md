@@ -73,10 +73,14 @@ PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py       # audit log 
 PYTHONPATH=. python migrations/apply_ghost_form_submissions.py      # node-level idempotency for fill_and_submit (prevents double form POST on retry); not tenant-bearing, no RLS
 PYTHONPATH=. python migrations/apply_ovs_data_coverage.py          # Subtask 2.1.2 — adds data_coverage_pct SMALLINT to owner_visibility_scores; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py  # Task 4.2.1 — Speed-to-Lead columns on inbound_messages (additive; after the three inbound_messages migrations, before RLS)
+PYTHONPATH=. python migrations/apply_ack_latency_reconcile.py  # Group D defect D-1 fix — converts inbound_messages.ack_latency_seconds to the canonical GENERATED STORED definition if this environment ran the old conflicting plain-column migration first (after apply_entitlements_billing.py and apply_inbound_messages_lead_fields.py, before RLS)
+PYTHONPATH=. python migrations/apply_mailbox_cap_index_fix.py  # Group D / D-1 review finding — replaces the now-unusable ix_inbound_messages_mailbox_responded index with one that actually covers the widened SENT_UNCONFIRMED + COALESCE cap query (after apply_ack_latency_reconcile.py, before RLS)
 PYTHONPATH=. python migrations/apply_stl_cadence.py  # Task 4.2.2 — STL cadence stop-latch columns + stl_cadence_dispatches table (after apply_inbound_messages_lead_fields.py, before RLS)
 PYTHONPATH=. python migrations/apply_winback_imports.py   # Subtask 3.1.1 — Lost-Owner CSV Ingest (winback_imports/winback_rows; before RLS)
 PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2 — Three-Touch Win-Back Sequence (winback_touch_dispatches, stop columns, calendar_connections.is_default_owner_booking; after apply_winback_imports.py and apply_calendar_connections.py, before RLS)
 PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
+PYTHONPATH=. python migrations/apply_winback_loss_est.py   # S-14 — adds custom_hook_text to winback_rows; after apply_winback_touch_sequence.py (audit_loss_dollars_est already exists there), before RLS
+PYTHONPATH=. python migrations/apply_band2_counters.py   # S-9 — Band 2 consecutive-clean-send tracker; not tenant-bearing, no RLS; any time after apply_clients.py
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -104,6 +108,7 @@ python -m src.tasks.billing_sweep               # Subtask 1.2.3 — $50 miss-cre
 python -m src.services.work_orders --sweep --client-id <id>  # Dev 3 — executes APPROVED touch dispatches (one client)
 python -m src.tasks.work_order_execution_sweep  # Task 4.2.2 — all-tenant APPROVED work-order dispatcher (runs cmd_sweep per client); wired into the deployed background workers
 python -m src.tasks.enrichment_verification --client-id <id> [--import-id <id>] [--limit 10]  # Subtask 3.2.1 — owner-enrichment (skip-trace) sweep; must run before a Win-Back import can be armed, posts the pre-pilot summary to #blackink-qa
+python -m src.tasks.ovs_delta_alert  # S-7 — month-over-month OVS score delta alert; run after owner_visibility_sweep completes; posts to #blackink-economics
 
 # Tests
 pytest tests/                       # unit tests, no DB required for most
@@ -1258,6 +1263,117 @@ Founding accounts are provisioned via the new
 future onboarding flow cannot silently default a real founding client to
 `False`; `tests/test_billing_structural.py` asserts both the missing default
 and that no other production code path INSERTs into `clients`.
+
+## Naming & Code Quality
+
+These rules apply to every line written in this repo — identifiers, comments,
+branch names, migration file names, SQL function names, log messages. No
+exceptions.
+
+### The core rule
+
+A name must describe what the thing **is or does**, not which ticket introduced
+it, which sprint it belongs to, or where the code lives on a developer's machine.
+
+### What is never allowed
+
+| Pattern | Examples | Why |
+|---|---|---|
+| Internal ticket / dev labels | `dev1_`, `dev3_`, `DEV_1`, `subtask_2_1_3`, `week2_`, `task_4_2` | Meaningless outside the sprint; rots immediately |
+| Local file paths | `C:/Users/Amal/...`, `~/Codebases/...` | Non-reproducible, exposes developer environment |
+| Sprint / iteration references | `week1_fix`, `sprint3_cleanup` | Describes timing, not the concept |
+| Raw PR / issue numbers | `pr37_fix`, `issue_123_handler` | That belongs in git history |
+| Author names or initials | `amal_patch`, `jd_refactor` | git blame exists |
+| Unresolved placeholders | `foo`, `bar`, `test123`, `FIXME_RENAME` | Not real names; fix before committing |
+
+### Identifiers
+
+- **Functions/methods**: verb + noun describing the operation — `calculate_score`,
+  `fetch_calendar_events`, `mark_job_complete`. Never named after a ticket.
+- **Variables**: readable English describing the value's role —
+  `active_client_ids`, `booking_start_time`. Single-letter only inside tight
+  loops or established math notation.
+- **Constants**: `SCREAMING_SNAKE_CASE`, descriptive —
+  `CLAIM_LEASE_MINUTES`, `MAX_ENRICHMENT_ATTEMPTS`. Never `DEV3_MAX_RETRIES`.
+- **Classes**: PascalCase noun naming the concept —
+  `BookingReminderJob`, `OwnerVisibilityScore`. Never named after the task.
+- **DB columns / tables**: `snake_case`, singular table names, full English
+  words. No sprint-derived abbreviations.
+
+### Branch names
+
+One of two patterns, no others:
+
+```
+feature/<descriptive-slug>    # new capability
+fix/<descriptive-slug>        # bug fix
+```
+
+The slug is a kebab-case phrase naming the feature or bug — not the ticket:
+
+| Wrong | Right |
+|---|---|
+| `dev-3` | `feature/sequence-work-order-approval` |
+| `subtask-2-1-3` | `feature/ovs-score-engine` |
+| `week2-fix` | `fix/settlement-clawback-race` |
+
+Check `git branch -a` and match the length and style already in use.
+
+### Migration file names
+
+`apply_<descriptive_noun_phrase>.py` — what the migration adds or changes, not
+which sprint it was in:
+
+| Wrong | Right |
+|---|---|
+| `apply_dev3_tables.py` | `apply_sequence_runs.py` |
+| `apply_week2_billing.py` | `apply_entitlements_billing.py` |
+
+### Comments
+
+Comments explain **why**, not what (the code shows what; the name shows what).
+- A comment referencing a ticket, sprint, or task number belongs in the commit
+  message or PR description, not the source file.
+- `# Added for Dev 3` — delete it.
+- `# TODO(dev-3): rename this` — resolve it before committing, not later.
+- `# Deferred to Week 4` — PR description, not source.
+
+### Pre-write self-check
+
+Before writing a single line of code, confirm:
+
+1. Every new name describes the concept with no sprint or ticket leakage.
+2. A developer with no sprint context would understand every name.
+3. Branch name and migration file name follow the patterns above.
+4. No placeholder or temporary names from a prior pass need renaming first.
+
+If any answer is no, fix the naming before proceeding.
+
+---
+
+## Commit Hygiene — STRICT RULES
+
+These two rules are **non-negotiable and enforced at commit time**. No exceptions, no "just this once."
+
+### Rule 1 — Naming conventions apply to every identifier in the repo
+
+The full naming standard is in **Naming & Code Quality** above. The short form: every name — function, variable, constant, class, column, branch, migration file, comment — must describe what the thing **is or does**. No ticket numbers, sprint labels, local paths, PR numbers, author names, or placeholder names anywhere in committed code. Violating this is a commit blocker, not a style note.
+
+### Rule 2 — Local documentation and context files are NEVER committed
+
+Any file used only during development — notes, planning docs, context summaries, local reference files, task lists, AI-session context, scratch analysis — **must never appear in a git commit**. This includes:
+
+- Files named `context*.md`, `notes*.md`, `plan*.md`, `todo*.txt`, `*.local.*`, or any derivative
+- Session transcripts, AI-generated summaries, or ephemeral working documents
+- Developer-environment-specific configs or path files
+
+**Where they go instead:** a single, gitignored local folder (e.g. `_local/` or `docs/_dev/`). Add the folder pattern to `.gitignore` once and never touch it again. Files in that folder never enter `git add`, never appear in `git status` staged output, and never land in a commit.
+
+**Why this is strict:** committing these files pollutes history, leaks internal context into the public diff, causes merge noise on every rebase, and signals to reviewers that the branch is not production-ready. It is a trust issue, not a cleanup item.
+
+**Pre-commit check:** before `git add`, run `git status` and confirm no file from a local docs/context folder is staged. If you see one, move it to the gitignored folder before proceeding — never stage-then-remove in a follow-up commit.
+
+---
 
 ## Tooling Rules
 

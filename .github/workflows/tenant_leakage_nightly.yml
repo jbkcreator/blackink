@@ -103,6 +103,8 @@ jobs:
           PYTHONPATH=. python migrations/apply_ghost_form_submissions.py
           PYTHONPATH=. python migrations/apply_ovs_data_coverage.py
           PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py
+          PYTHONPATH=. python migrations/apply_ack_latency_reconcile.py
+          PYTHONPATH=. python migrations/apply_mailbox_cap_index_fix.py
           PYTHONPATH=. python migrations/apply_stl_cadence.py
           PYTHONPATH=. python migrations/apply_winback_imports.py
           PYTHONPATH=. python migrations/apply_winback_touch_sequence.py

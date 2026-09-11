@@ -29,13 +29,15 @@ from src.tasks import sequence_sweep as sweep
 # Win-Back gate-before-posting (Subtask 3.1.2)
 # ---------------------------------------------------------------------------
 
-def _winback_order(action_class="DISPATCH_WINBACK_TOUCH", winback_row_id=1, slack_message_ts=None):
+def _winback_order(action_class="DISPATCH_WINBACK_TOUCH", winback_row_id=1, slack_message_ts=None,
+                   autonomy_band="BAND_2_ONE_TAP"):
 	return SimpleNamespace(
 		action_id="action-1",
 		client_id="client_a",
 		entity_id=str(winback_row_id),
 		action_class=action_class,
 		slack_message_ts=slack_message_ts,
+		autonomy_band=autonomy_band,
 		payload={"winback_row_id": winback_row_id, "touch_step": 2},
 	)
 
@@ -103,13 +105,15 @@ def test_already_posted_card_is_never_re_evaluated():
 # LinkedIn (Touch 4) path
 # ---------------------------------------------------------------------------
 
-def _order(action_class="LINKEDIN_TASK", contact_id="55", client_id="client-x", ts=None):
+def _order(action_class="LINKEDIN_TASK", contact_id="55", client_id="client-x", ts=None,
+           autonomy_band="BAND_2_ONE_TAP"):
     return SimpleNamespace(
         action_class=action_class,
         entity_id=contact_id,
         client_id=client_id,
         action_id="act-1",
         slack_message_ts=ts,
+        autonomy_band=autonomy_band,
         payload={"touch_step": 4, "run_id": "run-1"},
     )
 
@@ -243,9 +247,9 @@ def json_payloads(session):
     return " ".join(out)
 
 
-def test_run_sweep_routes_linkedin_and_email(monkeypatch):
-    """run_sweep dispatches email orders to _post_due_card and LinkedIn orders
-    to _post_due_linkedin_card; dial orders are ignored entirely."""
+def test_run_sweep_routes_linkedin_email_and_dial(monkeypatch):
+    """run_sweep dispatches email + deferred DIAL_TASK to _post_due_card and
+    LinkedIn orders to _post_due_linkedin_card."""
     batch = [
         _order(action_class="DISPATCH_EMAIL_TOUCH"),
         _order(action_class="LINKEDIN_TASK"),
@@ -256,12 +260,76 @@ def test_run_sweep_routes_linkedin_and_email(monkeypatch):
     monkeypatch.setattr(sweep, "_post_due_linkedin_card", AsyncMock(return_value=True))
 
     posted = sweep.run_sweep()
-    assert posted == 2  # one email + one linkedin, dial not swept
-    sweep._post_due_card.assert_awaited_once()
+    assert posted == 3  # email + linkedin + deferred dial
+    assert sweep._post_due_card.await_count == 2  # email + dial
     sweep._post_due_linkedin_card.assert_awaited_once()
 
 
-def test_run_sweep_zero_when_only_dial_due(monkeypatch):
+def test_run_sweep_posts_due_dial_card(monkeypatch):
+    """A DIAL_TASK whose due_at has arrived (deferred by calling-hours gate)
+    is posted by the sweep via _post_due_card on the 'dial' channel."""
     batch = [_order(action_class="DIAL_TASK")]
     monkeypatch.setattr(sweep.wo, "due_batch", lambda **kw: batch)
-    assert sweep.run_sweep() == 0
+    monkeypatch.setattr(sweep, "_post_due_card", AsyncMock(return_value=True))
+    assert sweep.run_sweep() == 1
+    sweep._post_due_card.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# BAND_3_AUTO — auto-approval path (S-9)
+# ---------------------------------------------------------------------------
+
+def test_band3_auto_order_is_approved_without_card(monkeypatch):
+    """A QUEUED order with autonomy_band=BAND_3_AUTO must be auto-approved
+    via record_decision and must never trigger a Slack card post."""
+    order = _order(action_class="DISPATCH_EMAIL_TOUCH", autonomy_band="BAND_3_AUTO")
+    order.client_id = "client-b3"
+    order.action_id = "act-b3"
+
+    monkeypatch.setattr(sweep.wo, "due_batch", lambda **kw: [order])
+    mock_record = MagicMock(return_value=SimpleNamespace(status="APPROVED"))
+    monkeypatch.setattr(sweep.wo, "record_decision", mock_record)
+    mock_post_card = AsyncMock(return_value=True)
+    monkeypatch.setattr(sweep, "_post_due_card", mock_post_card)
+    mock_post_linkedin = AsyncMock(return_value=True)
+    monkeypatch.setattr(sweep, "_post_due_linkedin_card", mock_post_linkedin)
+
+    posted = sweep.run_sweep()
+
+    # No Slack card should be posted for a BAND_3_AUTO order.
+    mock_post_card.assert_not_awaited()
+    mock_post_linkedin.assert_not_awaited()
+    # record_decision must be called with APPROVED and the system decider.
+    mock_record.assert_called_once_with(
+        "client-b3", "act-b3",
+        decision="APPROVED",
+        decided_by="system:band3_auto",
+    )
+    # The Slack-card count is 0 — auto-approvals don't count as posted cards.
+    assert posted == 0
+
+
+def test_band3_auto_mixed_with_band2_orders_only_auto_approves_band3(monkeypatch):
+    """In a mixed batch, BAND_3_AUTO orders are auto-approved and BAND_2 orders
+    get the normal Slack card. Card count reflects only the BAND_2 cards."""
+    band2 = _order(action_class="DISPATCH_EMAIL_TOUCH", autonomy_band="BAND_2_ONE_TAP")
+    band2.client_id = "client-x"
+    band2.action_id = "act-b2"
+    band3 = _order(action_class="DISPATCH_EMAIL_TOUCH", autonomy_band="BAND_3_AUTO")
+    band3.client_id = "client-x"
+    band3.action_id = "act-b3"
+
+    monkeypatch.setattr(sweep.wo, "due_batch", lambda **kw: [band2, band3])
+    mock_record = MagicMock(return_value=SimpleNamespace(status="APPROVED"))
+    monkeypatch.setattr(sweep.wo, "record_decision", mock_record)
+    monkeypatch.setattr(sweep, "_post_due_card", AsyncMock(return_value=True))
+    monkeypatch.setattr(sweep, "_post_due_linkedin_card", AsyncMock(return_value=True))
+
+    posted = sweep.run_sweep()
+
+    assert posted == 1  # only the BAND_2 card
+    mock_record.assert_called_once_with(
+        "client-x", "act-b3",
+        decision="APPROVED",
+        decided_by="system:band3_auto",
+    )

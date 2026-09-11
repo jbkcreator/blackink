@@ -143,7 +143,7 @@ def _check_cooldown(contact) -> GateCheckResult:
 	return GateCheckResult("cooldown_14d", FAIL, f"last touch {elapsed.days}d ago, cooldown not elapsed")
 
 
-def _check_dnc(contact, dnc_provider: DncProvider) -> GateCheckResult:
+def _check_dnc(session: Session, contact, dnc_provider: DncProvider) -> GateCheckResult:
 	max_age_days = get_settings().dnc_recheck_days
 	if contact.dnc_checked_at is None:
 		# Live check: unchecked contact needs a fresh lookup, not an
@@ -154,6 +154,18 @@ def _check_dnc(contact, dnc_provider: DncProvider) -> GateCheckResult:
 		result = dnc_provider.check(contact.phone)
 		if result is None:
 			return GateCheckResult("dnc_clean", ABSTAIN, "DNC check returned unknown (no vendor / lookup failed)")
+		# Persist the live result so the next gate call reads cache instead of
+		# calling the vendor again. A None result is deliberately not cached —
+		# caching "unknown" as clean would extend a false safe-harbour for the
+		# full recheck window (same posture as campaign_readiness_gate.py's
+		# _resolve_dnc_listed, which has the identical write-back guard).
+		session.execute(
+			text(
+				"UPDATE contacts SET dnc_clean = :clean, dnc_checked_at = NOW() "
+				"WHERE contact_id = :contact_id"
+			),
+			{"clean": not result, "contact_id": contact.contact_id},
+		)
 		return (
 			GateCheckResult("dnc_clean", FAIL, "listed on DNC registry")
 			if result
@@ -238,7 +250,7 @@ def evaluate_enrollment_gate(
 		_check_deterministic_columns(contact),
 		_check_not_paused(contact),
 		_check_cooldown(contact),
-		_check_dnc(contact, dnc_provider),
+		_check_dnc(session, contact, dnc_provider),
 		_check_non_poach(session, contact.company_id),
 	)
 
@@ -265,7 +277,7 @@ def evaluate_touch_gate(
 
 	checks = (
 		_check_deterministic_columns(contact),
-		_check_dnc(contact, dnc_provider),
+		_check_dnc(session, contact, dnc_provider),
 		_check_non_poach(session, contact.company_id),
 	)
 

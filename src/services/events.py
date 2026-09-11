@@ -41,8 +41,16 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"outbound_touch_dispatched": frozenset(
 		{"touch_step", "channel", "recipient_email", "template_version", "sending_domain", "mailbox_id"}
 	),
-	"owner_score_generated": frozenset(
-		{"score_total", "county", "data_coverage_pct", "county_rank"}
+	# Group D / D-4: this registry entry was named "owner_score_generated"
+	# and required a "county" field — but owner_visibility_sweep.py has
+	# always written "owner_visibility_score_calculated" with a "county_slug"
+	# field (this INSERT is raw SQL, not routed through log_event(), so the
+	# mismatch was never caught by validation). daily_digest.py and
+	# metrics_router.py both filtered on the never-written name, so
+	# scores_generated / county_rank_reports_delivered read 0 permanently in
+	# both surfaces. Renamed here to match what is actually emitted.
+	"owner_visibility_score_calculated": frozenset(
+		{"score_total", "county_slug", "data_coverage_pct", "county_rank"}
 	),
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
@@ -143,7 +151,7 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	# ghost_shopper_audit is deliberately ABSENT: the client spec update
 	# (Tasks/Updated_client spec/Project_Blackink_Complete_Implementation_
 	# Blueprint__Full__v2.md line 1264) confirms Ghost-Shopper is
-	# permanently deferred, replaced by owner_score_generated above — not
+	# permanently deferred, replaced by owner_visibility_score_calculated above — not
 	# "on hold", genuinely never coming back. A registry entry for an
 	# event type nothing will ever emit is dead config, same reasoning as
 	# the rentbot_* entries below.

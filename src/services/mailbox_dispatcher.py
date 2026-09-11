@@ -197,13 +197,29 @@ def get_active_mailbox_for_client(
             "        AND d.status IN ('SENDING', 'SENT') "
             "        AND d.created_at >= NOW() - INTERVAL '24 hours' "
             "    ) + ( "
-            # Speed-to-Lead auto-responses (Task 4.2.1) also consume this
-            # mailbox's rolling-24h capacity — count them here, or repeated
-            # inbound responses could blow past the cap while every check passes.
+            # Inbound auto-responses (Speed-to-Lead and KB replies) consume this
+            # mailbox's rolling-24h capacity — without this, repeated inbound
+            # responses could blow past the cap while every check passes.
+            # SENDING rows are in-flight sends that have reserved cap inside the
+            # advisory-lock transaction but whose SMTP call has not yet returned —
+            # counting them prevents concurrent approvals from racing past the cap
+            # before any of them writes RESPONDED. SENT_UNCONFIRMED (Group D defect
+            # D-1 fix) counts for the mirror-image reason: the SMTP send happened
+            # even though the post-send status write failed, so excluding it would
+            # let repeated post-send failures bypass the cap entirely. Neither
+            # responded_at nor claimed_at is guaranteed on those paths (the write
+            # that would have set responded_at is what failed, and claimed_at is
+            # the human-claim clock, never set for an auto-response), so the
+            # COALESCE falls through to received_at, which is always set — a NULL
+            # here would drop the row from the count and silently reopen the cap.
             "      SELECT COUNT(*) FROM inbound_messages im "
             "      WHERE im.mailbox_id = m.id "
-            "        AND im.status = 'RESPONDED' "
-            "        AND im.responded_at >= NOW() - INTERVAL '24 hours' "
+            "        AND ( "
+            "          im.status = 'SENDING' "
+            "          OR (im.status IN ('RESPONDED', 'SENT_UNCONFIRMED') "
+            "              AND COALESCE(im.responded_at, im.claimed_at, im.received_at) "
+            "                  >= NOW() - INTERVAL '24 hours') "
+            "        ) "
             "    ) + ( "
             # Speed-to-Lead cadence follow-ups (Task 4.2.2) also consume this
             # mailbox's rolling-24h capacity — without this a mailbox at cap

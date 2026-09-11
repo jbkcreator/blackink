@@ -65,9 +65,14 @@ def test_required_fields_registry_has_outbound_touch_and_owner_score():
 	assert REQUIRED_PAYLOAD_FIELDS["outbound_touch_dispatched"] == frozenset(
 		{"touch_step", "channel", "recipient_email", "template_version", "sending_domain", "mailbox_id"}
 	)
-	assert REQUIRED_PAYLOAD_FIELDS["owner_score_generated"] == frozenset(
-		{"score_total", "county", "data_coverage_pct", "county_rank"}
+	# Group D / D-4: renamed from owner_score_generated (a name/payload-key
+	# pair owner_visibility_sweep.py never actually wrote) to match what it
+	# really emits — see src/tasks/daily_digest.py's comment for the full
+	# explanation.
+	assert REQUIRED_PAYLOAD_FIELDS["owner_visibility_score_calculated"] == frozenset(
+		{"score_total", "county_slug", "data_coverage_pct", "county_rank"}
 	)
+	assert "owner_score_generated" not in REQUIRED_PAYLOAD_FIELDS
 
 
 def test_ghost_shopper_audit_is_not_in_the_registry():
@@ -81,10 +86,10 @@ def test_log_event_raises_on_missing_owner_score_field():
 	with pytest.raises(MalformedEventError):
 		log_event(
 			"acme_pm",
-			"owner_score_generated",
+			"owner_visibility_score_calculated",
 			entity_type="company",
 			entity_id="c1",
-			payload={"score_total": 82, "county": "hillsborough_fl", "data_coverage_pct": 91},  # missing county_rank
+			payload={"score_total": 82, "county_slug": "hillsborough_fl", "data_coverage_pct": 91},  # missing county_rank
 		)
 
 

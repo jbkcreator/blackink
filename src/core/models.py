@@ -10,8 +10,7 @@ sqlalchemy.text() with named binds per project convention).
 Week 1 scope: County, Client, CountyAllocation, ClientPmBook, Company,
 Contact, PmProfile. RawProspectCompany/RawProspectContact, Event,
 ComplianceGateCheck, OwnerEntity/OwnerEntityLink were already brought
-forward from the original Week 2 plan during Week 0 build-out — see
-C:\\Users\\HEU-Vishnu\\.claude\\plans\\dev-1-data-synthetic-fox.md.
+forward from the original Week 2 plan during Week 0 build-out.
 """
 
 from datetime import datetime, date

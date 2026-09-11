@@ -47,11 +47,11 @@ def main() -> int:
 		db.execute(
 			text(
 				"INSERT INTO mailboxes (domain_id, mailbox_address, client_id, smtp_host, smtp_port, "
-				"smtp_username, smtp_password_encrypted, quarantine_state) "
-				"VALUES (:domain_id, :addr, :cid, :host, :port, :user, :pw, 'active') "
+				"smtp_username, smtp_password_encrypted, quarantine_state, warmup_status) "
+				"VALUES (:domain_id, :addr, :cid, :host, :port, :user, :pw, 'active', 'warmed') "
 				"ON CONFLICT (mailbox_address) DO UPDATE SET "
 				"smtp_host = :host, smtp_port = :port, smtp_username = :user, "
-				"smtp_password_encrypted = :pw, quarantine_state = 'active'"
+				"smtp_password_encrypted = :pw, quarantine_state = 'active', warmup_status = 'warmed'"
 			),
 			{
 				"domain_id": domain_id,
