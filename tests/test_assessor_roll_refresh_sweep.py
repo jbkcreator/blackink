@@ -26,7 +26,8 @@ def test_run_county_missing_file_alerts_and_records_missing(tmp_path):
     db = MagicMock()
     db.execute.return_value.first.return_value = None
     missing_path = str(tmp_path / "nope.csv")
-    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run") as mock_run:
+    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run",
+                side_effect=lambda coro: coro.close()) as mock_run:
         status = _run_county(db, "hillsborough_fl", missing_path, datetime.now(timezone.utc), 400)
     assert status == "MISSING"
     assert mock_run.called
@@ -43,7 +44,8 @@ def test_run_county_missing_file_on_never_imported_county_fires_exactly_one_aler
     db = MagicMock()
     db.execute.return_value.first.return_value = None  # never imported at all
     missing_path = str(tmp_path / "nope.csv")
-    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run") as mock_run:
+    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run",
+                side_effect=lambda coro: coro.close()) as mock_run:
         _run_county(db, "pinellas_fl", missing_path, datetime.now(timezone.utc), 400)
     assert mock_run.call_count == 1
 
@@ -53,7 +55,8 @@ def test_run_county_failed_on_never_imported_county_fires_exactly_one_alert(tmp_
     p.write_bytes(b"wrong_columns\nvalue\n")
     db = MagicMock()
     db.execute.return_value.first.return_value = None
-    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run") as mock_run:
+    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run",
+                side_effect=lambda coro: coro.close()) as mock_run:
         _run_county(db, "hillsborough_fl", str(p), datetime.now(timezone.utc), 400)
     assert mock_run.call_count == 1
 
@@ -63,7 +66,8 @@ def test_run_county_success_does_not_alert(tmp_path):
     p.write_bytes(b"parcel_address,owner_name\n123 Main St,John Smith\n")
     db = MagicMock()
     db.execute.return_value.first.return_value = None  # no prior import -> first-ever SUCCESS
-    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run") as mock_run:
+    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run",
+                side_effect=lambda coro: coro.close()) as mock_run:
         status = _run_county(db, "hillsborough_fl", str(p), datetime.now(timezone.utc), 400)
     assert status == "SUCCESS"
     assert not mock_run.called
@@ -74,7 +78,8 @@ def test_run_county_failed_parse_alerts(tmp_path):
     p.write_bytes(b"wrong_columns\nvalue\n")
     db = MagicMock()
     db.execute.return_value.first.return_value = None
-    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run") as mock_run:
+    with patch("src.tasks.assessor_roll_refresh_sweep.asyncio.run",
+                side_effect=lambda coro: coro.close()) as mock_run:
         status = _run_county(db, "hillsborough_fl", str(p), datetime.now(timezone.utc), 400)
     assert status == "FAILED"
     assert mock_run.called

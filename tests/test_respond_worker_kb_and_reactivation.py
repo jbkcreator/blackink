@@ -45,7 +45,7 @@ def test_later_with_extracted_date_pauses_contact():
     target = datetime(2026, 6, 1, tzinfo=timezone.utc)
     with patch("src.services.reactivation.extract_target_date", return_value=target), \
          patch("src.services.reactivation.pause_contact_until") as mock_pause, \
-         patch("src.agents.respond.worker.asyncio.run", return_value=None):
+         patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
         _route(
             db=db, db_id=70, client_id="CL1", sender_email="owner@co.com",
             received_at=datetime.now(timezone.utc),
@@ -65,7 +65,7 @@ def test_later_with_no_extracted_date_flags_human_review():
     db = _mock_db()
     with patch("src.services.reactivation.extract_target_date", return_value=None), \
          patch("src.services.reactivation.pause_contact_until") as mock_pause, \
-         patch("src.agents.respond.worker.asyncio.run", return_value=None):
+         patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
         _route(
             db=db, db_id=71, client_id="CL1", sender_email="owner@co.com",
             received_at=datetime.now(timezone.utc),
@@ -85,7 +85,7 @@ def test_later_with_date_but_no_contact_id_flags_human_review_instead_of_pausing
     target = datetime(2026, 6, 1, tzinfo=timezone.utc)
     with patch("src.services.reactivation.extract_target_date", return_value=target), \
          patch("src.services.reactivation.pause_contact_until") as mock_pause, \
-         patch("src.agents.respond.worker.asyncio.run", return_value=None):
+         patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
         _route(
             db=db, db_id=72, client_id="CL1", sender_email="owner@co.com",
             received_at=datetime.now(timezone.utc),
@@ -108,7 +108,7 @@ def test_unsubscribe_suppresses_domain_in_addition_to_email():
     db = _mock_db()
     with patch("src.services.email_suppression.suppress_by_email") as mock_email, \
          patch("src.services.email_suppression.suppress_by_domain") as mock_domain, \
-         patch("src.agents.respond.worker.asyncio.run", return_value=None):
+         patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
         _route(
             db=db, db_id=80, client_id="CL1", sender_email="owner@acme-corp.com",
             received_at=datetime.now(timezone.utc),
@@ -124,7 +124,7 @@ def test_unsubscribe_writes_suppression_applied_event():
     with patch("src.services.email_suppression.suppress_by_email"), \
          patch("src.services.email_suppression.suppress_by_domain"), \
          patch("src.agents.respond.worker.log_event") as mock_log, \
-         patch("src.agents.respond.worker.asyncio.run", return_value=None):
+         patch("src.agents.respond.worker.asyncio.run", side_effect=lambda coro: coro.close()):
         _route(
             db=db, db_id=81, client_id="CL1", sender_email="owner@acme-corp.com",
             received_at=datetime.now(timezone.utc),
