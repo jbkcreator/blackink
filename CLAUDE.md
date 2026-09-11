@@ -21,6 +21,7 @@ uvicorn src.api.main:app --reload --port 8000
 PYTHONPATH=. python migrations/apply_db_roles.py
 PYTHONPATH=. python migrations/apply_counties.py
 PYTHONPATH=. python migrations/apply_raw_assessor_parcels.py   # Subtask 3.1.1 — Akrash staging feed, not tenant-bearing, any time after counties
+PYTHONPATH=. python migrations/apply_assessor_roll_imports.py   # S-24 — audit trail for the assessor-roll loader sweep + blackink_system INSERT/DELETE grant on raw_assessor_parcels; not tenant-bearing, any time after apply_raw_assessor_parcels.py
 PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
@@ -82,6 +83,8 @@ PYTHONPATH=. python migrations/apply_winback_touch_sequence.py   # Subtask 3.1.2
 PYTHONPATH=. python migrations/apply_winback_enrichment.py   # Subtask 3.2.1 — owner-enrichment (skip-trace) columns on winback_rows; not tenant-bearing (adds columns to an already-registered table), any time after apply_winback_touch_sequence.py, before RLS
 PYTHONPATH=. python migrations/apply_winback_loss_est.py   # S-14 — adds custom_hook_text to winback_rows; after apply_winback_touch_sequence.py (audit_loss_dollars_est already exists there), before RLS
 PYTHONPATH=. python migrations/apply_band2_counters.py   # S-9 — Band 2 consecutive-clean-send tracker; not tenant-bearing, no RLS; any time after apply_clients.py
+PYTHONPATH=. python migrations/apply_reactivation_pause.py   # S-10 — contacts.outbound_pause_until (additive column on an already-registered table); any time after apply_bookings.py
+PYTHONPATH=. python migrations/apply_backup_closer_roster.py   # S-13 — new tenant-bearing backup_closer_roster table + inbound_messages reallocation columns; before RLS
 PYTHONPATH=. python migrations/apply_rls_policies.py   # run LAST
 PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 
@@ -89,6 +92,7 @@ PYTHONPATH=. python migrations/apply_akrash_grant.py    # run after RLS
 python -m src.tasks.promotion_sweep
 python -m src.tasks.county_allocation_reassessment
 python -m src.tasks.deliverability_sentinel
+python -m src.tasks.assessor_roll_refresh_sweep  # S-24 — monthly county assessor roll change-detection + reimport
 python -m src.tasks.hunter_nightly_sweep
 python -m src.tasks.calendar_subscription_renewal
 python -m src.tasks.calendar_sync_worker
@@ -101,7 +105,8 @@ python -m src.tasks.meeting_outcome_prompt_sender
 python -m src.agents.cora.worker           # Cora draft-generation worker (LLM sequence + Slack card)
 python -m src.agents.relay.worker          # Relay dispatch worker (Instantly / SMTP send)
 python -m src.agents.respond.worker        # Reply Triage Agent classifier worker
-python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min)
+python -m src.tasks.respond_sla_sweep      # SLA escalation sweep (HOT_LEAD/WHALE_OWNER=15min, others=60min; tier3 reallocates at 240min to backup_closer_roster, S-13)
+python -m src.tasks.reactivation_resume_sweep  # S-10 — clears a LATER-intent REACTIVATION pause once its target date arrives
 python -m src.tasks.imap_listener          # Ghost Shopper IMAP listener — monitors audit-bot inbox; requires IMAP_ENABLED=True
 python -m src.tasks.sequence_sweep              # Dev 3 — posts due email-touch approval cards to Slack
 python -m src.tasks.settlement_sweep            # Subtask 1.2.2 — door_signed poll + installment 1/2 charge sweeps
@@ -1375,6 +1380,161 @@ Any file used only during development — notes, planning docs, context summarie
 **Pre-commit check:** before `git add`, run `git status` and confirm no file from a local docs/context folder is staged. If you see one, move it to the gitignored folder before proceeding — never stage-then-remove in a follow-up commit.
 
 ---
+
+### Reply Triage Agent — reactivation, and SLA reallocation (Week 2 §3.2.1, Dev Items S-10/S-12/S-13)
+
+Three gaps in `src/agents/respond/worker.py`'s intent routing, found by the
+Week 0-2 implementation audit. S-10's QUESTION piece (a KB auto-response
+engine) collided with Subtask 2.1.3's own already-merged implementation
+(`knowledge_base_entries` / `match_kb()` / `post_kb_card()` /
+`approve_kb_response` — see that section elsewhere in this doc) once this
+branch was rebased onto current `main`: this S-10 change originally
+duplicated that entire feature with an incompatible (per-client) schema,
+built without visibility into 2.1.3 having already shipped. The duplicate
+was dropped on rebase — only S-10's LATER/NURTURE pieces (genuinely
+non-overlapping) survive here, alongside S-12 and S-13.
+
+**S-10 — LATER/NURTURE.** LATER extracts a target reactivation date from the reply body
+(`src/services/reactivation.py::extract_target_date`, `dateutil.parser`
+with `fuzzy=True`, bounded to `(now, now+365 days]` — outside that window
+or unparseable is treated as no-date-found, never guessed) and pauses the
+contact via the EXISTING `contacts.outbound_paused_at` mechanism (Subtask
+3.2.3's No-Show Handler; already enforced at send time by
+`compliance_gate._check_not_paused`, so no new gate check was needed) plus
+a NEW `contacts.outbound_pause_until` column
+(`migrations/apply_reactivation_pause.py`) that
+`src/tasks/reactivation_resume_sweep.py` clears once due. `pause_contact_
+until()` deliberately never overwrites an existing pause for a DIFFERENT
+reason (e.g. an active `NO_SHOW_RECOVERY` pause) — reactivation defers to
+that pause rather than silently clobbering it, and the resume sweep only
+ever clears a pause whose reason is EXACTLY `'REACTIVATION'`, for the same
+reason. No date extracted (or no known `contact_id` for the reply) sets
+`requires_human_review = TRUE` instead of guessing.
+
+NURTURE is **explicitly deferred, not silently missing**: no monthly
+educational content exists anywhere in this repo, and inventing placeholder
+copy for a real prospect-facing nurture stream was rejected — it continues
+to fall through to plain `ROUTED`, same as before this change, pending a
+real content decision.
+
+**S-12 — UNSUBSCRIBE domain suppression + proof-ledger event.**
+`email_suppression.suppress_by_domain()` already existed but was only ever
+called for `COMPLAINT`; `UNSUBSCRIBE` now calls it too (an opt-out
+suppresses the sender's whole domain, not just their own address — same
+behavior `COMPLAINT` already had). `contacts.is_opted_out`/
+`suppression_state` remain the GLOBAL (cross-tenant) suppression record of
+truth per `email_suppression.py`'s own docstring — this reconciles with
+`events.client_id` being `NOT NULL` by writing the new `suppression_applied`
+event scoped to the `client_id` of the INBOUND MESSAGE that triggered the
+suppression, documenting per-tenant *when* a suppression was observed
+without claiming the suppression EFFECT itself is tenant-scoped.
+
+**S-13 — SLA tier-3 backup-closer reallocation.** `respond_sla_sweep.py`'s
+240-minute tier-3 escalation previously only posted "assign to backup
+closer queue manually" with no roster or real reassignment behind it.
+`backup_closer_roster` (`migrations/apply_backup_closer_roster.py`) is each
+PAYING CLIENT's own pool of backup closers (direct `client_id` column,
+registered in `TENANT_POLICIES` — per-tenant operational data, not global
+config like the KB table above). Tier-3 now claims the
+least-recently-assigned active roster row
+(`SELECT ... FOR UPDATE SKIP LOCKED`, round-robin) and, on a real
+assignment, resets `escalation_level` to 0 and starts a fresh SLA window
+under the new assignee (`assigned_closer_slack_user_id`, `reallocated_at`
+columns) — a settled decision that a reallocated lead should re-enter SLA
+tracking rather than sit in a dead terminal status. **Code-review fix**:
+tier2/tier3's own escalation predicates were still anchored to the
+ORIGINAL, immutable `received_at` — since a once-reallocated lead's
+`received_at` is by definition already older than both thresholds, this
+collapsed the "fresh window" to a ~60-120 second reallocation-churn loop
+(verified live: the lead cascaded to a second closer within two sweep
+ticks instead of after a genuine 240-minute wait). Both predicates now key
+off `COALESCE(reallocated_at, received_at)`, giving each successive backup
+closer a real 240-minute window before the next handoff — tier1 already
+worked correctly via `sla_due_at`, which was already computed from
+`reallocated_at` when set. A client with no active roster configured falls
+back to the pre-S-13 terminal
+`REALLOCATED` status with the original manual-assign note — fail-closed,
+never inventing an assignee.
+
+### Reply-routing SLA evidence (S-20, W2 §3.2.5 Stage 5)
+
+`src/agents/respond/worker.py`'s `inbound_reply_classified` event now carries
+`routing_latency_seconds` — `NOW() - received_at`, measured after `_route()`
+has already posted the `#blackink-setter` context card for a hot-lead-class
+intent, so it captures the FULL receipt-to-routed latency (including any
+Redis-stream queue wait), not just this function's own processing time.
+Written for every intent, not only `HOT_LEAD`/`WHALE_OWNER` — a digest or
+Evidence Packet reader filters to those two to evidence the "<60 seconds"
+acceptance criterion specifically; the field costs nothing to record more
+broadly. No schema change, no new event type — an additive, non-required
+payload field on an event that already fires for every classified reply.
+
+### Assessor roll loader (S-24, W2 §3.2.4 A)
+
+`raw_assessor_parcels` (Subtask 3.1.1) sat empty because Akrash was never
+contracted to supply it. Reclassified from an external (Akrash) blocker to
+platform dev work, since the underlying data is public county tax-roll
+information — but it is **not** a stable self-serve HTTP download:
+Hillsborough County's own property-appraiser site sells its full assessment
+extract as a paid, manually-ordered product (email/phone/in-person, not a
+direct download link), and Florida DOR's exact current-year statewide NAL
+download path could not be confirmed live. `src/services/
+assessor_roll_loader.py` therefore does not scrape any vendor/county URL —
+acquisition is a manual operator step (buy or obtain the county's roll
+extract, place it at the path `config/settings.py`'s
+`assessor_roll_path_hillsborough`/`assessor_roll_path_pinellas` names for
+that county), mirroring this repo's own posture for other un-automatable
+external inputs rather than guessing at an unverified integration.
+
+`src/tasks/assessor_roll_refresh_sweep.py` runs monthly via
+`scripts/crontab.txt` (not an in-process `_start_background_workers`
+thread — matching how `daily_digest`/`county_allocation_reassessment`/
+`deliverability_sentinel` are all cron-scheduled, not threaded, for
+daily-or-less-frequent work). It hashes each configured county's file
+(sha256, not mtime — a redeploy that doesn't change content must never
+trigger a needless reimport) and only reimports on a genuine content
+change; every tick writes one row to `assessor_roll_imports`
+(`migrations/apply_assessor_roll_imports.py`; not tenant-bearing, same
+class as `raw_assessor_parcels` itself) recording `SUCCESS`, `UNCHANGED`,
+`FAILED`, or `MISSING` — a successful no-op is recorded, not silently
+skipped, so "the sweep ran and found nothing to do" is as visible in the
+audit trail as an actual import. Alerts `#blackink-qa` on `MISSING`
+(configured path unreadable), `FAILED` (parse/validation error — existing
+rows for that county are left completely untouched, a fail-closed
+guarantee that a bad new file can never wipe good existing data), and
+`STALE` (no `SUCCESS` for a county within `settings.assessor_roll_
+staleness_days`, default 400 — county rolls are certified annually, so a
+healthy county shows one `SUCCESS` at least once a year).
+
+A tax roll is a full point-in-time snapshot, not an incremental feed — a
+genuine content change means `import_county_roll()` does a transactional
+`DELETE` of that county's prior `raw_assessor_parcels` rows followed by a
+bulk `INSERT` of the new file's rows, never a merge (a merge would leave
+`check_still_owns()`'s own `ORDER BY ingested_at DESC LIMIT 1` picking
+between two potentially-conflicting rows for the same address instead of
+there being exactly one live snapshot per county). `blackink_system` was
+granted `INSERT`/`DELETE` on `raw_assessor_parcels` for this (previously
+`SELECT`-only, since Akrash was the sole intended writer before this
+reclassification).
+
+Column parsing is deliberately alias-tolerant, not a fixed schema.
+**Hillsborough's real column layout is now confirmed, not guessed**:
+`FOLIO`/`OWNER`/`SITE_ADDR`/`SITE_CITY`/`SITE_ZIP` is HCPA's actual bulk
+parcel export schema, verified against `jbkcreator/Forced-action-`'s
+`src/loaders/column_mapper.py` — a sibling system (same lineage as this
+repo's own Forced Action fork) that has previously downloaded and loaded
+this exact county's real parcel data via a browser-automation pipeline
+(`src/scrappers/master/master_engine.py`). All three of those column names
+were already covered by this loader's existing alias sets, confirmed by a
+regression test (`test_parses_real_hillsborough_hcpa_column_schema`) rather
+than by inspection alone. **Pinellas's real layout remains unverified** —
+it uses a different portal, and the sibling repo's `bulk_tables` config for
+it lives in a database this repo has no access to, not in code. A Pinellas
+file with different headers still raises `UnrecognizedColumnsError` naming
+exactly which required field it couldn't find, rather than silently
+importing a partial or wrong mapping — extending
+`_ADDRESS_ALIASES`/`_OWNER_ALIASES`/`_PARCEL_ID_ALIASES` is the expected
+fix once a real Pinellas file's headers are known.
 
 ## Tooling Rules
 

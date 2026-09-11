@@ -96,6 +96,9 @@ _BILLING_SIT_INVOICE_SWEEP_INTERVAL_SECONDS = 300
 # staleness bound (settings.vera_health_max_age_minutes, default 30) is
 # sized around this cadence tolerating several missed ticks before halting.
 _VERA_HEALTH_SWEEP_INTERVAL_SECONDS = 300
+# S-10 (W2 §3.2.1) — clears a LATER-intent REACTIVATION pause once its
+# target date arrives. A date-grain deadline tolerates a 5-minute tick.
+_REACTIVATION_RESUME_SWEEP_INTERVAL_SECONDS = 300
 
 
 def _loop(name: str, interval_seconds: int, fn) -> None:
@@ -157,6 +160,7 @@ def _start_background_workers() -> None:
 		run_sit_invoice_sweep as billing_sit_invoice_sweep,
 	)
 	from src.tasks.vera_health_sweep import run_sweep as vera_health_sweep
+	from src.tasks.reactivation_resume_sweep import run_sweep as reactivation_resume_sweep
 
 	workers = [
 		("calendar_sync_worker.drain_queue", _QUEUE_DRAIN_INTERVAL_SECONDS, drain_queue),
@@ -191,6 +195,9 @@ def _start_background_workers() -> None:
 		# correctly halts on NO_HEALTH_RUN for up to one tick after startup
 		# rather than assuming health — see health_gate.py's module docstring.
 		("vera_health_sweep.run_sweep", _VERA_HEALTH_SWEEP_INTERVAL_SECONDS, vera_health_sweep),
+		# S-10 — without this, a REACTIVATION pause (LATER intent) never
+		# lifts on its own once the target date arrives.
+		("reactivation_resume_sweep.run_sweep", _REACTIVATION_RESUME_SWEEP_INTERVAL_SECONDS, reactivation_resume_sweep),
 	]
 	for name, interval, fn in workers:
 		thread = threading.Thread(target=_loop, args=(name, interval, fn), name=name, daemon=True)

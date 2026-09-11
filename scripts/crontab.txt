@@ -31,6 +31,14 @@
 # spam-complaint-rate trip over the rolling 48h window.
 0 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.deliverability_sentinel >> /root/blackink/logs/deliverability_sentinel.log 2>&1
 
+# ── Assessor roll refresh sweep ──────────────────────────────────────────
+# Monthly (1st of the month, 4 AM). Checks each configured county's roll
+# file for a real content change (sha256) and only reimports on change —
+# an unchanged file is recorded as a successful no-op. Alerts #blackink-qa
+# if a configured file is missing, fails to parse, or a county's last
+# successful import exceeds the staleness threshold (S-24).
+0 4 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.assessor_roll_refresh_sweep >> /root/blackink/logs/assessor_roll_refresh_sweep.log 2>&1
+
 # ── County-allocation reassessment ───────────────────────────────────────
 # Daily. Re-evaluates the 30-day prospect-pool outreach-rights window per
 # county; refreshes companies.owning_client_id.

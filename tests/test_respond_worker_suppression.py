@@ -56,7 +56,8 @@ def test_unsubscribe_calls_suppress_before_commit():
 
     with patch("src.agents.respond.worker._post_slack_alert", new=AsyncMock()), \
          patch("src.agents.respond.worker.asyncio.run"), \
-         patch("src.services.email_suppression.suppress_by_email") as mock_suppress:
+         patch("src.services.email_suppression.suppress_by_email") as mock_suppress, \
+         patch("src.services.email_suppression.suppress_by_domain"):
 
         def track_suppress(session, email, reason):
             call_order.append("suppress")
@@ -83,7 +84,8 @@ def test_unsubscribe_passes_correct_email_and_reason():
 
     with patch("src.agents.respond.worker._post_slack_alert", new=AsyncMock()), \
          patch("src.agents.respond.worker.asyncio.run"), \
-         patch("src.services.email_suppression.suppress_by_email") as mock_suppress:
+         patch("src.services.email_suppression.suppress_by_email") as mock_suppress, \
+         patch("src.services.email_suppression.suppress_by_domain"):
 
         _route(
             db=db,
@@ -115,7 +117,8 @@ def test_non_unsubscribe_does_not_call_suppress():
 
     # return_value=None so _write_card_meta is not triggered (no card meta to persist)
     with patch("src.agents.respond.worker.asyncio.run", return_value=None), \
-         patch("src.services.email_suppression.suppress_by_email") as mock_suppress:
+         patch("src.services.email_suppression.suppress_by_email") as mock_suppress, \
+         patch("src.services.email_suppression.suppress_by_domain"):
 
         _route(
             db=db,
@@ -139,7 +142,8 @@ def test_unsubscribe_suppress_uses_same_session():
 
     with patch("src.agents.respond.worker._post_slack_alert", new=AsyncMock()), \
          patch("src.agents.respond.worker.asyncio.run"), \
-         patch("src.services.email_suppression.suppress_by_email") as mock_suppress:
+         patch("src.services.email_suppression.suppress_by_email") as mock_suppress, \
+         patch("src.services.email_suppression.suppress_by_domain"):
 
         def capture_session(session, email, reason):
             received_sessions.append(session)

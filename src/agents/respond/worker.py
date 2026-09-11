@@ -3,16 +3,23 @@
 Reads from the respond:inbound Redis Stream, loads the inbound_messages DB
 row, classifies the intent, writes the result back, then routes:
 
-  UNSUBSCRIBE  → SUPPRESSED  + contact suppressed + Slack #command alert
+  UNSUBSCRIBE  → SUPPRESSED  + contact AND domain suppressed (S-12) + proof-ledger event + Slack #command alert
   LEGAL_GRIEF  → ESCALATED   + CLIENT relay halt  + Slack #command P0 alert
   COMPLAINT    → ROUTED      + domain suppressed  + sequence halted + #blackink-qa alert
   HOT_LEAD     → ROUTED      + context card       + sequence halted
   WHALE_OWNER  → ROUTED      + context card
   OBJECTION    → ROUTED      + context card
   QUESTION     → ROUTED      + requires_human_review=TRUE if confidence < 0.90
+                             + KB-matched draft card posted to #sales-replies (Subtask 2.1.3 /
+                               PR #46's knowledge_base_entries + match_kb()/post_kb_card() —
+                               NOT this S-10 change; S-10's own duplicate implementation of this
+                               piece was dropped when this branch was rebased onto main and the
+                               collision was found)
   PARTNER      → ROUTED      + Slack #client-growth notice
-  LATER        → DEFERRED
-  NURTURE      → ROUTED
+  LATER        → DEFERRED    + (S-10) contact paused until an extracted target date, or
+                               requires_human_review=TRUE if no date could be extracted
+  NURTURE      → ROUTED      (S-10's monthly nurture stream is explicitly DEFERRED — no
+                               content/enrollment exists yet; falls through unchanged)
 
 Control flow per iteration:
   1. read_batch()      — claim one message from the stream.
@@ -87,7 +94,7 @@ def _consumer_name() -> str:
 def _load_row(db: Any, db_id: int) -> Optional[Dict[str, Any]]:
     row = db.execute(
         text(
-            "SELECT id, client_id, sender_email, subject, body_text, status, received_at "
+            "SELECT id, client_id, contact_id, sender_email, subject, body_text, status, received_at "
             "FROM inbound_messages WHERE id = :id"
         ),
         {"id": db_id},
@@ -217,6 +224,9 @@ def _route(
     sender_email: str,
     received_at: Any,
     result: ClassificationResult,
+    *,
+    body_text: str = "",
+    contact_id: Optional[int] = None,
 ) -> str:
     """Determine terminal status, write it, fire any side-effects. Returns final status."""
     if isinstance(received_at, datetime):
@@ -248,10 +258,71 @@ def _route(
             logger.exception("respond.worker: kb match failed for db_id=%s", db_id)
         requires_human_review = result.confidence < 0.90 or is_fallback
 
+    # S-10 — LATER: extract a target reactivation date and pause the
+    # contact's outbound sequence until then. No clean date, or no known
+    # contact_id (an inbound reply doesn't always resolve to one) -> flag
+    # for human review rather than guessing.
+    later_blocked_by_competing_pause = False
+    later_requested_date_iso: Optional[str] = None
+    later_competing_pause_reason: Optional[str] = None
+    if result.intent == Intent.LATER:
+        from src.services.reactivation import extract_target_date, pause_contact_until
+        target_date = extract_target_date(body_text, as_of=received_at_dt)
+        if target_date is not None and contact_id is not None:
+            paused = pause_contact_until(db, contact_id, target_date)
+            if not paused:
+                # Review-fix: pause_contact_until() correctly refuses to
+                # clobber an existing non-REACTIVATION pause (e.g. a
+                # NO_SHOW_RECOVERY pause) and returns False — but the
+                # requested date must not be silently discarded just
+                # because it lost to a competing pause. Stashing it in
+                # classification_meta alone is not actionable — nothing
+                # anywhere reads requires_human_review/classification_meta
+                # for inbound_messages (confirmed: no sweep, dashboard, or
+                # card queries either), so a human must be paged directly
+                # (below, post-commit) rather than relying on a flag no
+                # workflow ever surfaces.
+                result.meta["requested_reactivation_date"] = target_date.isoformat()
+                requires_human_review = True
+                later_blocked_by_competing_pause = True
+                later_requested_date_iso = target_date.isoformat()
+                existing_pause = db.execute(
+                    text("SELECT outbound_pause_reason FROM contacts WHERE contact_id = :cid"),
+                    {"cid": contact_id},
+                ).first()
+                later_competing_pause_reason = existing_pause[0] if existing_pause else "unknown"
+        else:
+            requires_human_review = True
+
     # Pre-commit side-effects that must be atomic with the status write.
     if result.intent == Intent.UNSUBSCRIBE:
-        from src.services.email_suppression import suppress_by_email
+        from src.services.email_suppression import suppress_by_email, suppress_by_domain
         suppress_by_email(db, sender_email, reason="inbound_opt_out")
+        # S-12 — an opt-out suppresses the WHOLE domain, not just the
+        # sender's own address (previously only COMPLAINT did this).
+        domain = sender_email.split("@")[-1].strip().lower() if "@" in sender_email else ""
+        if domain:
+            suppress_by_domain(db, domain, reason="inbound_opt_out")
+        # S-12 — proof-ledger event. Scoped to THIS message's client_id
+        # (events.client_id is NOT NULL) even though the suppression effect
+        # itself is global/cross-tenant — see events.py's REQUIRED_PAYLOAD_
+        # FIELDS entry for suppression_applied and email_suppression.py's
+        # own docstring for why the contacts row, not events, is the
+        # suppression record of truth.
+        log_event(
+            client_id,
+            "suppression_applied",
+            entity_type="inbound_message",
+            entity_id=str(db_id),
+            payload={
+                "scope": "EMAIL_AND_DOMAIN" if domain else "EMAIL",
+                "sender_email": sender_email,
+                "domain": domain,
+                "reason": "inbound_opt_out",
+            },
+            actor="respond_worker",
+            session=db,
+        )
 
     elif result.intent == Intent.COMPLAINT:
         from src.services.email_suppression import suppress_by_domain
@@ -319,6 +390,24 @@ def _route(
             f":handshake: *Partner inquiry*\n"
             f"Client: `{client_id}` | Sender: `{sender_email}`\n"
             f"Message ID: `{db_id}` — route to Referral Agent.",
+        ))
+
+    if later_blocked_by_competing_pause:
+        # Review-fix: requires_human_review/classification_meta on
+        # inbound_messages have no consumer anywhere in this repo (no
+        # sweep, dashboard, or card queries either) — recording the
+        # requested date there makes it durable but not actionable. A
+        # direct Slack page is what actually gets a human to act, matching
+        # this file's own established pattern for every other "needs a
+        # human now" case above (LEGAL_GRIEF, COMPLAINT, PARTNER).
+        asyncio.run(_post_slack_alert(
+            "command",
+            f":date: *Reactivation request blocked by an active pause*\n"
+            f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+            f"Message ID: `{db_id}` — requested reactivation on "
+            f"`{later_requested_date_iso}`, but contact `{contact_id}` is "
+            f"already paused for `{later_competing_pause_reason}`. Not "
+            f"auto-applied — pause manually once the existing pause clears.",
         ))
 
     if is_fallback:
@@ -432,7 +521,24 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
             sender_email=row.get("sender_email") or "",
             received_at=row.get("received_at") or datetime.now(timezone.utc),
             result=result,
+            body_text=row.get("body_text") or "",
+            contact_id=row.get("contact_id"),
         )
+
+    # S-20 (W2 §3.2.5 Stage 5) — receipt-to-routed latency, the evidence the
+    # "<60s hot-lead routing" acceptance criterion needs. Measured from
+    # received_at (set at actual intake, before any queueing) to right now
+    # (after _route() has already posted the #blackink-setter context card
+    # for HOT_LEAD/WHALE_OWNER/OBJECTION and persisted card_posted_at) — so
+    # this captures the FULL pipeline latency including any queue wait, not
+    # just this function's own processing time. Written for every intent,
+    # not only hot leads: a digest/Evidence-Packet reader filters to
+    # intent IN (HOT_LEAD, WHALE_OWNER) to evidence the specific SLA claim,
+    # but the field costs nothing to record for every row.
+    received_at_for_latency = row.get("received_at") or datetime.now(timezone.utc)
+    if received_at_for_latency.tzinfo is None:
+        received_at_for_latency = received_at_for_latency.replace(tzinfo=timezone.utc)
+    routing_latency_seconds = (datetime.now(timezone.utc) - received_at_for_latency).total_seconds()
 
     try:
         log_event(
@@ -446,6 +552,7 @@ def _process_message(msg: queue.InboundQueueMessage) -> None:
                 "final_status":      final_status,
                 "objection_subtype": result.objection_subtype,
                 "path":              result.meta.get("path", "llm"),
+                "routing_latency_seconds": routing_latency_seconds,
             },
             actor="respond_worker",
         )

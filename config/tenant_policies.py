@@ -121,6 +121,11 @@ TENANT_POLICIES = {
 	# Task 4.2.2 — Six-Attempt STL Cadence at-most-once send guard.
 	# Direct client_id column, same pattern as winback_touch_dispatches.
 	"stl_cadence_dispatches": {"mode": "direct", "column": "client_id"},
+	# S-13 — SLA tier-3 reallocation. Each client's own pool of backup
+	# closers; direct client_id column, same reasoning as
+	# meeting_outcome_prompt_jobs (per-tenant operational data, not global
+	# reference config).
+	"backup_closer_roster": {"mode": "direct", "column": "client_id"},
 }
 
 # Tables deliberately NOT tenant-scoped, and why — kept here so the absence

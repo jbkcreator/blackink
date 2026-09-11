@@ -413,6 +413,26 @@ class AppSettings(BaseSettings):
 	# once AWS credentials exist.
 	pdf_local_dir: str = Field(default="tmp/pdf", env="PDF_LOCAL_DIR")
 
+	# ── S-24 (W2 §3.2.4 A) — Assessor roll loader ────────────────────────────
+	# A county tax-roll extract is not a stable self-serve HTTP download —
+	# Hillsborough's own site sells its full assessment data as a paid,
+	# manually-ordered product, and the FL DOR statewide portal's exact
+	# current-year download path is unverified. So acquisition is a manual
+	# operator step (buy/download the file, place it at this path) — these
+	# settings name where the loader looks, not how the file got there.
+	# Empty/missing path -> that county is skipped (fail closed, matching
+	# EMAIL_SENDING_ENABLED's own "unset means don't guess" posture) rather
+	# than the sweep silently doing nothing with no signal.
+	assessor_roll_path_hillsborough: str = Field(
+		default="data/assessor_rolls/hillsborough_fl.csv", env="ASSESSOR_ROLL_PATH_HILLSBOROUGH"
+	)
+	assessor_roll_path_pinellas: str = Field(
+		default="data/assessor_rolls/pinellas_fl.csv", env="ASSESSOR_ROLL_PATH_PINELLAS"
+	)
+	# County tax rolls are certified/updated annually — an import older than
+	# this is stale and worth a human's attention, not a silent gap.
+	assessor_roll_staleness_days: int = Field(default=400, env="ASSESSOR_ROLL_STALENESS_DAYS")
+
 	# ── Ink Sendspark ─────────────────────────────────────────────────────────
 	# Fail-closed: if either is unset, node_sendspark logs SENDSPARK_SKIPPED and
 	# returns video_id=None / landing_url=None -- campaign continues without video.

@@ -1055,14 +1055,101 @@ def _release_inbound_message_claim(session, inbound_id, original_status: str, cl
 		session.execute(text("SET LOCAL app.current_client_id = :cid"), {"cid": client_id})
 
 
-def _is_opted_out(session, contact_id) -> bool:
-	if contact_id is None:
-		return False
+# Free/consumer email providers — never treated as a company domain whose
+# suppression should block every OTHER sender at that same domain. Without
+# this, "someone at gmail.com opted out" would silently block every future
+# reply to any other gmail.com sender, which is not what domain suppression
+# means and is never this repo's intent (companies.domain is meant to be a
+# real business's own domain).
+_PUBLIC_EMAIL_DOMAINS = frozenset({
+	"gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+	"msn.com", "yahoo.com", "ymail.com", "aol.com", "icloud.com", "me.com",
+	"mac.com", "protonmail.com", "proton.me", "gmx.com", "zoho.com",
+})
+
+
+def _email_domain(normalized_email: str) -> Optional[str]:
+	if "@" not in normalized_email:
+		return None
+	return normalized_email.rsplit("@", 1)[-1] or None
+
+
+def _is_opted_out(session, client_id, contact_id, sender_email) -> bool:
+	"""Fail-closed opt-out check before a consequential send (Reply in
+	Thread / Book Meeting / KB draft approval). Code-review fix: the prior
+	version returned False (not blocked) unconditionally whenever
+	contact_id was None — a real, reachable gap for an "unattributed" reply
+	(contact_id legitimately NULL when ingestion attribution fails, per
+	inbound_ingest.py's own Tier-2 unattributed-match handling), confirmed
+	live: a domain-suppressed sender whose OWN contact row was never
+	resolved at intake still passed this check, meaning a rep could
+	approve-and-send to someone who had already opted out.
+
+	Checks, in order, and is TENANT-SCOPED throughout — client_id must be a
+	value the caller already trusts (the row's own resolved client_id;
+	never taken bare from unauthenticated request input), and no lookup
+	here ever searches by email/domain without that scope:
+
+	1. contact_id, when known — the authoritative per-contact flag, checked
+	   directly (unchanged from before).
+	2. A normalized, tenant-scoped exact sender-email lookup, when
+	   contact_id is unknown — catches a sender who HAS a contact row (an
+	   individual suppression, or one already flipped by a prior domain
+	   suppression) that ingestion simply failed to attribute this message
+	   to.
+	3. A tenant-scoped domain-suppression lookup — catches a sender with NO
+	   contact row of their own yet, at a company domain some OTHER
+	   contact there already suppressed via suppress_by_domain(). Skipped
+	   entirely for public/free email domains (see _PUBLIC_EMAIL_DOMAINS)
+	   — a personal gmail.com opt-out must never be read as "block all of
+	   gmail.com".
+	4. Fails CLOSED (returns True) when NEITHER contact_id nor a usable
+	   sender_email is available — a consequential send must never proceed
+	   blind with no identity to check at all.
+
+	A sender with no matching contact row and no domain-level suppression
+	found is NOT opted out — this is the ordinary "genuinely new, never
+	suppressed" case, not a failure to verify."""
+	if contact_id is not None:
+		row = session.execute(
+			text("SELECT is_opted_out FROM contacts WHERE contact_id = :cid"),
+			{"cid": contact_id},
+		).first()
+		return bool(row and row.is_opted_out)
+
+	normalized_email = (sender_email or "").strip().lower()
+	if not normalized_email or "@" not in normalized_email:
+		# Neither identity is available at all -- fail closed.
+		return True
+
 	row = session.execute(
-		text("SELECT is_opted_out FROM contacts WHERE contact_id = :cid"),
-		{"cid": contact_id},
+		text(
+			"SELECT c.is_opted_out FROM contacts c "
+			"JOIN companies co ON co.company_id = c.company_id "
+			"WHERE co.owning_client_id = :client_id AND lower(c.email) = :email "
+			"LIMIT 1"
+		),
+		{"client_id": client_id, "email": normalized_email},
 	).first()
-	return bool(row and row.is_opted_out)
+	if row is not None:
+		return bool(row.is_opted_out)
+
+	domain = _email_domain(normalized_email)
+	if domain and domain not in _PUBLIC_EMAIL_DOMAINS:
+		domain_row = session.execute(
+			text(
+				"SELECT 1 FROM contacts c "
+				"JOIN companies co ON co.company_id = c.company_id "
+				"WHERE co.owning_client_id = :client_id AND co.domain = :domain "
+				"  AND c.is_opted_out = TRUE "
+				"LIMIT 1"
+			),
+			{"client_id": client_id, "domain": domain},
+		).first()
+		if domain_row is not None:
+			return True
+
+	return False
 
 
 @app.action("reply_in_thread")
@@ -1150,7 +1237,7 @@ async def handle_reply_thread_modal_submit(ack, body, view, client):
 		if row.status == "RESPONDED":
 			await ack(response_action="errors", errors={"reply_block": "Already replied to this message."})
 			return
-		if _is_opted_out(session, contact_id):
+		if _is_opted_out(session, client_id, contact_id, row.sender_email):
 			await ack(response_action="errors", errors={"reply_block": "This contact has opted out — reply blocked."})
 			return
 
@@ -1252,7 +1339,7 @@ async def handle_book_meeting(ack, body, respond, action):
 		if row is None:
 			await respond(response_type="ephemeral", text=":warning: Original message not found.")
 			return
-		if _is_opted_out(session, contact_id):
+		if _is_opted_out(session, client_id, contact_id, row.sender_email):
 			await respond(response_type="ephemeral", text=":warning: This contact has opted out.")
 			return
 

@@ -47,19 +47,26 @@ def _inbound_row(*, status="PENDING", contact_id=7, sender_email="prospect@examp
     )
 
 
-def _fake_session(*, inbound_row, opted_out=False, claim_succeeds=True):
+def _fake_session(*, inbound_row, opted_out=False, claim_succeeds=True,
+                   email_suppressed=False, domain_suppressed=False):
     session = MagicMock()
 
     def _execute(stmt, params=None, *a, **kw):
         sql = str(stmt)
+        params = params or {}
         result = MagicMock()
         if "SET status = 'SENDING'" in sql:
             # Code-review fix (PR #50, finding 5): the atomic pre-send claim.
             result.first.return_value = SimpleNamespace(id=inbound_row.id) if claim_succeeds else None
         elif "FROM inbound_messages WHERE id" in sql:
             result.first.return_value = inbound_row
-        elif "FROM contacts WHERE contact_id" in sql:
+        elif "WHERE contact_id = :cid" in sql:
             result.first.return_value = SimpleNamespace(is_opted_out=opted_out)
+        elif "lower(c.email) = :email" in sql:
+            # Code-review fix: unattributed-reply (contact_id=None) fallback.
+            result.first.return_value = SimpleNamespace(is_opted_out=True) if email_suppressed else None
+        elif "c.is_opted_out = TRUE" in sql:
+            result.first.return_value = SimpleNamespace() if domain_suppressed else None
         else:
             result.first.return_value = None
         return result
@@ -244,6 +251,43 @@ def test_reply_send_blocked_for_opted_out_contact():
     assert "opted out" in str(ack.await_args.kwargs["errors"]).lower()
 
 
+def test_reply_send_blocked_for_unattributed_reply_with_suppressed_email():
+    """Code-review fix: contact_id=None (an unattributed reply — real
+    attribution can fail at ingestion) used to bypass the opt-out check
+    entirely. Now falls back to a tenant-scoped exact-email lookup."""
+    row = _inbound_row(status="PENDING", contact_id=None, sender_email="ghost@acme.com")
+    session = _fake_session(inbound_row=row, email_suppressed=True)
+    client = AsyncMock()
+    body, view = _submit_body(contact_id=None)
+    ack = AsyncMock()
+    fake_sender = MagicMock()
+
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender):
+        _run(handle_reply_thread_modal_submit(ack=ack, body=body, view=view, client=client))
+
+    fake_sender.send.assert_not_called()
+    assert "opted out" in str(ack.await_args.kwargs["errors"]).lower()
+
+
+def test_reply_send_blocked_for_unattributed_reply_at_suppressed_domain():
+    row = _inbound_row(status="PENDING", contact_id=None, sender_email="new-person@acme.com")
+    session = _fake_session(inbound_row=row, domain_suppressed=True)
+    client = AsyncMock()
+    body, view = _submit_body(contact_id=None)
+    ack = AsyncMock()
+    fake_sender = MagicMock()
+
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender):
+        _run(handle_reply_thread_modal_submit(ack=ack, body=body, view=view, client=client))
+
+    fake_sender.send.assert_not_called()
+    assert "opted out" in str(ack.await_args.kwargs["errors"]).lower()
+
+
 def test_reply_send_fails_visibly_on_missing_card_context():
     """A pre-S-11 card with no inbound_id/client_id in its value must fail
     visibly, never silently send nothing."""
@@ -356,3 +400,38 @@ def test_book_meeting_rejects_unauthorized_user():
         _run(handle_book_meeting(ack=AsyncMock(), body=body, respond=respond, action=action))
     respond.assert_awaited_once()
     assert "not authorized" in respond.await_args.kwargs["text"].lower()
+
+
+def test_book_meeting_blocked_for_unattributed_reply_with_suppressed_email():
+    """Code-review fix: same unattributed-reply gap as Reply in Thread."""
+    row = _inbound_row(status="PENDING", contact_id=None, sender_email="ghost@acme.com")
+    session = _fake_session(inbound_row=row, email_suppressed=True)
+    respond = AsyncMock()
+    action = {"value": json.dumps({"inbound_id": "inbound-1", "contact_id": None, "client_id": "acme_pm"})}
+    body = {"user": {"id": "U1"}}
+    fake_sender = MagicMock()
+
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender):
+        _run(handle_book_meeting(ack=AsyncMock(), body=body, respond=respond, action=action))
+
+    fake_sender.send.assert_not_called()
+    assert "opted out" in respond.await_args.kwargs["text"].lower()
+
+
+def test_book_meeting_blocked_for_unattributed_reply_at_suppressed_domain():
+    row = _inbound_row(status="PENDING", contact_id=None, sender_email="new-person@acme.com")
+    session = _fake_session(inbound_row=row, domain_suppressed=True)
+    respond = AsyncMock()
+    action = {"value": json.dumps({"inbound_id": "inbound-1", "contact_id": None, "client_id": "acme_pm"})}
+    body = {"user": {"id": "U1"}}
+    fake_sender = MagicMock()
+
+    with patch("src.services.slack.listeners.approver_authorized", return_value=True), \
+         patch("src.services.slack.listeners.get_db_context", _fake_ctx(session)), \
+         patch("src.services.slack.listeners.build_email_sender", return_value=fake_sender):
+        _run(handle_book_meeting(ack=AsyncMock(), body=body, respond=respond, action=action))
+
+    fake_sender.send.assert_not_called()
+    assert "opted out" in respond.await_args.kwargs["text"].lower()
