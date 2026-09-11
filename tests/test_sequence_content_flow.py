@@ -54,6 +54,17 @@ def _enqueue_capture(monkeypatch):
     monkeypatch.setattr(sequence_enrollment, "may_enroll", lambda cid: True)
     from src.services import work_orders as wo
     monkeypatch.setattr(wo, "enqueue", _fake_enqueue)
+    # S-3's DNC gate call in enroll_contact does real session.execute(...).one()
+    # queries against contacts.dnc_checked_at — a bare MagicMock() session
+    # (this suite's stand-in for a real DB session, since it only cares about
+    # content flow) returns a MagicMock for that column too, which blows up
+    # arithmetic against a timedelta. This suite isn't testing the DNC gate,
+    # so stub the whole readiness check out, same as may_enroll above.
+    # enroll_contact imports evaluate_full_readiness locally (to avoid a
+    # circular import), so the patch target is the defining module, not
+    # sequence_enrollment's own namespace.
+    from src.services import campaign_readiness_gate as _crg
+    monkeypatch.setattr(_crg, "evaluate_full_readiness", lambda *a, **k: None)
     return captured
 
 
