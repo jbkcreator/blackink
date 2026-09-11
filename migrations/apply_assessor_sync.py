@@ -93,11 +93,24 @@ DDL = [
 	# anything post-rename — safe to drop once assessor_parcels is the real
 	# table. Guarded to only ever drop it when it's genuinely empty.
 	"""
-	DO $$ BEGIN
+	DO $$
+	DECLARE
+	  stray_row_count BIGINT;
+	BEGIN
 	  IF to_regclass('public.assessor_parcels') IS NOT NULL
-	     AND to_regclass('public.raw_assessor_parcels') IS NOT NULL
-	     AND (SELECT COUNT(*) FROM raw_assessor_parcels) = 0 THEN
-	    DROP TABLE raw_assessor_parcels;
+	     AND to_regclass('public.raw_assessor_parcels') IS NOT NULL THEN
+	    -- EXECUTE (dynamic SQL), not a plain SELECT, because a plain
+	    -- "SELECT COUNT(*) FROM raw_assessor_parcels" embedded in this IF's
+	    -- own condition gets its relation resolved at PARSE time as part of
+	    -- the whole boolean expression -- before the AND short-circuits at
+	    -- runtime -- so it raised UndefinedTable on a fresh DB where this
+	    -- table never exists at all (caught live in CI). EXECUTE defers
+	    -- parsing until this branch actually runs, when the table is known
+	    -- to exist.
+	    EXECUTE 'SELECT COUNT(*) FROM raw_assessor_parcels' INTO stray_row_count;
+	    IF stray_row_count = 0 THEN
+	      EXECUTE 'DROP TABLE raw_assessor_parcels';
+	    END IF;
 	  END IF;
 	END $$;
 	""",
