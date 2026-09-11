@@ -72,6 +72,7 @@ from src.services import owner_enrichment as oe
 from src.services.events import log_event
 from src.services.slack.post import post_notice
 from src.services.winback_ingest import dnc_scrub_rows
+from src.services.winback_loss_est import stamp_loss_estimates
 
 logger = logging.getLogger(__name__)
 
@@ -389,6 +390,14 @@ def run_sweep(client_id: str, import_id: Optional[str] = None, limit: Optional[i
             _mark_claimed(session, [r.winback_row_id for r in rows], now)
             session.commit()
             _enrich_claimed_rows(session, client_id, rows, provider, settings, counts)
+            stamped = stamp_loss_estimates(
+                session, client_id, [r.winback_row_id for r in rows]
+            )
+            if stamped:
+                session.commit()
+                logger.info(
+                    "enrichment_verification: stamped loss estimates for %d rows", stamped
+                )
 
         # Homestead-drop / same-owner hook (client comments:28-29) — no-op
         # today (Week2_Tasks_Dev_Split_v1.md:11 defers both signal types),

@@ -63,4 +63,9 @@
 # 1st of the month. Scores every active company for the current month.
 0 5 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.owner_visibility_sweep >> /root/blackink/logs/owner_visibility_sweep.log 2>&1
 
+# ── OVS month-over-month delta alert ─────────────────────────────────────
+# 1st of the month at 7 AM, 2 hours after the OVS sweep (5 AM). Compares
+# current vs prior month scores; posts movers >10 pts to #blackink-economics.
+0 7 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.ovs_delta_alert >> /root/blackink/logs/ovs_delta_alert.log 2>&1
+
 # ── Add future scheduled jobs below this line ───────────────────────────

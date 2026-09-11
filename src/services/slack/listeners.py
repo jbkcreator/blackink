@@ -124,6 +124,19 @@ def _calling_hours_label(indicator: str) -> str:
 	return "Outside calling hours — do not call"
 
 
+def _next_calling_window_start(now: Optional[datetime] = None) -> datetime:
+	"""Next window-open moment (8 AM ET) as a UTC datetime.
+
+	Called only when the indicator is 🔴, so the two cases are:
+	  before 8 AM ET → returns today at 8 AM ET
+	  at/after 8 PM ET → returns tomorrow at 8 AM ET"""
+	now_et = (now or datetime.now(timezone.utc)).astimezone(_CALLING_TZ)
+	target = now_et.replace(hour=_CALLING_WINDOW_START, minute=0, second=0, microsecond=0)
+	if now_et.hour >= _CALLING_WINDOW_START:
+		target = target + timedelta(days=1)
+	return target.astimezone(timezone.utc)
+
+
 def _current_local_time_label(now: Optional[datetime] = None) -> str:
 	"""Recipient's current local wall-clock time, stamped at post time.
 	All 10 launch counties are Eastern (D14), so local == ET; the label names
@@ -312,6 +325,13 @@ def _dial_task_content_blocks(order: "wo.WorkOrder") -> list:
 	ovs_lines = payload.get("ovs_lines")
 	if ovs_lines:
 		blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(ovs_lines)}})
+	# DNC warning — shown when dnc_clean IS NULL (never checked). Hard-blocked
+	# contacts (dnc_clean=False / is_opted_out=True) never reach this function.
+	if payload.get("dnc_warning"):
+		blocks.append({
+			"type": "section",
+			"text": {"type": "mrkdwn", "text": "⚠️ *DNC not checked* — verify manually before calling"},
+		})
 	blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"{indicator} *{hours_label}*"}})
 	blocks.append({
 		"type": "context",
@@ -690,11 +710,20 @@ async def _load_and_verify(value: dict, user_id: str, *, respond) -> "wo.WorkOrd
 
 
 async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
-	"""Post a DIAL_TASK card immediately when Touch 1 is approved (ticket 25).
+	"""Enqueue and (conditionally) post a DIAL_TASK card when Touch 1 is approved.
 
-	60-second SLA means we cannot wait for the day-grain sweep — this is
-	fired event-driven from _finalize_terminal_decision on Touch 1 approval.
-	The DIAL_TASK work order's due_at is a 'call after' hint; posting is ours.
+	Two gates run before the card is created:
+
+	  DNC / opt-out — if contacts.dnc_clean IS FALSE or is_opted_out IS TRUE,
+	  the card is blocked entirely and a dial_task_dnc_blocked event is logged.
+	  dnc_clean IS NULL (unchecked) is a soft warning stamped on the card,
+	  not a hard block, because the DNC vendor may simply not have been
+	  polled yet for this contact.
+
+	  Calling hours — the card is enqueued with due_at=NOW if within the 8 AM–
+	  8 PM ET window (post immediately, 60s SLA met), or due_at=next 8 AM ET if
+	  outside it (post deferred — sequence_sweep picks it up when the window
+	  opens, same dedup guard as every other touch class).
 
 	Contact info is looked up synchronously from DB (same pattern as
 	_log_event — get_db_context is sync, safe to call from async context)."""
@@ -713,13 +742,14 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 		)
 		return
 
-	# Look up contact + company info to populate the card.
+	# Look up contact + company info (including DNC columns) to populate the card.
 	contact_data: dict = {}
 	try:
 		with get_db_context(client_id=order.client_id) as session:
 			row = session.execute(
 				text(
 					"SELECT c.first_name, c.last_name, c.phone, "
+					"       c.dnc_clean, c.is_opted_out, "
 					"       co.company_name, co.county_slug, co.company_id, co.door_count_est "
 					"FROM contacts c "
 					"JOIN companies co ON co.company_id = c.company_id "
@@ -738,12 +768,37 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 			exc_info=True,
 		)
 
+	# ── DNC / opt-out gate ────────────────────────────────────────────────
+	# dnc_clean=False → confirmed DNC listed; is_opted_out=True → suppressed.
+	# Both are hard blocks: no card, no work order, event logged for audit.
+	# dnc_clean=None → never checked (stub provider or new contact) → soft
+	# warning stamped on the card but not a hard block.
+	dnc_clean = contact_data.get("dnc_clean")
+	is_opted_out = contact_data.get("is_opted_out")
+	phone = contact_data.get("phone")
+
+	if is_opted_out or dnc_clean is False:
+		reason = "opted_out" if is_opted_out else "dnc_listed"
+		logger.info(
+			"[listeners] DIAL_TASK blocked — %s contact_id=%s run_id=%s",
+			reason, contact_id, run_id,
+		)
+		_log_event(
+			order.client_id, "dial_task_dnc_blocked",
+			entity_id=str(contact_id),
+			payload={"reason": reason, "run_id": run_id, "action_id": order.action_id},
+		)
+		return
+
+	# dnc_clean IS NULL + phone present = DNC vendor hasn't been polled yet.
+	# Show a warning on the card so the rep can verify manually before calling.
+	dnc_warning = phone is not None and dnc_clean is None
+
 	first = contact_data.get("first_name") or ""
 	last = contact_data.get("last_name") or ""
 	contact_name = f"{first} {last}".strip() or "Unknown"
 	firm_name = contact_data.get("company_name") or "Unknown"
 	county = contact_data.get("county_slug") or "Unknown"
-	phone = contact_data.get("phone")
 
 	dial_payload = {
 		"contact_id": contact_id,
@@ -754,7 +809,16 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 		"phone": phone,
 		"door_count": contact_data.get("door_count_est"),
 		"ovs_lines": contact_data.get("ovs_lines"),
+		"dnc_warning": dnc_warning,
 	}
+
+	# ── Calling-hours gate ────────────────────────────────────────────────
+	# If within the 8 AM–8 PM ET window: post immediately (60s SLA).
+	# If outside: defer to next window-open — sequence_sweep posts it then.
+	now_utc = datetime.now(timezone.utc)
+	indicator = _calling_hours_indicator(now_utc)
+	post_immediately = indicator == "🟢"
+	due_at = now_utc if post_immediately else _next_calling_window_start(now_utc)
 
 	# Stable run/touch key — matches the other touches' convention and
 	# guarantees exactly one dial order per run regardless of approval retries
@@ -773,12 +837,19 @@ async def _post_dial_task_after_touch1_approval(order: "wo.WorkOrder") -> None:
 			config_fingerprint={"channel": "dial", "touch_step": 2},
 			idempotency_key=idempotency_key,
 			recipient=phone,
+			due_at=due_at,
 		)
 	except Exception:
 		logger.error("[listeners] DIAL_TASK enqueue failed", exc_info=True)
 		return
 
-	await post_work_order_card(dial_order, channel_key="dial")
+	if post_immediately:
+		await post_work_order_card(dial_order, channel_key="dial")
+	else:
+		logger.info(
+			"[listeners] DIAL_TASK deferred — outside calling hours; due_at=%s action_id=%s",
+			due_at.isoformat(), dial_order.action_id,
+		)
 
 
 async def _finalize_terminal_decision(order: "wo.WorkOrder", *, decision: str, user_id: str, respond) -> None:

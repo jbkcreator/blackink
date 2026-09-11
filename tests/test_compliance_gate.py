@@ -24,6 +24,7 @@ from src.services.compliance_gate import (
 
 def _contact(**overrides):
 	base = dict(
+		contact_id=1,
 		email_status="VERIFIED",
 		is_opted_out=False,
 		suppression_state=False,
@@ -55,15 +56,20 @@ class _UnknownDnc(DncProvider):
 
 
 class FakeSession:
-	"""Minimal stand-in for the one query _check_non_poach issues."""
+	"""Minimal stand-in for queries issued by _check_dnc and _check_non_poach."""
 
 	def __init__(self, scalar_result=None, raise_error=False):
 		self._scalar_result = scalar_result
 		self._raise_error = raise_error
 
-	def execute(self, *args, **kwargs):
+	def execute(self, stmt, params=None):
 		if self._raise_error:
 			raise RuntimeError("simulated DB error")
+		sql = str(stmt)
+		# _check_dnc cache write — no-op in unit tests; we assert the return
+		# value of the check, not the DB write.
+		if "UPDATE contacts SET dnc_clean" in sql:
+			return SimpleNamespace(rowcount=1)
 		return SimpleNamespace(scalar=lambda: self._scalar_result)
 
 
@@ -103,43 +109,43 @@ def test_cooldown_fail_not_elapsed():
 # ── _check_dnc ───────────────────────────────────────────────────────────
 
 def test_dnc_abstains_when_never_checked_and_provider_unknown():
-	result = _check_dnc(_contact(dnc_checked_at=None), _UnknownDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_checked_at=None), _UnknownDnc())
 	assert result.status == ABSTAIN
 
 
 def test_dnc_passes_with_no_phone_on_file():
 	"""No phone → DNC registry not applicable → PASS (not ABSTAIN).
 	A missing phone is not a registry hit; the registry has nothing to say."""
-	result = _check_dnc(_contact(dnc_checked_at=None, phone=None), _AlwaysClearDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_checked_at=None, phone=None), _AlwaysClearDnc())
 	assert result.status == PASS
 
 
 def test_dnc_fails_when_provider_reports_listed():
-	result = _check_dnc(_contact(dnc_checked_at=None), _AlwaysListedDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_checked_at=None), _AlwaysListedDnc())
 	assert result.status == FAIL
 
 
 def test_dnc_passes_when_provider_reports_clear():
-	result = _check_dnc(_contact(dnc_checked_at=None), _AlwaysClearDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_checked_at=None), _AlwaysClearDnc())
 	assert result.status == PASS
 
 
 def test_dnc_abstains_on_stale_cached_true():
 	"""A stale TRUE is not trusted — must ABSTAIN, never silently PASS."""
 	stale = datetime.now(timezone.utc) - timedelta(days=45)
-	result = _check_dnc(_contact(dnc_clean=True, dnc_checked_at=stale), _AlwaysListedDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_clean=True, dnc_checked_at=stale), _AlwaysListedDnc())
 	assert result.status == ABSTAIN
 
 
 def test_dnc_passes_on_fresh_cached_true():
 	fresh = datetime.now(timezone.utc) - timedelta(days=5)
-	result = _check_dnc(_contact(dnc_clean=True, dnc_checked_at=fresh), _AlwaysListedDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_clean=True, dnc_checked_at=fresh), _AlwaysListedDnc())
 	assert result.status == PASS
 
 
 def test_dnc_fails_on_fresh_cached_false():
 	fresh = datetime.now(timezone.utc) - timedelta(days=5)
-	result = _check_dnc(_contact(dnc_clean=False, dnc_checked_at=fresh), _AlwaysClearDnc())
+	result = _check_dnc(FakeSession(), _contact(dnc_clean=False, dnc_checked_at=fresh), _AlwaysClearDnc())
 	assert result.status == FAIL
 
 

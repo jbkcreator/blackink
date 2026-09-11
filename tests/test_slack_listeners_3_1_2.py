@@ -439,8 +439,10 @@ def _fake_db_ctx(contact_row):
 def test_dial_task_created_when_touch1_payload_lacks_contact_id():
     """enroll_contact()'s Touch-1 payload has only {run_id, touch_step} — the
     dial poster must fall back to order.entity_id, not early-return (finding 2)."""
+    from types import SimpleNamespace
     contact_row = {
         "first_name": "Jane", "last_name": "Doe", "phone": "+18135550100",
+        "dnc_clean": True, "is_opted_out": False,
         "company_name": "Acme PM", "county_slug": "hillsborough",
         "company_id": "co-1", "door_count_est": 120,
     }
@@ -448,8 +450,9 @@ def test_dial_task_created_when_touch1_payload_lacks_contact_id():
     with patch("src.services.slack.listeners.get_db_context", return_value=_fake_db_ctx(contact_row)), \
          patch("src.services.slack.listeners.fetch_latest_ovs", return_value=None), \
          patch("src.services.slack.listeners.wo.enqueue") as mock_enqueue, \
+         patch("src.services.slack.listeners._calling_hours_indicator", return_value="🟢"), \
          patch("src.services.slack.listeners.post_work_order_card", new_callable=AsyncMock) as mock_post:
-        mock_enqueue.return_value = object()
+        mock_enqueue.return_value = SimpleNamespace(action_id="dial-act-1")
         import asyncio
         asyncio.run(_post_dial_task_after_touch1_approval(order))
 

@@ -185,8 +185,12 @@ def test_enroll_contact_skips_touch2_dial(monkeypatch):
     here would orphan it, since the sweep never posts DIAL_TASK."""
     import src.services.sequence_enrollment as se
     import src.services.work_orders as wo
+    import src.services.campaign_readiness_gate as crg
 
     monkeypatch.setattr(se, "may_enroll", lambda contact_id: True)
+    # evaluate_full_readiness issues several SQL queries against a real DB;
+    # stub it out — its correctness is covered by test_compliance_integration.py.
+    monkeypatch.setattr(crg, "evaluate_full_readiness", lambda session, contact_id, client_id, **kw: None)
 
     enqueued: list[dict] = []
     monkeypatch.setattr(wo, "enqueue", lambda **kw: enqueued.append(kw) or SimpleNamespace(action_id="a"))

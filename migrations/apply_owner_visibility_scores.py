@@ -56,6 +56,8 @@ DDL = [
     "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS county_rank       SMALLINT",
     "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS county_percentile SMALLINT",
     "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS peer_comparisons  JSONB",
+    # S-6: is_published marks scores whose rank <= 25 (visible to the owner portal).
+    "ALTER TABLE owner_visibility_scores ADD COLUMN IF NOT EXISTS is_published BOOLEAN NOT NULL DEFAULT FALSE",
     # County-rank queries: list top N firms in a county for a month.
     "CREATE INDEX IF NOT EXISTS ix_ovs_county_month_rank ON owner_visibility_scores (county_slug, month_key, score_total DESC)",
     "CREATE INDEX IF NOT EXISTS ix_ovs_company_month ON owner_visibility_scores (company_id, month_key)",

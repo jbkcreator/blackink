@@ -56,11 +56,13 @@ _WINBACK_ACTION = "DISPATCH_WINBACK_TOUCH"
 _STL_ARM_ACTION = "STL_CADENCE_ARM"
 _STL_TOUCH_ACTION = "DISPATCH_STL_CADENCE_TOUCH"
 
-# Action classes the sweep actually surfaces. DIAL_TASK is excluded on purpose
-# (event-driven on Touch 1 approval, ADR 0001) — it is in _ACTION_CHANNEL only
-# for channel resolution, never swept.
+# Action classes the sweep surfaces. DIAL_TASK is included so that cards
+# deferred by the calling-hours gate (🔴 path in listeners.py) are posted when
+# due_at arrives. Immediately-posted DIAL_TASK cards (🟢 path) have
+# slack_message_ts already set and are skipped by the dedup guard at line ~285.
 # STL_CADENCE_ARM is auto-executed (no card) — listed separately in _ARM_ACTIONS.
-_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION, _STL_TOUCH_ACTION)
+_DIAL_TASK_ACTION = "DIAL_TASK"
+_SWEPT_ACTIONS = (_EMAIL_TOUCH_ACTION, _LINKEDIN_TASK_ACTION, _WINBACK_ACTION, _STL_TOUCH_ACTION, _DIAL_TASK_ACTION)
 _ARM_ACTIONS = (_STL_ARM_ACTION,)
 
 
@@ -271,9 +273,9 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         executed = _run_arm_orders(arm_orders)
         logger.info("sequence_sweep: %d STL arm-check(s) executed", executed)
 
-    # DIAL_TASK is deliberately NOT swept — it is posted event-driven on Touch 1
-    # approval (docs/adr/0001-non-email-touch-posting-model.md); only email,
-    # LinkedIn, winback, and STL cadence touches surface here.
+    # DIAL_TASK is included — deferred cards (🔴 calling-hours path) are posted
+    # here when due_at arrives. Immediately-posted cards (🟢 path) have
+    # slack_message_ts set and are skipped by the dedup guard below.
     touch_orders = [o for o in batch if o.action_class in _SWEPT_ACTIONS]
 
     if not touch_orders:
@@ -281,10 +283,32 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         return 0
 
     posted = 0
+    auto_approved = 0
     for order in touch_orders:
         if order.slack_message_ts:
             # Card already posted — skip to avoid duplicate cards.
             logger.debug("sequence_sweep: action_id=%s already has a card, skipping", order.action_id)
+            continue
+        # BAND_3_AUTO orders earned auto-dispatch after 50 consecutive clean
+        # sends. Skip the Slack approval card entirely and flip to APPROVED so
+        # the execution sweep dispatches on the next tick.
+        if order.autonomy_band == "BAND_3_AUTO":
+            approved = wo.record_decision(
+                order.client_id, order.action_id,
+                decision="APPROVED",
+                decided_by="system:band3_auto",
+            )
+            if approved is not None:
+                auto_approved += 1
+                logger.info(
+                    "sequence_sweep: BAND_3_AUTO auto-approved action_id=%s class=%s",
+                    order.action_id, order.action_class,
+                )
+            else:
+                logger.warning(
+                    "sequence_sweep: BAND_3_AUTO auto-approve no-op action_id=%s (already decided)",
+                    order.action_id,
+                )
             continue
         if order.action_class == _WINBACK_ACTION and not _winback_touch_still_ready(order):
             # DoD requires the card never be QUEUED after a stop — not just
@@ -318,7 +342,10 @@ def run_sweep(client_id=None, limit: int = 100) -> int:
         else:
             logger.warning("sequence_sweep: card NOT posted action_id=%s — Slack error", order.action_id)
 
-    logger.info("sequence_sweep: %d/%d cards posted", posted, len(touch_orders))
+    logger.info(
+        "sequence_sweep: %d/%d cards posted, %d auto-approved (BAND_3_AUTO)",
+        posted, len(touch_orders), auto_approved,
+    )
     return posted
 
 

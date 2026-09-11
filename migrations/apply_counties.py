@@ -3,11 +3,11 @@ Provision the counties reference table (Dev 1 plan, migration 2 of 11).
 
 Canonical list of Florida counties Blackink targets — avoids free-text
 county-name typos propagating into companies.county_slug /
-county_allocations.county_slug / client_pm_books. Seed list is intentionally
-small (the initial Florida target metros from the blueprint: Tampa-St.
-Petersburg / Hillsborough & Pinellas, Orlando / Orange, Miami-Dade) — add
-more counties by re-running this script with an expanded SEED_COUNTIES list;
-the INSERT is idempotent (ON CONFLICT DO NOTHING).
+county_allocations.county_slug / client_pm_books. First-launch counties are
+Hillsborough and Pinellas; next-wave are Orange, Duval, Polk, Pasco, Lee,
+Brevard, Volusia, Seminole. Miami-Dade is deliberately excluded from first
+launch (spec lines 24 and 306). Add more counties by re-running this script
+with an expanded SEED_COUNTIES list; the INSERT is idempotent (ON CONFLICT DO NOTHING).
 
 Idempotent: CREATE TABLE IF NOT EXISTS, seed insert is ON CONFLICT DO NOTHING.
 
@@ -40,10 +40,19 @@ DDL = [
 ]
 
 SEED_COUNTIES = [
+	# First-launch
 	{"county_slug": "hillsborough_fl", "county_name": "Hillsborough", "state": "FL"},
-	{"county_slug": "pinellas_fl", "county_name": "Pinellas", "state": "FL"},
-	{"county_slug": "orange_fl", "county_name": "Orange", "state": "FL"},
-	{"county_slug": "miami_dade_fl", "county_name": "Miami-Dade", "state": "FL"},
+	{"county_slug": "pinellas_fl",     "county_name": "Pinellas",     "state": "FL"},
+	# Next-wave
+	{"county_slug": "orange_fl",       "county_name": "Orange",       "state": "FL"},
+	{"county_slug": "duval_fl",        "county_name": "Duval",        "state": "FL"},
+	{"county_slug": "polk_fl",         "county_name": "Polk",         "state": "FL"},
+	{"county_slug": "pasco_fl",        "county_name": "Pasco",        "state": "FL"},
+	{"county_slug": "lee_fl",          "county_name": "Lee",          "state": "FL"},
+	{"county_slug": "brevard_fl",      "county_name": "Brevard",      "state": "FL"},
+	{"county_slug": "volusia_fl",      "county_name": "Volusia",      "state": "FL"},
+	{"county_slug": "seminole_fl",     "county_name": "Seminole",     "state": "FL"},
+	# Miami-Dade deliberately excluded from first launch (spec lines 24 and 306)
 ]
 
 SEED_SQL = """

@@ -9,6 +9,7 @@ secrets/
 
 # Task docs/reports — local only, never push
 /Tasks
+/reports/
 
 # Project docs — local only, never push
 /docs

@@ -24,14 +24,16 @@ from src.services.work_orders.dispatchers import (
 def _order(action_class, action_id="a1"):
     return SimpleNamespace(
         action_id=action_id, entity_id="1", action_class=action_class, slack_message_ts=None,
+        autonomy_band="BAND_2_ONE_TAP",
         payload={"touch_step": 4, "run_id": "r1"},
     )
 
 
-def test_sweep_surfaces_email_and_linkedin_but_not_dial(monkeypatch):
-    """Per ADR 0001: the sweep posts the email touch (via _post_due_card) and
-    the LinkedIn touch (via its compliance-gated _post_due_linkedin_card).
-    DIAL_TASK is event-driven on Touch 1 approval and is NEVER swept."""
+def test_sweep_surfaces_email_linkedin_and_dial(monkeypatch):
+    """The sweep posts email (via _post_due_card), LinkedIn (via
+    _post_due_linkedin_card), and deferred DIAL_TASK cards (via _post_due_card
+    on the 'dial' channel). Immediately-posted dial cards are skipped by the
+    dedup guard (slack_message_ts already set); only deferred ones reach here."""
     orders = [
         _order("DISPATCH_EMAIL_TOUCH", "email1"),
         _order("DIAL_TASK", "dial1"),
@@ -53,13 +55,13 @@ def test_sweep_surfaces_email_and_linkedin_but_not_dial(monkeypatch):
     monkeypatch.setattr(sequence_sweep, "_post_due_linkedin_card", _fake_linkedin_post)
 
     posted = sequence_sweep.run_sweep()
-    # Email + LinkedIn posted; dial excluded entirely.
-    assert posted == 2
+    # Email + LinkedIn + deferred DIAL_TASK all posted.
+    assert posted == 3
     assert dict(routed) == {
         "DISPATCH_EMAIL_TOUCH": "setter",
+        "DIAL_TASK": "dial",
         "LINKEDIN_TASK": "linkedin",
     }
-    assert "DIAL_TASK" not in dict(routed)
 
 
 def test_manual_touch_registered_and_closes_without_send():

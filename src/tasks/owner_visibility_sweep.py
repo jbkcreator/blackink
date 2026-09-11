@@ -217,23 +217,25 @@ def _update_county_ranks(month_key: str) -> None:
                         "UPDATE owner_visibility_scores SET "
                         "  county_rank       = :county_rank, "
                         "  county_percentile = :county_percentile, "
-                        "  peer_comparisons  = :peer_comparisons ::jsonb "
+                        "  peer_comparisons  = :peer_comparisons ::jsonb, "
+                        "  is_published      = :is_published "
                         "WHERE score_id = :score_id"
                     ),
                     {
                         "county_rank":       row["county_rank"],
                         "county_percentile": row["county_percentile"],
                         "peer_comparisons":  json.dumps(row["peer_comparisons"]),
+                        "is_published":      row.get("is_published", False),
                         "score_id":          row["score_id"],
                     },
                 )
 
-            # Log owner_visibility_score_calculated event per firm that has an
-            # owning client. Unallocated prospects (owning_client_id IS NULL) are
-            # skipped — there is no client to log under. Event payload carries
-            # score_total, county_slug, data_coverage_pct, county_rank, and the
-            # top-3 peer comparisons so the daily digest and alert jobs can read
-            # them without re-joining owner_visibility_scores.
+            # Log owner_score_generated event per firm that has an owning client.
+            # Unallocated prospects (owning_client_id IS NULL) are skipped — there
+            # is no client to log under. Event payload carries score_total,
+            # county_slug, data_coverage_pct, county_rank, and the top-3 peer
+            # comparisons so the daily digest and alert jobs can read them without
+            # re-joining owner_visibility_scores.
             for row in ranked:
                 client_id = row.get("owning_client_id")
                 if not client_id:
@@ -253,7 +255,7 @@ def _update_county_ranks(month_key: str) -> None:
                         "INSERT INTO events "
                         "  (client_id, event_type, entity_type, entity_id, payload, actor) "
                         "VALUES "
-                        "  (:client_id, 'owner_visibility_score_calculated', "
+                        "  (:client_id, 'owner_score_generated', "
                         "   'company', :company_id, :payload ::jsonb, 'owner_visibility_sweep')"
                     ),
                     {

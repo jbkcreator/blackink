@@ -22,6 +22,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.core.database import get_system_db_context
+from src.services.autonomy_band import resolve_band
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,15 @@ def enroll_contact(
         logger.info("enroll_contact: contact_id=%s already in active sequence", contact_id)
         return None
 
+    # Stamp compliance_eligibility before creating the run so
+    # _check_deterministic_columns has a real value to read at dispatch time.
+    # evaluate_full_readiness also writes dnc_clean/dnc_checked_at if a live
+    # provider is wired and the contact hasn't been through the monthly batch.
+    # Imported here (not at module level) to avoid a circular import — this
+    # module is imported by campaign_readiness_gate indirectly via compliance_gate.
+    from src.services.campaign_readiness_gate import evaluate_full_readiness
+    evaluate_full_readiness(session, contact_id, client_id)
+
     now = enrolled_at or datetime.now(timezone.utc)
 
     # may_enroll runs on a separate (system) connection, so between that read
@@ -160,7 +170,7 @@ def enroll_contact(
             entity_id=str(contact_id),
             agent_id="cold_outbound_sequencer",
             action_class=action_class,
-            autonomy_band="BAND_2_ONE_TAP",
+            autonomy_band=resolve_band(client_id, action_class, touch_step=touch_step if is_email else 0),
             risk_class="LOW",
             recipient=contact_email,
             payload=payload,
