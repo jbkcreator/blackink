@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from unittest.mock import MagicMock
+
 from src.agents.respond.classifier import ClassificationResult, _call_model
 from src.agents.respond.context_cards import (
     CONTEXT_CARD_INTENTS,
@@ -23,6 +25,7 @@ from src.agents.respond.context_cards import (
     _weakest_signals,
     _suggest_opener,
     _format_thread,
+    _fetch_engagement,
 )
 from src.agents.respond.intents import Intent
 from src.agents.respond.worker import _compute_sla
@@ -250,3 +253,26 @@ def test_format_thread_truncates_long_body():
     msgs = [{"body_text": long_body, "subject": None, "received_at": datetime(2026, 9, 7, tzinfo=timezone.utc)}]
     text = _format_thread(msgs)
     assert "…" in text
+
+
+# ── Engagement (Group D / D-4) ────────────────────────────────────────────────
+# email_opened/email_clicked have no producer anywhere in this codebase
+# (S-8 is not built) — opens/clicks must render "n/a", never a misleading
+# literal 0 that a setter reads as "confirmed zero engagement".
+
+def test_engagement_opens_clicks_are_not_a_when_no_contact():
+    result = _fetch_engagement(MagicMock(), None)
+    assert result["opens"] == "n/a"
+    assert result["clicks"] == "n/a"
+    assert result["touches"] == 0
+
+
+def test_engagement_opens_clicks_are_not_a_with_a_real_contact():
+    """Even with a real contact_id and touches sent, opens/clicks must still
+    read n/a — there is no event producer to query, regardless of contact."""
+    db = MagicMock()
+    db.execute.return_value.scalar.return_value = 5
+    result = _fetch_engagement(db, contact_id=42)
+    assert result["touches"] == 5
+    assert result["opens"] == "n/a"
+    assert result["clicks"] == "n/a"

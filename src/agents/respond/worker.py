@@ -58,6 +58,20 @@ DB_SCAN_SWEEP_EVERY_N_LOOPS = 60   # ~1 min at 1s block_ms
 DB_SCAN_MIN_AGE_SECONDS = 120       # only rows stuck for 2+ minutes
 IDLE_SLEEP_SECONDS = 5
 
+# PR #48 review finding: a sustained ANTHROPIC_API_KEY/SDK/Anthropic-API
+# outage makes every queued reply hit the classifier fallback path
+# (_classify_with_llm's own outer except catches ALL of those cases, not
+# just a missing key at startup). Without a cooldown, this worker's
+# single-consumer loop posted one synchronous Slack alert (asyncio.run +
+# a blocking webhook POST) per message — serializing its own throughput
+# behind Slack round-trips exactly when the queue most needs to drain
+# fast, and flooding #blackink-qa with near-duplicate pings. Process-local
+# state is sufficient: there is exactly one respond-worker thread per
+# deployed process (see src/api/main.py's _start_background_workers).
+_FALLBACK_ALERT_COOLDOWN_SECONDS = 300  # 5 minutes
+_last_fallback_alert_at: Optional[datetime] = None
+_fallback_suppressed_since_last_alert = 0
+
 _INTENT_TO_STATUS: Dict[Intent, str] = {
     Intent.UNSUBSCRIBE: "SUPPRESSED",
     Intent.LEGAL_GRIEF: "ESCALATED",
@@ -160,6 +174,33 @@ def _halt_sequence(db: Any, sender_email: str, client_id: str) -> None:
     )
 
 
+def _should_alert_fallback() -> tuple[bool, int]:
+    """Coalesces repeated classifier-fallback alerts behind a cooldown.
+
+    Returns (should_post_now, suppressed_count). suppressed_count is the
+    number of fallback classifications that were silently suppressed since
+    the last alert actually posted — surfaced in the alert text so an
+    outage still reads as "N suppressed", not as a single unlabeled ping.
+
+    requires_human_review on the DB row is set unconditionally regardless
+    of this cooldown (see _route below) — only the Slack side-channel is
+    throttled, so a human working the Respond queue directly still sees
+    every affected row even while alerts are suppressed."""
+    global _last_fallback_alert_at, _fallback_suppressed_since_last_alert
+    now = datetime.now(timezone.utc)
+    if (
+        _last_fallback_alert_at is not None
+        and (now - _last_fallback_alert_at).total_seconds() < _FALLBACK_ALERT_COOLDOWN_SECONDS
+    ):
+        _fallback_suppressed_since_last_alert += 1
+        return False, 0
+
+    suppressed = _fallback_suppressed_since_last_alert
+    _last_fallback_alert_at = now
+    _fallback_suppressed_since_last_alert = 0
+    return True, suppressed
+
+
 def _load_body(db: Any, db_id: int) -> str:
     """Fetch body_text for KB matching — separate query so the classifier result is already written."""
     row = db.execute(
@@ -186,17 +227,26 @@ def _route(
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
     sla_due_at   = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
 
+    # Group D / D-10: a classifier error (LLM/SDK/API-key failure) returns
+    # NURTURE with meta={"path": "fallback"} — the ONLY signal distinguishing
+    # it from a genuine NURTURE classification. Without this it lands ROUTED
+    # with no card (NURTURE is not in CONTEXT_CARD_INTENTS), no alert, and no
+    # halt — the row becomes permanently invisible: the SLA sweep requires
+    # card_ts to escalate at all (respond_sla_sweep.py), which a NURTURE row
+    # never gets. Flagging it for human review is what makes the row visible.
+    is_fallback = result.meta.get("path") == "fallback"
+
     # QUESTION: run KB matcher; requires_human_review is gated on LLM classification
     # confidence (>= 0.90 means the intent is trusted enough for auto-response).
     # The KB card type (high/low/no-match) is determined separately by kb_match.
     kb_match = None
-    requires_human_review = False
+    requires_human_review = is_fallback
     if result.intent == Intent.QUESTION:
         try:
             kb_match = match_kb(db, _load_body(db, db_id))
         except Exception:
             logger.exception("respond.worker: kb match failed for db_id=%s", db_id)
-        requires_human_review = result.confidence < 0.90
+        requires_human_review = result.confidence < 0.90 or is_fallback
 
     # Pre-commit side-effects that must be atomic with the status write.
     if result.intent == Intent.UNSUBSCRIBE:
@@ -271,7 +321,33 @@ def _route(
             f"Message ID: `{db_id}` — route to Referral Agent.",
         ))
 
-    elif result.intent == Intent.QUESTION:
+    if is_fallback:
+        # This is the only place a fallback result becomes visible to a
+        # human — the SLA sweep cannot reach it (no card, escalation_level
+        # stays 0). Deliberately does NOT halt the sequence: the true intent
+        # is unknown, and halting on every transient LLM error would stall
+        # live campaigns for no reason; a human reviewer halts it if warranted.
+        #
+        # PR #48 review finding: the alert itself is cooldown-throttled (see
+        # _should_alert_fallback) — requires_human_review above is NOT, so a
+        # sustained outage still flags every affected row for the queue, it
+        # just stops flooding #blackink-qa with one post per message.
+        should_alert, suppressed = _should_alert_fallback()
+        if should_alert:
+            suffix = (
+                f" ({suppressed} more suppressed in the last "
+                f"{_FALLBACK_ALERT_COOLDOWN_SECONDS // 60} min)"
+                if suppressed else ""
+            )
+            asyncio.run(_post_slack_alert(
+                "qa",
+                f":warning: *Classifier error — manual review required*{suffix}\n"
+                f"Client: `{client_id}` | Sender: `{sender_email}`\n"
+                f"Message ID: `{db_id}` — classification failed (LLM/SDK/API-key "
+                f"error); flagged for human review rather than auto-routed.",
+            ))
+
+    if result.intent == Intent.QUESTION:
         card_meta = asyncio.run(post_kb_card(
             db_id=db_id,
             client_id=client_id,
@@ -500,8 +576,36 @@ class Worker:
         logger.info("respond.worker: stopped (consumer=%s)", self.consumer_name)
 
 
+def _assert_llm_configured() -> None:
+    """Refuse to start rather than silently classifying every reply as
+    NURTURE/ROUTED with zero human visibility (Group D / D-10). Before this
+    check, a missing anthropic SDK or an unset ANTHROPIC_API_KEY made
+    classify() return the error fallback for every single message —
+    indistinguishable from the LLM genuinely deciding NURTURE — and the
+    entire Respond product would no-op while every status column read
+    healthy. A misconfiguration must be a loud startup failure instead."""
+    from src.agents.respond.classifier import anthropic as _anthropic
+    from config.settings import get_settings
+
+    if _anthropic is None:
+        raise RuntimeError(
+            "respond.worker: refusing to start — the 'anthropic' package is "
+            "not installed. Every inbound reply would silently classify as "
+            "NURTURE/ROUTED with no alert. Install the SDK before starting "
+            "this worker."
+        )
+    if not get_settings().anthropic_api_key:
+        raise RuntimeError(
+            "respond.worker: refusing to start — ANTHROPIC_API_KEY is not "
+            "set. Every inbound reply would silently classify as "
+            "NURTURE/ROUTED with no alert. Set the key before starting this "
+            "worker."
+        )
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    _assert_llm_configured()
     worker = Worker()
     worker.install_signal_handlers()
     worker.run_forever()

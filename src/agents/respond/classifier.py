@@ -66,10 +66,15 @@ class ClassificationResult:
 
 
 def _fallback() -> ClassificationResult:
+    # Group D / D-10: meta={"path": "fallback"} + confidence==0.0 is the only
+    # signal that this NURTURE came from an error, not a real classification —
+    # worker.py must treat it as requiring human review and alert, never as
+    # an ordinary routed NURTURE. See worker.py's use of confidence == 0.0.
     return ClassificationResult(
         intent=Intent.NURTURE,
         confidence=0.0,
         reasoning="Classifier error — conservative fallback pending manual review.",
+        meta={"path": "fallback"},
     )
 
 

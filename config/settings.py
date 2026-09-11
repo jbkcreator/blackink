@@ -134,10 +134,13 @@ class AppSettings(BaseSettings):
 	email_bcc: Optional[str] = Field(default=None, env="EMAIL_BCC")
 
 	# ── Mailgun inbound (Task 4.2.1 Path B) ───────────────────────────────────
-	# HMAC signing key for Mailgun Routes inbound webhooks. Unset → the Path B
-	# handler rejects every delivery (fail closed), never processes an unsigned
-	# one. Set from the Mailgun account's webhook signing key.
-	mailgun_webhook_signing_key: Optional[str] = Field(default=None, env="MAILGUN_WEBHOOK_SIGNING_KEY")
+	# Group D / D-2 fix: this used to be a second field
+	# (mailgun_webhook_signing_key) holding the same Mailgun account webhook
+	# signing key as mailgun_signing_key below, read by a different router
+	# (src/api/mailgun_inbound_router.py). Two settings for one secret meant
+	# setting only one silently disabled the other endpoint — both fail
+	# closed with no startup error, just a 403/406 on every delivery. Both
+	# routers now read mailgun_signing_key.
 	# Slack channel for Speed-to-Lead closer-alert cards.
 	slack_closer_alert_channel: str = Field(default="#blackink-setter", env="SLACK_CLOSER_ALERT_CHANNEL")
 
@@ -216,15 +219,14 @@ class AppSettings(BaseSettings):
 	def blackink_global_approvers(self) -> Tuple[str, ...]:
 		return tuple(v.strip() for v in self.blackink_global_approvers_raw.split(",") if v.strip())
 
-	# ── Relay halt / resume ──────────────────────────────────────────────────
-	# HMAC-SHA256 signing key for cryptographic resume tokens. Must be set
-	# before any halt can be issued or resumed. Recommended: 32+ bytes of entropy.
-	relay_resume_secret: Optional[SecretStr] = Field(default=None, env="RELAY_RESUME_SECRET")
-
-	# ── Inbound email (3.1.3 reply bridge) ──────────────────────────────────
+	# ── Inbound email (Task 4.2.1 Path B + 3.1.3 reply bridge) ──────────────
 	# Mailgun webhook signing key — used to verify HMAC-SHA256 signatures on
-	# inbound-email webhook POSTs (src/api/inbound_email_router.py). Without
-	# this the /webhooks/inbound-email endpoint rejects all requests.
+	# BOTH inbound Mailgun webhook routes: the reply bridge
+	# (src/api/inbound_email_router.py, /webhooks/inbound-email) and the
+	# Speed-to-Lead Path B intake (src/api/mailgun_inbound_router.py,
+	# /webhooks/mailgun-inbound). Mailgun issues one webhook signing key per
+	# account, so this is genuinely one secret, not two — see Group D / D-2.
+	# Without this, both endpoints reject all requests (fail closed).
 	mailgun_signing_key: Optional[SecretStr] = Field(default=None, env="MAILGUN_SIGNING_KEY")
 
 	# ── Internal admin API ───────────────────────────────────────────────────
@@ -283,44 +285,6 @@ class AppSettings(BaseSettings):
 	# When absent the stub provider is used — max achievable score is 42/100
 	# (38 website + 4 DBPR). Set to enable live Google Places API calls.
 	google_places_api_key: Optional[SecretStr] = Field(default=None, env="GOOGLE_PLACES_API_KEY")
-
-	# ── Calendar OAuth (Subtask 3.2.1 — Inbound Booking Engine) ─────────────
-	# No Calendly per client comment W1-8 (Blackink_Source_of_Truth.md line
-	# 577) — Google Calendar + Microsoft Graph only. Unlike the DNC/SMS/
-	# RentCast vendors, no third party here is genuinely absent — these are
-	# OAuth apps this project registers itself; unset means "not registered
-	# yet", a required completion gate, not a permanently-deferred provider.
-	google_oauth_client_id: Optional[str] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_ID")
-	google_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="GOOGLE_OAUTH_CLIENT_SECRET")
-	microsoft_oauth_client_id: Optional[str] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_ID")
-	microsoft_oauth_client_secret: Optional[SecretStr] = Field(default=None, env="MICROSOFT_OAUTH_CLIENT_SECRET")
-	# Fernet key (urlsafe base64, 32 bytes) — encrypts OAuth tokens and SMTP
-	# passwords at rest. See src/core/token_crypto.py.
-	token_encryption_key: Optional[SecretStr] = Field(default=None, env="TOKEN_ENCRYPTION_KEY")
-	# Signs connect-link and OAuth `state` tokens (src/services/calendar_oauth.py).
-	# Deliberately its own secret, not a reuse of akrash_ingest_jwt_secret —
-	# these two token families protect unrelated systems and must be able to
-	# rotate independently.
-	calendar_oauth_state_secret: Optional[SecretStr] = Field(default=None, env="CALENDAR_OAUTH_STATE_SECRET")
-	calendar_webhook_base_url: str = Field(
-		default="http://localhost:8000", env="CALENDAR_WEBHOOK_BASE_URL",
-		description="Public base URL the providers POST notifications to — must be internet-reachable in prod.",
-	)
-	# Local-testing-only escape hatch: Google/Microsoft's watch()/subscription
-	# registration calls reject a non-public, non-domain-verified callback
-	# URL (localhost) at registration time — this lets the OAuth callback
-	# complete anyway (real token exchange + real baseline sync still run),
-	# just without a live push subscription. Never set True outside local
-	# dev — a connection created this way never receives real-time webhook
-	# notifications, only whatever calendar_sync_worker's periodic safety
-	# sweep picks up.
-	skip_calendar_watch_registration: bool = Field(default=False, env="SKIP_CALENDAR_WATCH_REGISTRATION")
-
-	# ── Booking confirmation email (Subtask 3.2.1) ──────────────────────────
-	# Default False: per explicit instruction, a missing/disabled real
-	# email provider must be a visible launch blocker (booking_confirmation_
-	# blocked event), never a silent no-op or a stub quietly satisfying a test.
-	email_sending_enabled: bool = Field(default=False, env="EMAIL_SENDING_ENABLED")
 
 	# ── OVS PDF fetch (Subtask 3.2.2) ────────────────────────────────────────
 	# Comma-separated exact hostnames the pre-demo reminder is allowed to

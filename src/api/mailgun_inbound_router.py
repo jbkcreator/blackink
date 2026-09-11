@@ -39,12 +39,17 @@ _SUBDOMAIN_RE = re.compile(r"leads@([a-z0-9\-]+)\.getblackink\.com", re.IGNORECA
 
 
 def _verify_mailgun_signature(timestamp: str, token: str, signature: str) -> bool:
-    signing_key = get_settings().mailgun_webhook_signing_key
+    # Group D / D-2: this used to read its own mailgun_webhook_signing_key
+    # setting, a second field holding the same Mailgun account webhook
+    # signing key as src/api/inbound_email_router.py's mailgun_signing_key —
+    # setting only one silently disabled the other endpoint. Both routers
+    # now read the same setting.
+    signing_key = get_settings().mailgun_signing_key
     if not signing_key:
-        logger.error("[mailgun] MAILGUN_WEBHOOK_SIGNING_KEY not configured — rejecting all")
+        logger.error("[mailgun] MAILGUN_SIGNING_KEY not configured — rejecting all")
         return False
     expected = hmac.new(
-        signing_key.encode(),
+        signing_key.get_secret_value().encode(),
         f"{timestamp}{token}".encode(),
         hashlib.sha256,
     ).hexdigest()

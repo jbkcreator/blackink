@@ -43,7 +43,9 @@ if LIVE_INTEGRATIONS:
 else:
     os.environ["EMAIL_SENDER_MODE"] = "stub"
     os.environ["SLACK_BOT_TOKEN"] = "xoxb-e2e-disabled"
-os.environ.setdefault("MAILGUN_WEBHOOK_SIGNING_KEY", "e2e-pay-per-lead-signing-key")
+# Group D / D-2: merged into MAILGUN_SIGNING_KEY, shared by both Mailgun
+# inbound routers.
+os.environ.setdefault("MAILGUN_SIGNING_KEY", "e2e-pay-per-lead-signing-key")
 
 sys.path.insert(0, ".")
 try:
@@ -62,7 +64,7 @@ CLIENT_ID = f"E2E_PPL_{RUN_ID.upper()}"
 SLUG = f"e2eppl{RUN_ID}"
 DOMAIN = f"{SLUG}-outreach.example"
 MAILBOX = f"sales@{DOMAIN}"
-SIGNING_KEY = os.environ["MAILGUN_WEBHOOK_SIGNING_KEY"]
+SIGNING_KEY = os.environ["MAILGUN_SIGNING_KEY"]
 
 APM_BODY = """Owner Name: Ava APM
 Email: ava.apm@example.test

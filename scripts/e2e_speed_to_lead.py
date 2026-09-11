@@ -18,7 +18,7 @@ PREREQUISITES
 RUN
     PYTHONPATH=. python scripts/e2e_speed_to_lead.py
 
-The script forces EMAIL_SENDER_MODE=stub and a fixed MAILGUN_WEBHOOK_SIGNING_KEY
+The script forces EMAIL_SENDER_MODE=stub and a fixed MAILGUN_SIGNING_KEY
 via os.environ BEFORE settings load, so no real mail is sent and Path B signing
 is deterministic regardless of your .env. It seeds its own throwaway client
 (E2E_STL_CLIENT), cleans up prior runs, and cleans up on exit.
@@ -30,7 +30,10 @@ from __future__ import annotations
 import os
 
 os.environ.setdefault("EMAIL_SENDER_MODE", "stub")
-os.environ.setdefault("MAILGUN_WEBHOOK_SIGNING_KEY", "e2e-test-signing-key")
+# Group D / D-2: mailgun_webhook_signing_key was merged into
+# mailgun_signing_key — both Mailgun inbound routers (this one and the
+# 3.1.3 reply bridge) now read the single MAILGUN_SIGNING_KEY.
+os.environ.setdefault("MAILGUN_SIGNING_KEY", "e2e-test-signing-key")
 
 # Slack policy: only allow the closer-alert card to REALLY post when running
 # against the dedicated TEST workspace (ENV_FILE=.env.test). Then the card
@@ -65,7 +68,7 @@ SECRET_HASH = hashlib.sha256(SECRET.encode()).hexdigest()
 SLUG = "e2eacme"
 DOMAIN = "e2eacme-outreach.com"
 MAILBOX = "sales1@e2eacme-outreach.com"
-SIGNING_KEY = os.environ["MAILGUN_WEBHOOK_SIGNING_KEY"]
+SIGNING_KEY = os.environ["MAILGUN_SIGNING_KEY"]
 
 # A SECOND client that has claimed a PM-book domain — used to prove the
 # cross-tenant non-poach gate: a lead to CLIENT_ID from POACHED_DOMAIN (owned by
@@ -155,7 +158,7 @@ def messages():
     return _owner_query(
         "SELECT id, status, channel, source_channel, sender_email, "
         " sender_name, sender_phone, send_at, lead_sla_due_at, idempotency_key, "
-        " destination_address, ack_latency_seconds, mailbox_id, responded_at "
+        " destination_address, ack_latency_seconds, acked_at, mailbox_id, responded_at "
         "FROM inbound_messages WHERE client_id = :c ORDER BY received_at",
         c=CLIENT_ID,
     )
@@ -180,7 +183,7 @@ def main() -> int:
     settings = get_settings()
     print(f"DB: {settings.database_url_app or settings.database_url}")
     print(f"EMAIL_SENDER_MODE={os.environ['EMAIL_SENDER_MODE']}  "
-          f"MAILGUN key set={'yes' if settings.mailgun_webhook_signing_key else 'no'}\n")
+          f"MAILGUN key set={'yes' if settings.mailgun_signing_key else 'no'}\n")
 
     print("[setup] cleanup + seed")
     cleanup()
@@ -326,11 +329,17 @@ def main() -> int:
     responded = [m for m in messages() if m.status == "RESPONDED"]
     R.check("rows flipped to RESPONDED", len(responded) == len(received_before),
             f"{len(responded)} RESPONDED")
-    R.check("ack_latency_seconds recorded", all(m.ack_latency_seconds is not None for m in responded))
     # #4: sends that actually emailed must record the mailbox for capacity counting.
     emailed = [m for m in responded if m.sender_email]
     R.check("responded sends record mailbox_id + responded_at (capacity accounting)",
             all(m.mailbox_id is not None and m.responded_at is not None for m in emailed),
+            f"emailed={len(emailed)}")
+    # ack_latency_seconds is a GENERATED STORED column derived from acked_at
+    # (never written to directly — see apply_ack_latency_reconcile.py). Only
+    # rows that actually got a real auto-response set acked_at; a
+    # no-prospect-email RESPONDED row deliberately leaves it NULL.
+    R.check("emailed sends have acked_at + derived ack_latency_seconds",
+            all(m.acked_at is not None and m.ack_latency_seconds is not None for m in emailed),
             f"emailed={len(emailed)}")
     R.check("speed_to_lead_response_sent event logged", "speed_to_lead_response_sent" in event_types())
 

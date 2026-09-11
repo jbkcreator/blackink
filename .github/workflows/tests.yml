@@ -49,6 +49,18 @@ jobs:
       # encryption/HMAC rather than mocking it.
       TOKEN_ENCRYPTION_KEY: sWHdVufCbVgVcqllGh3tCpyvFNKIBKO9kVkfoippIwk=
       NO_SHOW_TOKEN_SECRET: test-only-no-show-token-secret-not-a-real-secret
+      # Not a real key — src/agents/respond/worker.py's _assert_llm_configured()
+      # (Group D / D-10) only checks that a value is present before starting
+      # the respond worker thread inside src/api/main.py's
+      # _start_background_workers(). tests/test_api_internal_endpoints.py and
+      # tests/test_api_startup.py both boot the real app via
+      # `with TestClient(app) as ...`, which runs that startup path (a bare
+      # TestClient(app) without the `with` block, as most other route tests
+      # use, does not run the lifespan at all). No test in this suite makes a
+      # real Anthropic API call with this value — every classifier test mocks
+      # the client or the settings object directly (see
+      # tests/test_respond_classifier.py).
+      ANTHROPIC_API_KEY: sk-test-not-a-real-anthropic-key
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -115,6 +127,8 @@ jobs:
           PYTHONPATH=. python migrations/apply_ghost_form_submissions.py
           PYTHONPATH=. python migrations/apply_ovs_data_coverage.py
           PYTHONPATH=. python migrations/apply_inbound_messages_lead_fields.py
+          PYTHONPATH=. python migrations/apply_ack_latency_reconcile.py
+          PYTHONPATH=. python migrations/apply_mailbox_cap_index_fix.py
           PYTHONPATH=. python migrations/apply_stl_cadence.py
           PYTHONPATH=. python migrations/apply_winback_imports.py
           PYTHONPATH=. python migrations/apply_winback_touch_sequence.py
