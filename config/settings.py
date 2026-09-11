@@ -78,7 +78,7 @@ class AppSettings(BaseSettings):
 	# was added and then deliberately removed once that was confirmed).
 	tracerfy_api_key: Optional[SecretStr] = Field(default=None, env="TRACERFY_API_KEY")
 	# Max age before a cached dnc_clean value is treated as ABSTAIN (stale), not trusted.
-	dnc_recheck_days: int = Field(default=30, env="DNC_RECHECK_DAYS")
+	dnc_recheck_days: int = Field(default=30, ge=1, le=31, env="DNC_RECHECK_DAYS")
 	email_verification_vendor_api_key: Optional[SecretStr] = Field(
 		default=None, env="EMAIL_VERIFICATION_VENDOR_API_KEY"
 	)

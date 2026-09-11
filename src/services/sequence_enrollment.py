@@ -100,6 +100,15 @@ def enroll_contact(
         logger.info("enroll_contact: contact_id=%s already in active sequence", contact_id)
         return None
 
+    # Stamp compliance_eligibility before creating the run so
+    # _check_deterministic_columns has a real value to read at dispatch time.
+    # evaluate_full_readiness also writes dnc_clean/dnc_checked_at if a live
+    # provider is wired and the contact hasn't been through the monthly batch.
+    # Imported here (not at module level) to avoid a circular import — this
+    # module is imported by campaign_readiness_gate indirectly via compliance_gate.
+    from src.services.campaign_readiness_gate import evaluate_full_readiness
+    evaluate_full_readiness(session, contact_id, client_id)
+
     now = enrolled_at or datetime.now(timezone.utc)
 
     # may_enroll runs on a separate (system) connection, so between that read
