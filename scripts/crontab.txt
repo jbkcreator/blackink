@@ -31,14 +31,6 @@
 # spam-complaint-rate trip over the rolling 48h window.
 0 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.deliverability_sentinel >> /root/blackink/logs/deliverability_sentinel.log 2>&1
 
-# ── Assessor roll refresh sweep ──────────────────────────────────────────
-# Monthly (1st of the month, 4 AM). Checks each configured county's roll
-# file for a real content change (sha256) and only reimports on change —
-# an unchanged file is recorded as a successful no-op. Alerts #blackink-qa
-# if a configured file is missing, fails to parse, or a county's last
-# successful import exceeds the staleness threshold (S-24).
-0 4 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.assessor_roll_refresh_sweep >> /root/blackink/logs/assessor_roll_refresh_sweep.log 2>&1
-
 # ── County-allocation reassessment ───────────────────────────────────────
 # Daily. Re-evaluates the 30-day prospect-pool outreach-rights window per
 # county; refreshes companies.owning_client_id.
@@ -83,5 +75,14 @@
 # 1st of the month at 7 AM, 2 hours after the OVS sweep (5 AM). Compares
 # current vs prior month scores; posts movers >10 pts to #blackink-economics.
 0 7 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.ovs_delta_alert >> /root/blackink/logs/ovs_delta_alert.log 2>&1
+
+# ── County assessor roll sync ────────────────────────────────────────────
+# Daily 8:00 AM. Checks each county's official bulk-download page; downloads
+# and imports ONLY when the published timestamp changed. Scheduled after both
+# counties' publish windows (Hillsborough ~7:10 AM, Pinellas ~2:00-3:30 AM) —
+# an earlier 6:00 AM slot ran before Hillsborough's file was even published,
+# adding a full day of avoidable staleness. Feeds Win-Back ownership matching
+# (assessor_parcels). Requires ASSESSOR_SYNC_ENABLED=True in .env.
+0 8 * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.assessor_sync >> /root/blackink/logs/assessor_sync.log 2>&1
 
 # ── Add future scheduled jobs below this line ───────────────────────────

@@ -9,8 +9,8 @@ separate piece of work.
 Runs under the system role (BYPASSRLS), same justification as
 sequence_enrollment.may_enroll and promotion_sweep.py: the non-poach check
 (step 5 below) must see every client's client_pm_books rows, not just the
-importing client's own, and the assessor lookup reads Akrash's staging
-table, which carries no client_id at all. Must NEVER be imported from
+importing client's own, and the assessor lookup reads assessor_parcels,
+which carries no client_id at all. Must NEVER be imported from
 src/api/ — batch-only per CLAUDE.md's stated blackink_system posture. The
 router (src/api/winback_router.py) only creates the winback_imports row
 under the tenant-scoped app role, then hands off to run_import() here.
@@ -26,7 +26,6 @@ from __future__ import annotations
 import csv
 import io
 import logging
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +37,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.core.database import get_system_db_context
+from src.services.address_normalize import normalize_address
 from src.services.email_suppression import _normalize_phone
 from src.services.events import log_event
 
@@ -58,23 +58,6 @@ _REQUIRED_CSV_COLUMNS = ("owner_name", "property_address", "county")
 # Week2_Tasks_Dev_Split_v1.md:236, not to the client. Requiring phone meant a
 # client export with no phone column produced 500 rows of UNKNOWN and zero
 # outreach — see Subtask 3.2.1's plan doc §3 Step 0.
-
-_PUNCTUATION_RE = re.compile(r"[^\w\s]")
-_WHITESPACE_RE = re.compile(r"\s+")
-
-
-def normalize_address(raw: str) -> str:
-	"""Standardize a property address for exact-match lookup against
-	raw_assessor_parcels: uppercase, strip punctuation, collapse whitespace.
-	Deliberately simple (no USPS-style unit/suffix expansion) — a future
-	geocoding pass can replace this if address variance turns out to matter
-	in practice; not built speculatively here."""
-	if not raw:
-		return ""
-	value = str(raw).upper().strip()
-	value = _PUNCTUATION_RE.sub(" ", value)
-	value = _WHITESPACE_RE.sub(" ", value).strip()
-	return value
 
 
 def _email_domain(email: Optional[str]) -> Optional[str]:
@@ -112,7 +95,8 @@ def compute_disposition(still_owns: Optional[bool], still_renting: Optional[bool
 	evidence of a sale) — distinct from still_owns=None (parcel not found /
 	county not staged / lookup errored), which the spec's own literal
 	wording would route to the same SOLD bucket but this pipeline
-	deliberately does not: an Akrash coverage gap must never silently
+	deliberately does not: an assessor-roll coverage gap (a county not yet
+	synced, or a parcel the sync hasn't reached) must never silently
 	suppress a real lead forever. See the plan doc's disposition matrix.
 	"""
 	if still_owns is False:
@@ -132,7 +116,9 @@ def compute_disposition(still_owns: Optional[bool], still_renting: Optional[bool
 
 
 # ============================================================================
-# Assessor lookup — real, Akrash-staged (Subtask 3.1.1, confirmed decision)
+# Assessor lookup — real, sourced from the daily county assessor sync
+# (Subtask 3.1.1's original design assumed Akrash; corrected 2026-09-11 —
+# see assessor_sync.py and the plan doc referenced above)
 # ============================================================================
 
 class AssessorProvider(ABC):
@@ -144,10 +130,18 @@ class AssessorProvider(ABC):
 
 
 class StagingTableAssessorProvider(AssessorProvider):
-	"""Queries raw_assessor_parcels — the Akrash-staged county tax assessor
-	roll feed (migrations/apply_raw_assessor_parcels.py). Real implementation,
-	not a stub: Akrash's own ingestion pipeline is the confirmed data source
-	for this lookup (see the plan doc's §Assessor cross-reference)."""
+	"""Queries assessor_parcels — the daily-synced county tax assessor roll
+	(src/tasks/assessor_sync.py, migrations/apply_assessor_sync.py). Real
+	implementation, not a stub. Was previously assumed to be an
+	Akrash-staged feed; that was never in the client's build spec (see
+	docs/plans/2026-09-11-automated-county-assessor-data-sync.md's Context
+	section) — assessor_sync.py is the actual, confirmed data source.
+
+	Only matches an eligible, non-retired parcel: a retired parcel (fallen
+	off the current roll) must never answer an ownership question with a
+	stale owner name, and an ineligible parcel (government/commercial/
+	vacant/etc — see mapping.py's per-county allowlist) was never a
+	Win-Back target to begin with."""
 
 	def __init__(self, session: Session):
 		self._session = session
@@ -156,8 +150,9 @@ class StagingTableAssessorProvider(AssessorProvider):
 		normalized = normalize_address(address)
 		row = self._session.execute(
 			text(
-				"SELECT owner_name_on_roll FROM raw_assessor_parcels "
+				"SELECT owner_name_on_roll FROM assessor_parcels "
 				"WHERE county_slug = :county_slug AND parcel_address_normalized = :address "
+				"AND retired_at IS NULL AND is_blackink_eligible "
 				"ORDER BY ingested_at DESC LIMIT 1"
 			),
 			{"county_slug": county_slug, "address": normalized},
