@@ -326,3 +326,25 @@ def test_client_below_ceiling_proceeds_to_pick():
     # index 2 is the client 24h count (0 lock, 1 ceiling, 2 count) — by client_id.
     count_sql = str(session.execute.call_args_list[2][0][0]).lower()
     assert "sequence_touch_dispatches" in count_sql and "client_id" in count_sql
+    # Code-review fix (PR #50): manual Slack-triggered sends (reply-send /
+    # Book Meeting) must also count toward the per-client ceiling — this
+    # query was previously blind to inbound_messages entirely.
+    assert "inbound_messages" in count_sql
+
+
+def test_client_24h_count_includes_responded_inbound_messages():
+    """Direct proof of the PR #50 fix: _client_sends_last_24h's SQL counts
+    RESPONDED inbound_messages rows with a mailbox_id set, not just
+    sequence_touch_dispatches/stl_cadence_dispatches — a rep manually
+    replying or sending a booking link is a real send against the client's
+    daily volume and must be counted the same way."""
+    from src.services.mailbox_dispatcher import _client_sends_last_24h
+
+    session = MagicMock()
+    session.execute.return_value.scalar.return_value = 3
+    result = _client_sends_last_24h(session, "client_a")
+    assert result == 3
+    sql = str(session.execute.call_args[0][0]).lower()
+    assert "inbound_messages" in sql
+    assert "responded" in sql
+    assert "mailbox_id is not null" in sql

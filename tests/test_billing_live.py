@@ -28,6 +28,7 @@ from src.services.clients import provision_client
 from src.services.settlement.gateway import InvoiceHandle, StripeGateway
 from src.tasks.billing_sweep import run_sit_invoice_sweep
 from tests.fixtures.synthetic_tenants import CANARY_A, CANARY_B, canary_tenants  # noqa: F401
+from tests.fixtures.vera_health import healthy_vera_run  # noqa: F401
 
 
 def _insert_appointment(session, *, client_id, company_id, contact_id, opportunity_id,
@@ -652,7 +653,7 @@ class _FakeSitGateway(StripeGateway):
 
 
 @pytest.fixture
-def attended_billable_appointment(billing_tenant, canary_tenants):
+def attended_billable_appointment(billing_tenant, canary_tenants, healthy_vera_run):
 	client_id = billing_tenant["client_id"]
 	company_id = billing_tenant["company_id"]
 	contact_id = billing_tenant["contact_id"]

@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from src.services.compliance_gate import evaluate_touch_gate
 from src.services.email_sender import EmailSender, build_email_sender
+from src.services.email_tracking import assert_tracking_configured, html_body_with_pixel, pixel_url
 from src.services.email_unsubscribe import append_unsubscribe_footer, unsubscribe_url
 from src.services.mailbox_dispatcher import (
     AllMailboxesCapped,
@@ -113,6 +114,15 @@ def dispatch_touch(
         logger.error("sequence_orchestrator: no mailbox for client_id=%s — %s", client_id, exc)
         return TouchResult(contact_id=contact.contact_id, touch_step=touch_step, outcome="NO_MAILBOX")
 
+    # Code-review fix (Important, PR #50): validate the tracking secret is
+    # configured BEFORE claim_touch() commits a SENDING row — pixel_url()
+    # below needs dispatch_id (only available after the claim), but the
+    # secret itself doesn't, so checking it now means a missing secret
+    # fails here, before any durable state exists, instead of stranding an
+    # already-committed SENDING dispatch with no except around the failure
+    # and a UNIQUE claim that blocks any retry.
+    assert_tracking_configured()
+
     # Look up the prior touch's Message-ID so email clients thread the reply.
     # Done BEFORE the claim commit so it shares the RLS-scoped read transaction.
     in_reply_to: str | None = None
@@ -141,6 +151,19 @@ def dispatch_touch(
     unsub_url = unsubscribe_url(client_id, contact.email)
     body_with_footer = append_unsubscribe_footer(body, unsub_url)
 
+    # S-8 — tracking pixel (W1 §3.1.4 "tracking pixel active"). Deliberately
+    # NOT click-wrapping the unsubscribe link in the HTML render — RFC 8058/
+    # Gmail-Yahoo bulk-sender rules govern that link's own behavior, and an
+    # extra redirect hop there adds risk for no benefit (see
+    # email_tracking.py's wrap_link docstring). No other link exists in
+    # today's touch copy to wrap (sequence_content.py is plain text, no
+    # links besides the footer) — that's dev items S-4/S-5's job, not this
+    # one; the click-wrap mechanism itself (email_tracking.wrap_link) is
+    # built and tested but has no real caller yet, stated here rather than
+    # silently left unwired.
+    pixel_img_url = pixel_url(client_id, contact.contact_id, dispatch_id)
+    html_body = html_body_with_pixel(body_with_footer, pixel_img_url)
+
     # send → UPDATE SENT/FAILED, each in the fresh (post-claim-commit) txn.
     try:
         result = sender.send(
@@ -148,6 +171,7 @@ def dispatch_touch(
             to_address=contact.email,
             subject=subject,
             body=body_with_footer,
+            html_body=html_body,
             sending_domain=mailbox.sending_domain,
             in_reply_to=in_reply_to,
             list_unsubscribe_url=unsub_url,

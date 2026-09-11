@@ -10,10 +10,26 @@ inbound contact or confirmed booking"). CI/CD build fails if this gate is
 bypassed — see tests/test_cold_sms_gate.py.
 
 Both signals are derived from the events ledger (source of record) so no
-denormalized columns are needed on contacts. Queries use BYPASSRLS role
-(system session) since this is a compliance predicate, not a tenant-scoped
-data access — the gate must see events across all channels regardless of
-which client initiated them.
+denormalized columns are needed on contacts.
+
+Code-review correction (2026-09-10): this docstring previously called for a
+BYPASSRLS/system session, on the reasoning that the gate must see events
+across all channels regardless of which client initiated them. That was
+never actually exercised — before the D-7 fix below, this module had zero
+production callers. The two real callers wired in by that fix
+(campaign_readiness_gate.evaluate_full_readiness(), sms_dispatch.dispatch_sms())
+both pass their own regular RLS-scoped, per-tenant session — matching every
+other check in both of those gates (DNC, opt-out, quiet hours), not a
+cross-tenant BYPASSRLS one. Accepted as correct: per docs/
+SOURCE_OF_TRUTH_RECONCILIATION.md §1.3, outbound SMS is cancelled for all of
+2026 ("No SMS this year" — W1-4) and this module "remain[s] correct as a
+block but has nothing to gate this year" — StubSmsProvider unconditionally
+raises NotImplementedError regardless of engagement, so the narrow edge
+case a BYPASSRLS session would additionally catch (a contact's inbound-SMS
+event logged under a company's PRIOR owning client_id, before a
+county_allocation_reassessment.py reassignment) has no live consequence
+this year. Revisit this decision if/when a real SMS vendor is contracted
+and this gate starts actually gating real sends.
 """
 
 import logging

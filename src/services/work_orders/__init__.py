@@ -330,9 +330,14 @@ def update_payload(client_id: str, action_id: str, *, payload: dict, config_fing
 
 
 def queued_depth(client_id: Optional[str] = None, *, older_than: Optional[timedelta] = None) -> int:
-	"""What Dev 2 §C's Cora throttle reads (50-count and 24h-age
-	triggers). client_id=None aggregates across all tenants via
-	get_system_db_context() — batch/throttle use only, never src/api/."""
+	"""QUEUED depth in agent_work_orders — the sequence-touch / win-back /
+	STL-cadence / meeting-outcome approval-card backlog. NOT what Cora's
+	throttle reads (a prior version of this docstring claimed it was — see
+	docs/plans/2026-09-10-s2-cora-24h-age-throttle.md §2: Cora's drafts
+	never create a row in this table, they live in a separate Redis-based
+	queue tracked by src.agents.cora.throttle). client_id=None aggregates
+	across all tenants via get_system_db_context() — batch use only, never
+	src/api/."""
 	where = ["status = 'QUEUED'"]
 	params: dict = {}
 	if client_id is not None:

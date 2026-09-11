@@ -47,12 +47,14 @@ MIGRATIONS=(
   apply_clients
   apply_clients_stl_fields
   apply_relay_halts
+  apply_vera_health_runs
   apply_companies
   apply_contacts
   apply_pm_profiles
   apply_owner_entities
   apply_raw_prospect_pipeline
   apply_events
+  apply_events_dispatch_dedup_index
   apply_sandbox_dashboard_view
   apply_compliance_gate_audit
   apply_campaign_readiness_gate
@@ -99,6 +101,8 @@ MIGRATIONS=(
   apply_winback_imports
   apply_winback_touch_sequence
   apply_winback_enrichment
+  apply_winback_loss_est
+  apply_band2_counters
   apply_knowledge_base
   apply_rls_policies
   apply_akrash_grant

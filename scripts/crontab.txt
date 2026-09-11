@@ -63,6 +63,14 @@
 # 1st of the month. Scores every active company for the current month.
 0 5 1 * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.owner_visibility_sweep >> /root/blackink/logs/owner_visibility_sweep.log 2>&1
 
+# ── Vera health checks (S-1) ─────────────────────────────────────────────
+# NOT a cron entry — src.tasks.vera_health_sweep.run_sweep runs as an
+# in-process background thread from src/api/main.py::_start_background_workers
+# (5-minute tick), the same run surface as settlement_sweep and billing_sweep,
+# the two consumers it gates. Do not add a duplicate cron entry here; a
+# second, independently-scheduled copy would defeat the point of having one
+# process own both the health producer and its consumers' reliability class.
+
 # ── OVS month-over-month delta alert ─────────────────────────────────────
 # 1st of the month at 7 AM, 2 hours after the OVS sweep (5 AM). Compares
 # current vs prior month scores; posts movers >10 pts to #blackink-economics.

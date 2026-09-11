@@ -47,6 +47,14 @@ from src.agents.relay import halt_service
 from src.agents.relay.resume_auth import generate_resume_token
 from src.core.database import get_db_context, get_system_db_context
 from src.services import work_orders as wo
+from src.services.booking_link import resolve_booking_link
+from src.services.email_sender import build_email_sender
+from src.services.email_unsubscribe import append_unsubscribe_footer, unsubscribe_url
+from src.services.mailbox_dispatcher import (
+	AllMailboxesCapped,
+	NoMailboxAvailable,
+	get_active_mailbox_for_client,
+)
 from src.services.ovs_lookup import fetch_latest_ovs, ovs_card_lines
 from src.services.no_show_prompts import verify_no_show_token
 from src.services.no_show_recovery import already_recorded, trigger_recovery
@@ -596,16 +604,25 @@ def sales_reply_content_blocks(
 
 	blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"inbound `{inbound_id[:8]}`"}]})
 
-	# Actions: Reply in Thread (always), Mark Opt-Out (only when a contact_id is
-	# known — never expires, no payload hash, ticket 15/27). Book Meeting is
-	# out of scope until the Task 3.2 booking engine lands.
+	# Actions: Reply in Thread (always), Book Meeting (always — S-11, the
+	# booking engine now exists; resolve_booking_link() itself returns None
+	# and the handler fails visibly if no default sales-booking connection
+	# is flagged, rather than the button silently doing nothing), Mark
+	# Opt-Out (only when a contact_id is known — never expires, no payload
+	# hash, ticket 15/27).
 	elements: list = [
 		{
 			"type": "button",
 			"text": {"type": "plain_text", "text": "Reply in Thread"},
 			"action_id": "reply_in_thread",
 			"value": json.dumps({"inbound_id": inbound_id, "contact_id": contact_id, "client_id": client_id}),
-		}
+		},
+		{
+			"type": "button",
+			"text": {"type": "plain_text", "text": "Book Meeting"},
+			"action_id": "book_meeting",
+			"value": json.dumps({"inbound_id": inbound_id, "contact_id": contact_id, "client_id": client_id}),
+		},
 	]
 	if contact_id is not None:
 		elements.append({
@@ -865,7 +882,12 @@ async def _finalize_terminal_decision(order: "wo.WorkOrder", *, decision: str, u
 	# "reviewed" — only a genuine approve or reject counts as a resolved draft.
 	if decision in {"APPROVED", "REJECTED"}:
 		from src.agents.cora.throttle import notify_approval_resolved
-		notify_approval_resolved()
+		# Code-review fix (PR #50, finding 7): pass this order's own
+		# action_id — this handler fires for every work-order type, not
+		# just Cora drafts, so a bare no-arg call would corrupt the
+		# age-tracking ZSET for an unrelated, still-unreviewed Cora draft.
+		# ZREM on an id never added by Cora's worker is a safe no-op.
+		notify_approval_resolved(order.action_id)
 	_log_event(order.client_id, "work_order_decided", entity_id=order.action_id, actor=f"slack:{user_id}", payload={"decision": decision})
 	if decided.slack_channel_id and decided.slack_message_ts:
 		await post.update_card(
@@ -969,16 +991,83 @@ async def handle_linkedin_note_modal_closed(ack):
 
 
 # ── Reply in Thread — #sales-replies card button (v2 §3.1.3) ────────────
-# Interim manual bridge: the rep composes a reply in a modal, and we post it
-# as a threaded message under the card so the team has the response on record.
-# Actual outbound-email send is out of scope this sprint (no reply-send path).
+# S-11: this now actually emails the prospect (previously an interim manual
+# bridge that only posted the rep's text into the Slack thread — see
+# docs/plans/2026-09-10-s8-s11-tracking-and-reply-send.md). Idempotent on
+# inbound_messages.status='RESPONDED' (also what mailbox_dispatcher.py's
+# rolling-24h capacity subquery already recognizes, so a manual reply
+# correctly counts against the sending mailbox's daily cap).
 
 _REPLY_THREAD_MODAL_ID = "sales_reply_thread_modal"
 
 
+def _load_inbound_message(session, inbound_id):
+	return session.execute(
+		text(
+			"SELECT id, client_id, contact_id, sender_email, original_message_id, "
+			"       subject, status "
+			"FROM inbound_messages WHERE id = :id"
+		),
+		{"id": inbound_id},
+	).first()
+
+
+def _claim_inbound_message_for_send(session, inbound_id, client_id) -> bool:
+	"""Code-review fix (PR #50, finding 5): atomically claims the row for a
+	send by flipping status to 'SENDING' (the same in-progress sentinel
+	value this shared column already uses for the Speed-to-Lead flow) —
+	`WHERE status NOT IN ('RESPONDED', 'SENDING')` means a second click, or
+	a Slack action replay, that races this one gets zero rows back and
+	must treat that as already-in-progress/already-sent, never a second
+	SMTP call. Commits immediately so the claim is visible to a genuinely
+	concurrent second request in its own session — a claim that only lives
+	in this transaction's uncommitted state protects against nothing (see
+	sequence_orchestrator.dispatch_touch()'s identical durability-boundary
+	reasoning). Re-asserts the RLS tenant binding after the commit, same
+	reason as that module's _reassert_tenant(): SET LOCAL is transaction-
+	scoped, so it's gone the instant this commits. Returns True if this
+	call won the claim."""
+	claimed = session.execute(
+		text(
+			"UPDATE inbound_messages SET status = 'SENDING' "
+			"WHERE id = :id AND status NOT IN ('RESPONDED', 'SENDING') "
+			"RETURNING id"
+		),
+		{"id": inbound_id},
+	).first()
+	session.commit()
+	if client_id:
+		session.execute(text("SET LOCAL app.current_client_id = :cid"), {"cid": client_id})
+	return claimed is not None
+
+
+def _release_inbound_message_claim(session, inbound_id, original_status: str, client_id) -> None:
+	"""Releases a claim made by _claim_inbound_message_for_send() after a
+	send failure, restoring the row's pre-claim status so a retry (a fresh
+	button click) is possible — leaving it stuck on 'SENDING' forever would
+	make a transient SMTP failure permanently block this message."""
+	session.execute(
+		text("UPDATE inbound_messages SET status = :status WHERE id = :id"),
+		{"id": inbound_id, "status": original_status},
+	)
+	session.commit()
+	if client_id:
+		session.execute(text("SET LOCAL app.current_client_id = :cid"), {"cid": client_id})
+
+
+def _is_opted_out(session, contact_id) -> bool:
+	if contact_id is None:
+		return False
+	row = session.execute(
+		text("SELECT is_opted_out FROM contacts WHERE contact_id = :cid"),
+		{"cid": contact_id},
+	).first()
+	return bool(row and row.is_opted_out)
+
+
 @app.action("reply_in_thread")
-async def handle_reply_in_thread(ack, body, respond, client):
-	"""Open a modal for the rep to compose a threaded reply to the card."""
+async def handle_reply_in_thread(ack, body, respond, client, action):
+	"""Open a modal for the rep to compose a real emailed reply."""
 	await ack()
 	trigger_id = body.get("trigger_id")
 	channel_id = (body.get("channel") or {}).get("id") or (body.get("container") or {}).get("channel_id")
@@ -986,14 +1075,23 @@ async def handle_reply_in_thread(ack, body, respond, client):
 	if not trigger_id or not channel_id or not message_ts:
 		await respond(response_type="ephemeral", text=":warning: Could not open the reply composer.")
 		return
+	try:
+		card_value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		card_value = {}
 	await client.views_open(
 		trigger_id=trigger_id,
 		view={
 			"type": "modal",
 			"callback_id": _REPLY_THREAD_MODAL_ID,
-			"private_metadata": json.dumps({"channel": channel_id, "ts": message_ts}),
+			# card_value (inbound_id/contact_id/client_id) previously discarded
+			# here — the modal only carried {channel, ts} and had no idea who
+			# to actually email. Fixed by merging it in, mirroring the
+			# LinkedIn-note modal's own already-correct pattern of passing
+			# its button value through.
+			"private_metadata": json.dumps({"channel": channel_id, "ts": message_ts, **card_value}),
 			"title": {"type": "plain_text", "text": "Reply in thread"},
-			"submit": {"type": "plain_text", "text": "Post reply"},
+			"submit": {"type": "plain_text", "text": "Send reply"},
 			"close": {"type": "plain_text", "text": "Cancel"},
 			"blocks": [
 				{
@@ -1009,26 +1107,225 @@ async def handle_reply_in_thread(ack, body, respond, client):
 
 @app.view(_REPLY_THREAD_MODAL_ID)
 async def handle_reply_thread_modal_submit(ack, body, view, client):
-	"""Post the composed reply as a threaded message under the card."""
-	await ack()
+	"""Actually email the prospect, then post the sent copy into the thread."""
 	user_id = body.get("user", {}).get("id", "")
 	try:
 		meta = json.loads(view.get("private_metadata", "{}"))
 	except (json.JSONDecodeError, TypeError):
+		await ack(response_action="errors", errors={"reply_block": "Internal error — could not read card context. Close this and try again."})
 		return
 	channel = meta.get("channel")
 	ts = meta.get("ts")
+	inbound_id = meta.get("inbound_id")
+	client_id = meta.get("client_id")
+	contact_id = meta.get("contact_id")
 	text_val = (
 		view.get("state", {}).get("values", {})
 		.get("reply_block", {}).get("reply_text", {}).get("value", "")
 	)
 	if not channel or not ts or not text_val:
+		await ack(response_action="errors", errors={"reply_block": "Missing reply text or card context."})
 		return
+	if not inbound_id or not client_id:
+		# Pre-S-11 cards (posted before this fix landed) never carried these
+		# in their button value — fail visibly rather than silently sending
+		# nothing, matching this repo's own "never silently no-op" posture.
+		await ack(response_action="errors", errors={"reply_block": "This card is too old to reply from — ask for a fresh one."})
+		return
+	# Code-review fix (Critical): this handler sends a REAL outbound email
+	# from the company's mailbox — the same class of consequential action
+	# as opt_out_contact/book_meeting/every work-order decision, all of
+	# which check approver_authorized(). This one didn't; a click-through
+	# from any channel member could previously trigger a real, externally-
+	# visible send with zero authorization check.
+	if not approver_authorized(user_id, client_id=client_id):
+		await ack(response_action="errors", errors={"reply_block": "Not authorized to reply from this card."})
+		return
+
+	with get_db_context(client_id=client_id) as session:
+		row = _load_inbound_message(session, inbound_id)
+		if row is None:
+			await ack(response_action="errors", errors={"reply_block": "Original message not found."})
+			return
+		if row.status == "RESPONDED":
+			await ack(response_action="errors", errors={"reply_block": "Already replied to this message."})
+			return
+		if _is_opted_out(session, contact_id):
+			await ack(response_action="errors", errors={"reply_block": "This contact has opted out — reply blocked."})
+			return
+
+		try:
+			mailbox = get_active_mailbox_for_client(session, client_id)
+		except AllMailboxesCapped:
+			await ack(response_action="errors", errors={"reply_block": "All sending mailboxes are at capacity today — try again later."})
+			return
+		except NoMailboxAvailable:
+			await ack(response_action="errors", errors={"reply_block": "No sending mailbox configured for this client."})
+			return
+
+		# Code-review fix (PR #50, finding 5): atomic claim before any SMTP
+		# call — closes the race a plain `if row.status == "RESPONDED"`
+		# check above can't (two near-simultaneous submits both reading
+		# PENDING before either writes).
+		if not _claim_inbound_message_for_send(session, inbound_id, client_id):
+			await ack(response_action="errors", errors={"reply_block": "Already replied to this message."})
+			return
+
+		unsub_url = unsubscribe_url(client_id, row.sender_email)
+		body_with_footer = append_unsubscribe_footer(text_val, unsub_url)
+		subject = row.subject or "Re: your message"
+		if not subject.lower().startswith("re:"):
+			subject = f"Re: {subject}"
+
+		try:
+			build_email_sender().send(
+				from_address=mailbox.mailbox_address,
+				to_address=row.sender_email,
+				subject=subject,
+				body=body_with_footer,
+				sending_domain=mailbox.sending_domain,
+				in_reply_to=row.original_message_id,
+				list_unsubscribe_url=unsub_url,
+			)
+		except Exception as exc:  # noqa: BLE001 — surface as a modal error, never a silent send failure
+			logger.error("[listeners] reply send failed inbound_id=%s: %s", inbound_id, exc, exc_info=True)
+			_release_inbound_message_claim(session, inbound_id, row.status, client_id)
+			await ack(response_action="errors", errors={"reply_block": "Send failed — try again or contact support."})
+			return
+
+		session.execute(
+			text(
+				"UPDATE inbound_messages SET status = 'RESPONDED', responded_at = NOW(), "
+				"mailbox_id = :mailbox_id WHERE id = :id"
+			),
+			{"id": inbound_id, "mailbox_id": mailbox.mailbox_id},
+		)
+		_shared_log_event(
+			client_id,
+			"sales_reply_sent",
+			entity_type="inbound_message",
+			entity_id=str(inbound_id),
+			payload={"inbound_id": str(inbound_id), "contact_id": contact_id},
+			actor=f"slack:{user_id}",
+			session=session,
+		)
+		session.commit()
+
+	await ack()
 	await client.chat_postMessage(
 		channel=channel,
 		thread_ts=ts,
-		text=f":envelope_with_arrow: Reply drafted by <@{user_id}>:\n>{text_val}",
+		text=f":envelope_with_arrow: Reply sent by <@{user_id}>:\n>{text_val}",
 	)
+
+
+# ── Book Meeting — #sales-replies card button (S-11) ─────────────────────
+
+@app.action("book_meeting")
+async def handle_book_meeting(ack, body, respond, action):
+	"""Emails the prospect a real booking link (Blackink's own internal
+	sales-demo calendar — resolve_booking_link()'s INTERNAL_SALES_DEMO
+	scope), reusing the same mailbox/send path as Reply in Thread. Fails
+	visibly (never a silent no-op) if no default sales-booking connection
+	is flagged — see booking_link.py's own docstring for that pre-existing,
+	separate gap."""
+	await ack()
+	user_id = body.get("user", {}).get("id", "")
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed card payload.")
+		return
+
+	inbound_id = value.get("inbound_id")
+	client_id = value.get("client_id")
+	contact_id = value.get("contact_id")
+	if not approver_authorized(user_id, client_id=client_id):
+		await respond(response_type="ephemeral", text=":no_entry: Not authorized to act on this card.")
+		return
+	if not inbound_id or not client_id:
+		await respond(response_type="ephemeral", text=":warning: This card is too old — ask for a fresh one.")
+		return
+
+	with get_db_context(client_id=client_id) as session:
+		row = _load_inbound_message(session, inbound_id)
+		if row is None:
+			await respond(response_type="ephemeral", text=":warning: Original message not found.")
+			return
+		if _is_opted_out(session, contact_id):
+			await respond(response_type="ephemeral", text=":warning: This contact has opted out.")
+			return
+
+		link = resolve_booking_link(session, email=row.sender_email)
+		if link is None:
+			await respond(
+				response_type="ephemeral",
+				text=":warning: No default sales-booking calendar is configured — an operator must flag one before this button can send a real link.",
+			)
+			return
+
+		try:
+			mailbox = get_active_mailbox_for_client(session, client_id)
+		except AllMailboxesCapped:
+			await respond(response_type="ephemeral", text=":warning: All sending mailboxes are at capacity today.")
+			return
+		except NoMailboxAvailable:
+			await respond(response_type="ephemeral", text=":warning: No sending mailbox configured for this client.")
+			return
+
+		# Code-review fix (PR #50, finding 5): this handler previously had
+		# NO idempotency check at all — re-clicking or replaying the action
+		# sent another booking email every time. Same atomic claim as
+		# Reply in Thread above.
+		if not _claim_inbound_message_for_send(session, inbound_id, client_id):
+			await respond(response_type="ephemeral", text=":warning: A booking link was already sent for this message.")
+			return
+
+		unsub_url = unsubscribe_url(client_id, row.sender_email)
+		body_text = (
+			f"Here's a link to grab a time that works for you: {link.url}\n\n"
+			"Talk soon,\nThe Blackink team"
+		)
+		body_with_footer = append_unsubscribe_footer(body_text, unsub_url)
+		subject = row.subject or "Let's find a time"
+		if not subject.lower().startswith("re:"):
+			subject = f"Re: {subject}"
+
+		try:
+			build_email_sender().send(
+				from_address=mailbox.mailbox_address,
+				to_address=row.sender_email,
+				subject=subject,
+				body=body_with_footer,
+				sending_domain=mailbox.sending_domain,
+				in_reply_to=row.original_message_id,
+				list_unsubscribe_url=unsub_url,
+			)
+		except Exception as exc:  # noqa: BLE001
+			logger.error("[listeners] book_meeting send failed inbound_id=%s: %s", inbound_id, exc, exc_info=True)
+			_release_inbound_message_claim(session, inbound_id, row.status, client_id)
+			await respond(response_type="ephemeral", text=":warning: Send failed — try again or contact support.")
+			return
+
+		session.execute(
+			text(
+				"UPDATE inbound_messages SET status = 'RESPONDED', responded_at = NOW(), "
+				"mailbox_id = :mailbox_id WHERE id = :id"
+			),
+			{"id": inbound_id, "mailbox_id": mailbox.mailbox_id},
+		)
+		_shared_log_event(
+			client_id,
+			"sales_meeting_link_sent",
+			entity_type="inbound_message",
+			entity_id=str(inbound_id),
+			payload={"inbound_id": str(inbound_id), "contact_id": contact_id},
+			actor=f"slack:{user_id}",
+			session=session,
+		)
+		session.commit()
+
+	await respond(response_type="ephemeral", text=f":calendar: Booking link sent to {row.sender_email}.")
 
 
 # ── Opt-out — Mark Opt-Out button on #sales-replies cards (ticket 27) ────
@@ -2199,7 +2496,11 @@ async def _handle_ink_campaign_decision(
 
     # Decrement Cora's approval backlog counter
     from src.agents.cora.throttle import notify_approval_resolved
-    notify_approval_resolved()
+    # Code-review fix (PR #50, finding 7): same reasoning as
+    # _finalize_terminal_decision above — pass this specific draft's own
+    # work_order_id so an unrelated resolution never corrupts a different,
+    # still-unreviewed Cora draft's age entry.
+    notify_approval_resolved(work_order_id)
 
 
 @app.action("approve_ink_campaign")
@@ -2210,3 +2511,89 @@ async def handle_approve_ink_campaign(ack, body, action):
 @app.action("reject_ink_campaign")
 async def handle_reject_ink_campaign(ack, body, action):
     await _handle_ink_campaign_decision(ack, body, action, approved=False)
+
+
+# ── @Blackink mention/intent router (audit item 3.0.3 — no @mention router
+# existed at all; macro pipeline queries were only ever served by the
+# scheduled daily_digest.py cron, never conversationally) ──────────────────
+
+_MENTION_HELP_TEXT = (
+    "I understand:\n"
+    "- `@Blackink pipeline` / `@Blackink digest` / `@Blackink status` — "
+    "post the last-24h pipeline digest (same numbers as the scheduled "
+    "#blackink-command post, on demand)\n"
+    "- `@Blackink halt status` — list active halts (same as `/blackink-halt status`)\n"
+    "Anything else, and I'll show this message."
+)
+
+_DIGEST_KEYWORDS = ("pipeline", "digest", "status", "numbers", "metrics")
+
+
+def _mention_text_without_bot_id(event: dict) -> str:
+    """Slack renders the bot mention itself as a literal `<@U0123...>` token
+    at the start of event['text'] — strip it so keyword matching below
+    doesn't need to know the bot's own user id."""
+    raw = event.get("text") or ""
+    parts = raw.split(maxsplit=1)
+    if parts and parts[0].startswith("<@") and parts[0].endswith(">"):
+        return parts[1].strip().lower() if len(parts) > 1 else ""
+    return raw.strip().lower()
+
+
+async def handle_app_mention(event: dict, say) -> None:
+    """Thin wrapper's plain-function half — same split convention as every
+    other listener in this file (unit-testable with a plain dict + AsyncMock
+    `say`, no real Bolt event needed).
+
+    Reuses src.tasks.daily_digest.build_digest_text() for the pipeline
+    query rather than re-deriving the metrics — one computation, whether it
+    reaches Slack via the 8am cron or an on-demand mention (repo's own
+    "reuse existing architecture" rule); this is a deliberately small,
+    read-only first router, not the full macro-query surface implied by the
+    blueprint's "command & intent dispatcher" language — see the module's
+    task-analysis plan for what's explicitly out of scope.
+
+    Code-review fix (Important): this handler returns platform-wide pipeline
+    volume/engagement numbers and operational halt reasons/issuer identities
+    — the same class of sensitive, cross-tenant information every other
+    consequential action in this file gates on approver_authorized(). No
+    client_id scoping applies here (this is a genuinely platform-wide query,
+    same posture as /blackink-halt status's own bare approver_authorized(user_id)
+    call), so any unauthorized workspace member who could previously mention
+    the bot and read this now gets a plain rejection instead."""
+    user_id = event.get("user", "")
+    if not approver_authorized(user_id):
+        await say(text=":no_entry: Not authorized to query pipeline data.", thread_ts=event.get("thread_ts") or event.get("ts"))
+        return
+
+    text_content = _mention_text_without_bot_id(event)
+    thread_ts = event.get("thread_ts") or event.get("ts")
+
+    # "halt" is checked first: "halt status" would otherwise also match the
+    # digest branch's "status" keyword below, since the two intents share
+    # that one ambiguous word.
+    if "halt" in text_content:
+        halts = halt_service.get_active_halts()
+        if not halts:
+            await say(text="No active halts.", thread_ts=thread_ts)
+            return
+        lines = [
+            f"#{h.halt_id} {h.scope}" + (f":{h.scope_id}" if h.scope_id else "") + f" — {h.reason} (by {h.issued_by})"
+            for h in halts
+        ]
+        await say(text="Active halts:\n" + "\n".join(lines), thread_ts=thread_ts)
+        return
+
+    if any(keyword in text_content for keyword in _DIGEST_KEYWORDS):
+        from src.tasks.daily_digest import build_digest_text
+
+        digest_text = build_digest_text()
+        await say(text=digest_text, thread_ts=thread_ts)
+        return
+
+    await say(text=_MENTION_HELP_TEXT, thread_ts=thread_ts)
+
+
+@app.event("app_mention")
+async def on_app_mention(event, say):
+    await handle_app_mention(event, say)

@@ -352,6 +352,23 @@ def test_sales_reply_reply_in_thread_button_always_present():
     assert "reply_in_thread" in _reply_action_ids(unattributed)
 
 
+def test_sales_reply_book_meeting_button_always_present():
+    """S-11: Book Meeting appears on every card, attributed or not — same
+    reasoning as Reply in Thread above."""
+    attributed = sales_reply_content_blocks(
+        from_address="p@example.com", contact_name="Jane", firm_name="Acme",
+        run_id="r1", touch_step=1, attribution_status="attributed",
+        subject=None, raw_body="hi", contact_id=99, client_id="cli-1", inbound_id="i1",
+    )
+    unattributed = sales_reply_content_blocks(
+        from_address="p@example.com", contact_name=None, firm_name=None,
+        run_id=None, touch_step=None, attribution_status="unattributed",
+        subject=None, raw_body="hi", contact_id=None, client_id="cli-1", inbound_id="i1",
+    )
+    assert "book_meeting" in _reply_action_ids(attributed)
+    assert "book_meeting" in _reply_action_ids(unattributed)
+
+
 def test_sales_reply_no_opt_out_button_when_unattributed():
     """No opt_out button on unattributed cards (no contact to target) — but the
     Reply in Thread action block still exists."""

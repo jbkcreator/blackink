@@ -61,6 +61,18 @@ def test_email_sender_callers_are_the_known_reviewed_set():
         "winback_sequencer.py",      # win-back outbound — gated, see above
         "stl_cadence.py",            # STL follow-ups — see module docstring above
         "speed_to_lead_sweep.py",    # STL initial auto-response — inbound-reply, not cold outbound
+        # S-11 — Slack "Reply in Thread" / "Book Meeting" button handlers
+        # (src/services/slack/listeners.py). Both load an existing
+        # inbound_messages row the contact themselves sent in
+        # (_load_inbound_message) — an opted-in inbound reply, same category
+        # as speed_to_lead_sweep.py above, not a cold-outbound campaign
+        # contact compliance_gate.py's DNC/non-poach/quiet-hours waterfall is
+        # meant to screen. Gated instead by what an inbound reply actually
+        # needs: _is_opted_out() before sending, approver_authorized() so an
+        # arbitrary channel member can't trigger a real send, and an atomic
+        # claim (_claim_inbound_message_for_send) so a double-click/replay
+        # can't double-send.
+        "listeners.py",
     }
     offenders = []
     for path in SRC_SERVICES.rglob("*.py"):

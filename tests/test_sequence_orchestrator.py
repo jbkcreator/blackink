@@ -23,6 +23,15 @@ def _stub_unsubscribe():
     with (
         patch("src.services.sequence_orchestrator.unsubscribe_url", return_value="https://app.example.com/unsub?token=t"),
         patch("src.services.sequence_orchestrator.append_unsubscribe_footer", side_effect=lambda body, url: body),
+        # S-8's tracking pixel — same reasoning as the unsubscribe stub
+        # above: pixel_url() needs EMAIL_TRACKING_SECRET configured, which
+        # this suite deliberately never sets.
+        patch("src.services.sequence_orchestrator.pixel_url", return_value="https://app.example.com/pixel?token=p"),
+        # Code-review fix (PR #50): dispatch_touch() now validates the
+        # tracking secret before claim_touch() — stub it the same way as
+        # pixel_url() above for every test except the ones specifically
+        # testing this new check, which override it explicitly.
+        patch("src.services.sequence_orchestrator.assert_tracking_configured"),
     ):
         yield
 
@@ -77,6 +86,28 @@ def test_compliance_block_returns_compliance_block_outcome():
 # ---------------------------------------------------------------------------
 # Cycle 2: no mailbox
 # ---------------------------------------------------------------------------
+
+def test_missing_tracking_secret_raises_before_any_claim_is_made():
+    """Code-review fix (Important, PR #50): a missing EMAIL_TRACKING_SECRET
+    must fail BEFORE claim_touch() commits a SENDING row — previously
+    pixel_url() only raised AFTER that commit, with no except around it,
+    permanently stranding the dispatch (its UNIQUE claim blocks any retry).
+    Proven here by asserting claim_touch is never even called."""
+    session = MagicMock()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch(
+            "src.services.sequence_orchestrator.assert_tracking_configured",
+            side_effect=RuntimeError("Tracking tokens need EMAIL_TRACKING_SECRET configured"),
+        ),
+        patch("src.services.sequence_orchestrator.claim_touch") as mock_claim,
+    ):
+        with pytest.raises(RuntimeError, match="EMAIL_TRACKING_SECRET"):
+            dispatch_touch(session, _contact(), "client_a", touch_step=1, sender=_Sender(), subject="S", body="B")
+    mock_claim.assert_not_called()
+    session.commit.assert_not_called()
+
 
 def test_no_mailbox_returns_no_mailbox_outcome():
     from src.services.mailbox_dispatcher import NoMailboxAvailable
@@ -311,6 +342,28 @@ def test_supplied_content_is_sent_verbatim():
         )
     assert sender.calls[0]["subject"] == "Approved subject"
     assert sender.calls[0]["body"] == "Approved body"
+
+
+def test_html_body_with_pixel_is_passed_to_sender():
+    """S-8 — dispatch_touch must pass html_body= to sender.send() so a
+    tracking pixel can be embedded; previously omitted entirely."""
+    session = MagicMock()
+    sender = _Sender()
+    with (
+        patch("src.services.sequence_orchestrator.evaluate_touch_gate", return_value=_gate_result(True)),
+        patch("src.services.sequence_orchestrator.get_active_mailbox_for_client", return_value=_mailbox()),
+        patch("src.services.sequence_orchestrator.claim_touch", return_value="dispatch-uuid"),
+        patch("src.services.sequence_orchestrator.mark_sent", return_value=True),
+        patch("src.services.sequence_orchestrator.log_touch_dispatched"),
+    ):
+        dispatch_touch(
+            session, _contact(), "client_a", touch_step=1, run_id="run-1", sender=sender,
+            subject="Approved subject", body="Approved body",
+        )
+    html_body = sender.calls[0]["html_body"]
+    assert html_body is not None
+    assert "https://app.example.com/pixel?token=p" in html_body
+    assert "Approved body" in html_body
 
 
 # ---------------------------------------------------------------------------

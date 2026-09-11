@@ -79,9 +79,15 @@ def _resolve_client_daily_ceiling(session: Session, client_id: str) -> int:
 def _client_sends_last_24h(session: Session, client_id: str) -> int:
     """Count the client's sends across all mailboxes in the rolling 24h window.
 
-    Covers both cold-sequence touches and Speed-to-Lead cadence follow-ups
-    (Task 4.2.2) — an STL send is a real send against the client's daily volume,
-    so it must count toward the per-client ceiling too."""
+    Covers cold-sequence touches, Speed-to-Lead cadence follow-ups
+    (Task 4.2.2), and manual Slack-triggered sends (S-11 reply-send /
+    Book Meeting) — an STL send or a manual reply is a real send against
+    the client's daily volume just like a cold touch, so each must count
+    toward the per-client ceiling too. The manual-send term was missing
+    entirely until a code-review finding on PR #50 caught it: reps could
+    exceed the per-client ceiling through Reply in Thread / Book Meeting
+    with zero enforcement, independent of whether mailbox_id was even
+    being recorded on those rows (a separate bug, also fixed in that PR)."""
     return session.execute(
         text(
             "SELECT ( "
@@ -94,6 +100,12 @@ def _client_sends_last_24h(session: Session, client_id: str) -> int:
             "  WHERE client_id = :client_id "
             "    AND status IN ('SENDING', 'SENT', 'SENT_UNCONFIRMED') "
             "    AND created_at >= NOW() - INTERVAL '24 hours' "
+            ") + ( "
+            "  SELECT COUNT(*) FROM inbound_messages "
+            "  WHERE client_id = :client_id "
+            "    AND status = 'RESPONDED' "
+            "    AND mailbox_id IS NOT NULL "
+            "    AND responded_at >= NOW() - INTERVAL '24 hours' "
             ")"
         ),
         {"client_id": client_id},

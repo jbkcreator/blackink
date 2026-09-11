@@ -25,12 +25,14 @@ PYTHONPATH=. python migrations/apply_area_code_timezones.py
 PYTHONPATH=. python migrations/apply_clients.py
 PYTHONPATH=. python migrations/apply_clients_stl_fields.py  # Task 4.2.1 — inbound webhook secret, subdomain slug, STL reply template
 PYTHONPATH=. python migrations/apply_relay_halts.py   # not tenant-bearing, any time after clients
+PYTHONPATH=. python migrations/apply_vera_health_runs.py   # S-1 (W0 §3.0.2 A) — Vera health-check results; not tenant-bearing, any time, no dependency on any other table
 PYTHONPATH=. python migrations/apply_companies.py
 PYTHONPATH=. python migrations/apply_contacts.py
 PYTHONPATH=. python migrations/apply_pm_profiles.py
 PYTHONPATH=. python migrations/apply_owner_entities.py
 PYTHONPATH=. python migrations/apply_raw_prospect_pipeline.py
 PYTHONPATH=. python migrations/apply_events.py
+PYTHONPATH=. python migrations/apply_events_dispatch_dedup_index.py   # S-8/S-11 code-review fix — partial unique index backing per-dispatch dedup of email_opened/email_clicked/email_replied; not tenant-bearing, any time after apply_events.py
 PYTHONPATH=. python migrations/apply_sandbox_dashboard_view.py   # read-only view over companies+events, not tenant-bearing — safe any time after both
 PYTHONPATH=. python migrations/apply_compliance_gate_audit.py
 PYTHONPATH=. python migrations/apply_campaign_readiness_gate.py
@@ -64,6 +66,7 @@ PYTHONPATH=. python migrations/apply_settlement_reopen_count.py   # PR #37 re-re
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
+PYTHONPATH=. python migrations/apply_knowledge_base.py  # Subtask 2.1.3 — KB Auto-Response Engine; knowledge_base_entries table + 5 seeded entries, not tenant-bearing, no RLS; any time after apply_respond_routing_gaps.py
 PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
 PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
 PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py  # re-adds ghost_submitted_at + ghost_work_order_id to contacts (Ghost Shopper reactivated); before RLS
@@ -290,6 +293,38 @@ code (matches Forced Action's own ADR 0011 call). `sending_domains` /
 (adapted from Forced Action's `email_deliverability_monitor.py`)
 quarantines a domain and promotes a same-cluster reserve domain on a
 bounce/complaint-rate trip.
+
+### Vera health gate — settlement/billing halt on unverifiable data (W0 §3.0.2 A)
+The tri-state `HealthResult` type (`src/agents/vera/health_result.py`) and
+its three checks (`src/agents/vera/checks/*` — PM-book sync freshness,
+Instantly campaign feed, ingestion pipeline staging counts) never fabricate
+a value for a failed or unconfigured integration: `VALUE` (a real reading,
+zero included), `UNKNOWN` (integration never configured — deliberately
+skipped), or `ABSTAIN` (configured but the check failed or could not be
+verified). What closes the loop is `src/tasks/vera_health_sweep.py`, a
+5-minute in-process background worker (registered in
+`_start_background_workers`, same run surface as the sweeps it protects —
+not a cron entry) that runs all three checks and persists exactly one row
+to `vera_health_runs` (`migrations/apply_vera_health_runs.py` — not
+tenant-bearing, every check is platform-wide).
+
+`src/agents/vera/health_gate.py::evaluate_settlement_health()` reads the
+latest row and is called FIRST, before opening a DB session or making any
+Stripe call, by every one of the seven settlement/billing sweep functions
+(`src/tasks/settlement_sweep.py`, `src/tasks/billing_sweep.py`) — a halted
+sweep returns `0` immediately rather than touching its own working session.
+Three distinct halt reasons, not one: `ABSTAIN` (a check failed — the
+literal blueprint case), `NO_HEALTH_RUN` (no health run has ever completed
+— treating that as "fine" would be the exact silent-zero bug this task
+exists to close, one layer up), and `STALE_HEALTH_RUN` (the latest run is
+older than `settings.vera_health_max_age_minutes`, default 30 — a health
+job that silently stopped running must not look identical to healthy).
+**`UNKNOWN` does NOT halt** — a deliberate, confirmed decision: `UNKNOWN`
+means an integration (Instantly today — see B8/B12) was never configured,
+and halting on that would freeze every settlement/billing sweep from the
+moment this shipped, for as long as Instantly remains unconfigured. `vera_health_sweep.py` alerts `#blackink-qa` and writes the `vera_health_halt_issued`
+proof-ledger event only on a state *transition* (into or out of halt), not
+on every 5-minute tick.
 
 ### Inbound booking engine (Subtask 3.2.1)
 A property owner books on the **client's own** connected calendar

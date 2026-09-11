@@ -97,6 +97,33 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"first_sit_consumed": frozenset({"client_id", "appointment_id", "offer_code"}),
 	"sixty_day_guarantee_applied": frozenset({"client_id", "attended_sit_count", "billing_period"}),
 	"rate_migration_applied": frozenset({"offer_code", "new_price_cents", "clients_updated", "founding_skipped"}),
+	# S-1 — Vera health gate. Written once per transition into a halting
+	# state (not once per health tick — see src/tasks/vera_health_sweep.py's
+	# module docstring), so this is the proof-ledger record of exactly when
+	# and why settlement/billing sweeps stopped running.
+	"vera_health_halt_issued": frozenset({"reason", "abstaining_checks", "ran_at"}),
+	# S-8 — tracking pixel/click on the cold 5-touch sequence's Touch 1
+	# (W1 §3.1.4) and the daily digest's open/click/reply rate metrics
+	# (src/tasks/daily_digest.py's own "CROSS-TASK EVENT CONTRACT" comment
+	# names these three event_type strings exactly). dispatch_id is required
+	# on all three so a row can be joined back to the specific send it
+	# measures (Evidence Packet §2) and so the pixel/click producer can
+	# dedupe per dispatch (src/api/email_tracking_router.py) rather than
+	# counting every re-fetch as a separate open.
+	"email_opened": frozenset({"dispatch_id"}),
+	"email_clicked": frozenset({"dispatch_id", "target_url"}),
+	# Only ever written for a Tier-1 (message-id) attributed reply — see
+	# src/services/inbound_ingest.py's producer and the plan's note on why a
+	# Tier-2 (sender-email-only) match has no dispatch_id to attribute to.
+	"email_replied": frozenset({"dispatch_id"}),
+	# S-11 — real reply-send from the #sales-replies "Reply in Thread"/"Book
+	# Meeting" cards. Deliberately its own event_type, never
+	# outbound_touch_dispatched — a manual rep reply is not a cold-sequence
+	# touch and must not pollute daily_digest.py's cold_emails_dispatched/
+	# open/click/reply-rate denominators, which are scoped to the 5-touch
+	# sequence only (see docs/plans/2026-09-10-s8-s11-tracking-and-reply-send.md).
+	"sales_reply_sent": frozenset({"inbound_id", "contact_id"}),
+	"sales_meeting_link_sent": frozenset({"inbound_id", "contact_id"}),
 	# Subtask 3.1.1 — Lost-Owner CSV Ingest. Per-disposition-bucket counts,
 	# not just a total, so the proof-ledger-style visibility the spec asks
 	# for ("winback_import_completed event written with row counts for each
@@ -181,6 +208,43 @@ def _insert(client_id: str, event_type: str, entity_type: str, entity_id: str, p
 		return
 	with get_db_context(client_id=client_id) as new_session:
 		_execute_insert(new_session, client_id, event_type, entity_type, entity_id, payload, actor)
+
+
+# event_type values whose payload's "dispatch_id" key must be unique per
+# (client_id, event_type) — see already_logged_for_dispatch() and
+# migrations/apply_events_dispatch_dedup_index.py's partial unique index,
+# which enforces this at the database level as a backstop against the
+# check-then-insert race the application-level check alone can't close.
+# Code-review finding (S-8/S-11): email_opened/email_clicked originally had
+# only the application-level check; email_replied had no dedup guard at
+# all, letting a prospect who replies twice to the same touch double-count
+# toward daily_digest.py's reply_rate_pct.
+DISPATCH_DEDUPED_EVENT_TYPES = frozenset({"email_opened", "email_clicked", "email_replied"})
+
+
+def already_logged_for_dispatch(session: Session, client_id: str, event_type: str, dispatch_id: str) -> bool:
+	"""True if an event of this type already exists for this dispatch_id.
+
+	Application-level pre-check shared by every DISPATCH_DEDUPED_EVENT_TYPES
+	producer (src/api/email_tracking_router.py, src/services/inbound_ingest.py)
+	— cheap, correct for the overwhelmingly common non-concurrent case. The
+	database-level partial unique index is the real backstop for the narrow
+	concurrent-hit race this check alone cannot close (two requests both
+	passing this SELECT before either commits): a second INSERT that loses
+	the race hits the unique constraint, which log_event() catches (its own
+	documented "never raise into the caller" contract) and buffers for
+	retry — the retry keeps losing the same conflict until evicted from the
+	1000-item buffer. That's inert noise, not data corruption: the single
+	correct row from the winning request already exists, which is what
+	actually matters for the digest's correctness."""
+	row = session.execute(
+		text(
+			"SELECT 1 FROM events WHERE client_id = :client_id AND event_type = :event_type "
+			"AND payload->>'dispatch_id' = :dispatch_id LIMIT 1"
+		),
+		{"client_id": client_id, "event_type": event_type, "dispatch_id": dispatch_id},
+	).first()
+	return row is not None
 
 
 def log_event(

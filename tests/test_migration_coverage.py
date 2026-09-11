@@ -146,3 +146,45 @@ def test_documented_migration_order_matches_ci():
 	assert in_any_ci - documented == set(), (
 		f"run in CI but undocumented in CLAUDE.md: {sorted(in_any_ci - documented)}"
 	)
+
+
+def test_documented_migration_order_matches_production_runner():
+	"""PR #50 review finding (Important): apply_vera_health_runs.py and
+	apply_events_dispatch_dedup_index.py were both correctly added to
+	CLAUDE.md and every CI workflow, but scripts/run_migrations.sh — the
+	actual production deploy script — has its own separate, hand-maintained
+	MIGRATIONS array and was never updated. A deployment using this script
+	would never create vera_health_runs, so the health worker could never
+	insert a row and every settlement/billing gate would read
+	NO_HEALTH_RUN and halt indefinitely — a real, live-consequence miss
+	that CI green could not catch, since this script isn't part of CI.
+
+	This is the third place a migration must be registered (CLAUDE.md +
+	both CI workflows already checked above), so it gets the same
+	documented-vs-actual diff check, not a one-off manual fix."""
+	runner = REPO_ROOT / "scripts" / "run_migrations.sh"
+	if not runner.exists():
+		pytest.skip("scripts/run_migrations.sh does not exist in this checkout")
+
+	claude_md = (REPO_ROOT / "CLAUDE.md").read_text(encoding="utf-8")
+	documented = set(re.findall(r"migrations/(apply_\w+)\.py", claude_md))
+
+	runner_text = runner.read_text(encoding="utf-8")
+	# The MIGRATIONS array holds bare script names, one per line, no .py
+	# suffix and no migrations/ prefix (e.g. "  apply_vera_health_runs").
+	array_match = re.search(r"MIGRATIONS=\((.*?)\)", runner_text, re.DOTALL)
+	assert array_match is not None, (
+		"scripts/run_migrations.sh no longer defines a MIGRATIONS=(...) array — "
+		"this test's parsing assumption is stale, update it rather than deleting it."
+	)
+	in_runner = set(re.findall(r"(apply_\w+)", array_match.group(1)))
+
+	assert documented - in_runner == set(), (
+		"documented in CLAUDE.md but missing from scripts/run_migrations.sh's "
+		f"MIGRATIONS array: {sorted(documented - in_runner)} — a real production "
+		"deploy using this script would never create these tables."
+	)
+	assert in_runner - documented == set(), (
+		f"present in scripts/run_migrations.sh but undocumented in CLAUDE.md: "
+		f"{sorted(in_runner - documented)}"
+	)

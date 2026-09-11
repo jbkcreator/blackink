@@ -30,15 +30,39 @@ def _parsed(**overrides) -> InboundParsed:
     return InboundParsed(**base)
 
 
-def _fake_session(existing=False):
+def _fake_session(existing=False, inserted_id=42, dispatch_id=None):
+    """Call-aware fake: distinguishes the dedup SELECT from the INSERT ...
+    RETURNING id (both go through session.execute(), so a single static
+    return_value can't represent both — a real bug-fix regression test, not
+    incidental mock plumbing: this is exactly the distinction
+    ingest_inbound_reply's own duplicate-vs-inserted branch depends on)."""
     session = MagicMock()
-    exists_result = MagicMock()
-    exists_result.first.return_value = MagicMock() if existing else None
-    # _recent_thread calls .mappings().all() — return empty so it renders no thread
-    exists_result.mappings.return_value.all.return_value = []
-    # fetch_latest_ovs guards on to_regclass(...).scalar() — None ⇒ OVS table absent
-    exists_result.scalar.return_value = None
-    session.execute.return_value = exists_result
+
+    def _execute(stmt, params=None, *a, **kw):
+        sql = str(stmt)
+        result = MagicMock()
+        if "SELECT id FROM inbound_messages WHERE idempotency_key" in sql:
+            result.first.return_value = MagicMock() if existing else None
+        elif "INSERT INTO inbound_messages" in sql:
+            row = MagicMock()
+            row.id = inserted_id
+            result.first.return_value = row
+        elif "FROM sequence_touch_dispatches" in sql:
+            if dispatch_id is not None:
+                row = MagicMock()
+                row.dispatch_id = dispatch_id
+                result.first.return_value = row
+            else:
+                result.first.return_value = None
+        else:
+            result.first.return_value = None
+        # _recent_thread calls .mappings().all() — return empty so it renders no thread
+        result.mappings.return_value.all.return_value = []
+        # fetch_latest_ovs guards on to_regclass(...).scalar() — None ⇒ OVS table absent
+        result.scalar.return_value = None
+        return result
+
+    session.execute.side_effect = _execute
     return session
 
 
@@ -49,8 +73,9 @@ def _patches(
     existing=False,
     attribution_status="attributed",
     contact_id=1,
+    dispatch_id=None,
 ):
-    session = _fake_session(existing=existing)
+    session = _fake_session(existing=existing, dispatch_id=dispatch_id)
     cm = MagicMock()
     cm.__enter__ = lambda s: session
     cm.__exit__ = MagicMock(return_value=False)
@@ -142,3 +167,56 @@ def test_display_name_stripped_for_from_address():
     # Card is posted as a colored attachment; from_address is the bare email.
     assert mock_post.await_args.kwargs["attachments"][0]["blocks"] is not None
     assert "jane@acme.com" in mock_post.await_args.kwargs["text"]
+
+
+# ── S-8: email_replied producer ──────────────────────────────────────────
+
+def test_tier1_attributed_reply_with_resolvable_dispatch_writes_email_replied():
+    p1, p2, p3, p4, p5 = _patches(attribution_status="attributed", contact_id=7, dispatch_id="dispatch-99")
+    with p1, p2, p3, p4, p5 as mock_post, \
+         patch("src.services.inbound_ingest.log_event") as mock_log:
+        _run(_parsed())
+    email_replied_calls = [c for c in mock_log.call_args_list if c.args[1] == "email_replied"]
+    assert len(email_replied_calls) == 1
+    assert email_replied_calls[0].kwargs["payload"] == {"dispatch_id": "dispatch-99"}
+
+
+def test_tier1_attributed_reply_with_no_matching_sent_dispatch_writes_no_email_replied():
+    """run_id/touch_step present but no SENT dispatch row found (e.g. the
+    touch never actually sent) — must not fabricate a dispatch_id."""
+    p1, p2, p3, p4, p5 = _patches(attribution_status="attributed", contact_id=7, dispatch_id=None)
+    with p1, p2, p3, p4, p5, \
+         patch("src.services.inbound_ingest.log_event") as mock_log:
+        _run(_parsed())
+    email_replied_calls = [c for c in mock_log.call_args_list if c.args[1] == "email_replied"]
+    assert email_replied_calls == []
+
+
+def test_tier2_unattributed_reply_writes_no_email_replied():
+    """Sender-email-only match has no run_id/touch_step — no dispatch to
+    attribute the reply to, so it must not count toward the digest's
+    reply-rate metric, even though it still posts to #sales-replies."""
+    p1, p2, p3, p4, p5 = _patches(attribution_status="unattributed", contact_id=None)
+    with p1, p2, p3, p4, p5 as mock_post, \
+         patch("src.services.inbound_ingest.log_event") as mock_log:
+        result = _run(_parsed())
+    assert result["status"] == "ok"
+    mock_post.assert_awaited_once()  # still posts to #sales-replies
+    email_replied_calls = [c for c in mock_log.call_args_list if c.args[1] == "email_replied"]
+    assert email_replied_calls == []
+
+
+def test_email_replied_is_deduped_per_dispatch_id():
+    """Code-review fix: a SECOND reply attributed to the same dispatch_id
+    (e.g. the prospect replies twice in the same thread) must not double-
+    write email_replied — the exact inflation class email_opened/
+    email_clicked already guard against."""
+    p1, p2, p3, p4, p5 = _patches(attribution_status="attributed", contact_id=7, dispatch_id="dispatch-99")
+    with p1, p2, p3, p4, p5, \
+         patch("src.services.inbound_ingest.log_event") as mock_log, \
+         patch("src.services.inbound_ingest.already_logged_for_dispatch", return_value=True) as mock_dedup:
+        _run(_parsed())
+    mock_dedup.assert_called_once()
+    assert mock_dedup.call_args.args[1:] == ("testclient", "email_replied", "dispatch-99")
+    email_replied_calls = [c for c in mock_log.call_args_list if c.args[1] == "email_replied"]
+    assert email_replied_calls == []
