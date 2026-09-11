@@ -66,6 +66,7 @@ PYTHONPATH=. python migrations/apply_settlement_reopen_count.py   # PR #37 re-re
 PYTHONPATH=. python migrations/apply_inbound_messages.py  # Reply Triage Agent intake table; before RLS
 PYTHONPATH=. python migrations/apply_inbound_messages_sla.py  # SLA/claim/escalation columns for context cards (Subtask 2.1.2); before RLS
 PYTHONPATH=. python migrations/apply_respond_routing_gaps.py  # requires_human_review on inbound_messages; HALTED status on sequence_runs (Subtask 2.1.1)
+PYTHONPATH=. python migrations/apply_knowledge_base.py  # Subtask 2.1.3 — KB Auto-Response Engine; knowledge_base_entries table + 5 seeded entries, not tenant-bearing, no RLS; any time after apply_respond_routing_gaps.py
 PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
 PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
 PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py  # re-adds ghost_submitted_at + ghost_work_order_id to contacts (Ghost Shopper reactivated); before RLS
