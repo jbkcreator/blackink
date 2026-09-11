@@ -8,8 +8,6 @@ every 24h/30min booking_reminder_jobs row stays PENDING forever.
 """
 from unittest.mock import patch
 
-import pytest
-
 from src.api import main
 
 
@@ -83,17 +81,16 @@ def test_respond_worker_llm_guard_runs_before_any_thread_starts():
 	assert len(names) > 1, "sanity check: multiple worker threads should have been registered"
 
 
-def test_no_worker_thread_starts_when_llm_misconfigured():
-	"""The guard raising must abort _start_background_workers() before ANY
-	worker thread is constructed — not just before the respond worker's own
-	thread. Before this fix, the guard ran after all 18 sweep threads
-	(including billing_sweep.run_sit_invoice_sweep and every settlement_sweep
-	sweep) had already started and fired at least one real tick, since
-	daemon threads are not killed by an exception raised on a different
-	thread. A partially-started worker set — real money-moving sweeps
-	included — on a misconfigured deployment is itself a silent-failure
-	surface this guard exists to prevent entirely, not just for the respond
-	worker."""
+def test_only_respond_worker_is_skipped_when_llm_misconfigured():
+	"""Corrected behavior (was: the guard raising aborted the ENTIRE
+	function, so /healthz and all 18 unrelated sweep threads — billing,
+	settlement, booking sync — never started either; this is the exact
+	PR #4 bug already fixed once for a missing Slack credential, see
+	tests/test_api_startup.py's docstring). ANTHROPIC_API_KEY only gates
+	the respond worker: every other worker thread must still start, and
+	_start_background_workers() must not raise — the failure is logged
+	loudly (CRITICAL) instead, mirroring src/services/slack/bolt_app.py's
+	own catch-log-and-degrade pattern."""
 	names = []
 
 	class _StubThread:
@@ -107,7 +104,10 @@ def test_no_worker_thread_starts_when_llm_misconfigured():
 	with patch.object(main.threading, "Thread", _StubThread), \
 	     patch("src.agents.respond.worker._assert_llm_configured",
 	           side_effect=RuntimeError("ANTHROPIC_API_KEY is not set")):
-		with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
-			main._start_background_workers()
+		main._start_background_workers()  # must NOT raise
 
-	assert names == [], f"no worker thread should have started, but these did: {names}"
+	assert "respond_worker" not in names
+	assert "show_rate_reminder_sender.run_sweep" in names, (
+		f"unrelated workers must still start, but only these did: {names}"
+	)
+	assert len(names) > 10, "sanity check: the other ~18 sweep threads should have started"

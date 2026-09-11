@@ -103,19 +103,29 @@ def _loop(name: str, interval_seconds: int, fn) -> None:
 
 
 def _start_background_workers() -> None:
-	# PR #48 review finding: this guard used to run AFTER the `workers` loop
-	# below had already started all 18 sweep threads — including
-	# billing_sweep.run_sit_invoice_sweep and every settlement_sweep sweep,
-	# each of which calls fn() immediately on thread start, before its first
-	# time.sleep(). A misconfigured ANTHROPIC_API_KEY would still let those
-	# threads run at least one real tick (real Stripe calls included) during
-	# the window between thread.start() and the RuntimeError propagating out
-	# of lifespan() — they're daemon threads, not killed by an exception on a
-	# different thread. Calling the guard FIRST, before any thread of any
-	# kind starts, is what actually makes "the whole API's startup fails
-	# loudly" true.
+	# Group D / D-10, corrected: an earlier version let _assert_llm_configured()
+	# raise straight out of this function — which lifespan() awaits directly,
+	# so a missing ANTHROPIC_API_KEY killed FastAPI's entire startup, /healthz
+	# included. That's the exact PR #4 bug this repo already fixed once for a
+	# missing Slack credential (see tests/test_api_startup.py's docstring: an
+	# optional integration's misconfiguration must degrade gracefully, never
+	# take down the whole API) — ANTHROPIC_API_KEY only gates the respond
+	# worker, not booking sync, settlement, or billing. Mirrors
+	# src/services/slack/bolt_app.py's own pattern: catch, log loudly, and
+	# skip starting only the one thing that needed the missing credential —
+	# every other worker (and /healthz) still starts normally. Called FIRST,
+	# before any other thread starts, purely so the log line lands first;
+	# it no longer aborts anything.
 	from src.agents.respond.worker import _assert_llm_configured
-	_assert_llm_configured()
+	try:
+		_assert_llm_configured()
+		llm_configured = True
+	except RuntimeError as exc:
+		logger.critical(
+			"[main] %s — respond_worker will NOT start; every other "
+			"background worker still starts normally.", exc,
+		)
+		llm_configured = False
 
 	from src.tasks.booking_confirmation_sender import run_sweep
 	from src.tasks.calendar_subscription_renewal import run_renewal_sweep
@@ -185,17 +195,19 @@ def _start_background_workers() -> None:
 	# src/agents/respond/worker.py's own main()/_assert_llm_configured() is
 	# never reached here (that guard only covers a standalone
 	# `python -m src.agents.respond.worker` invocation, which this codebase
-	# does not use). The guard call itself now lives at the very top of this
-	# function — see the comment there for why it moved ahead of every other
-	# worker thread, not just this one.
-	respond_worker = RespondWorker()
-	respond_thread = threading.Thread(
-		target=respond_worker.run_forever,
-		name="respond_worker",
-		daemon=True,
-	)
-	respond_thread.start()
-	logger.info("Started background worker respond_worker")
+	# does not use). Gated on llm_configured (see the guard call at the top
+	# of this function) — every inbound reply would otherwise silently
+	# classify as NURTURE/ROUTED with no alert, which is the whole reason
+	# the guard exists; the CRITICAL log line above is what makes that loud.
+	if llm_configured:
+		respond_worker = RespondWorker()
+		respond_thread = threading.Thread(
+			target=respond_worker.run_forever,
+			name="respond_worker",
+			daemon=True,
+		)
+		respond_thread.start()
+		logger.info("Started background worker respond_worker")
 
 
 # PR review finding: src.services.events._pending_buffer is process-local,
