@@ -149,26 +149,23 @@ def _fetch_prior_messages(db: Session, client_id: str, sender_email: str, exclud
     return [dict(r) for r in rows]
 
 
-def _fetch_engagement(db: Session, contact_id: Optional[int]) -> dict[str, int]:
+def _fetch_engagement(db: Session, contact_id: Optional[int]) -> dict[str, Any]:
     if not contact_id:
-        return {"touches": 0, "opens": 0, "clicks": 0}
+        return {"touches": 0, "opens": "n/a", "clicks": "n/a"}
     touch_row = db.execute(
         text("SELECT COUNT(*) FROM sequence_touch_dispatches WHERE contact_id = :cid"),
         {"cid": contact_id},
     ).scalar()
-    event_row = db.execute(
-        text(
-            "SELECT "
-            "  COUNT(*) FILTER (WHERE event_type = 'email_opened')  AS opens, "
-            "  COUNT(*) FILTER (WHERE event_type = 'email_clicked') AS clicks "
-            "FROM events WHERE entity_type = 'contact' AND entity_id = :cid"
-        ),
-        {"cid": str(contact_id)},
-    ).first()
+    # Group D / D-4: email_opened/email_clicked have no producer anywhere in
+    # this codebase (S-8, open/click tracking, is not built yet). The query
+    # this used to run always returned 0, which the card rendered as
+    # "confirmed zero engagement" to a setter about to make a call, rather
+    # than "not tracked". "n/a" is honest — restore the real per-contact
+    # query here once S-8 lands.
     return {
         "touches": touch_row or 0,
-        "opens":   event_row[0] if event_row else 0,
-        "clicks":  event_row[1] if event_row else 0,
+        "opens":   "n/a",
+        "clicks":  "n/a",
     }
 
 # ── Weak signal extraction ────────────────────────────────────────────────────

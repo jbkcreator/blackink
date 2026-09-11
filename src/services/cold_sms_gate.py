@@ -85,6 +85,18 @@ def assert_not_cold_sms(session: Session, contact_id: int) -> None:
     Called as the final pre-dispatch gate before any outbound SMS is sent.
     This is the runtime enforcement that CI/CD tests verify is present.
 
+    Group D / D-7 — NOT sufficient alone: this checks only cold/engaged.
+    It has NO opt-out, non-poach, DNC, or quiet-hours check.
+    src/services/sms_dispatch.py deliberately does NOT call this function —
+    it calls src/services/campaign_readiness_gate.py's
+    evaluate_full_readiness() instead, which is strictly stronger and is
+    the only sanctioned SMS send path in this repo
+    (src/services/sms_dispatch.py:dispatch_sms()). Reach for THAT, not
+    this function, if wiring a new SMS send path — this one exists to be
+    unit-tested (tests/test_cold_sms_gate.py) as the CI-verifiable
+    cold/engaged predicate on its own, not to be called directly by a
+    dispatcher.
+
     Raises:
         ValueError: with contact_id and reason — caller logs and routes to
                     dead-letter queue, never swallows silently.

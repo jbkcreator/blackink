@@ -103,6 +103,30 @@ def _loop(name: str, interval_seconds: int, fn) -> None:
 
 
 def _start_background_workers() -> None:
+	# Group D / D-10, corrected: an earlier version let _assert_llm_configured()
+	# raise straight out of this function — which lifespan() awaits directly,
+	# so a missing ANTHROPIC_API_KEY killed FastAPI's entire startup, /healthz
+	# included. That's the exact PR #4 bug this repo already fixed once for a
+	# missing Slack credential (see tests/test_api_startup.py's docstring: an
+	# optional integration's misconfiguration must degrade gracefully, never
+	# take down the whole API) — ANTHROPIC_API_KEY only gates the respond
+	# worker, not booking sync, settlement, or billing. Mirrors
+	# src/services/slack/bolt_app.py's own pattern: catch, log loudly, and
+	# skip starting only the one thing that needed the missing credential —
+	# every other worker (and /healthz) still starts normally. Called FIRST,
+	# before any other thread starts, purely so the log line lands first;
+	# it no longer aborts anything.
+	from src.agents.respond.worker import _assert_llm_configured
+	try:
+		_assert_llm_configured()
+		llm_configured = True
+	except RuntimeError as exc:
+		logger.critical(
+			"[main] %s — respond_worker will NOT start; every other "
+			"background worker still starts normally.", exc,
+		)
+		llm_configured = False
+
 	from src.tasks.booking_confirmation_sender import run_sweep
 	from src.tasks.calendar_subscription_renewal import run_renewal_sweep
 	from src.tasks.calendar_sync_worker import drain_queue, sweep_all_active_connections
@@ -165,14 +189,25 @@ def _start_background_workers() -> None:
 	# directly rather than wrapping in _loop(). Signal handlers are not
 	# installed: only the main thread can handle signals in Python, and Cloud
 	# Run SIGTERM terminates the container regardless.
-	respond_worker = RespondWorker()
-	respond_thread = threading.Thread(
-		target=respond_worker.run_forever,
-		name="respond_worker",
-		daemon=True,
-	)
-	respond_thread.start()
-	logger.info("Started background worker respond_worker")
+	#
+	# Group D / D-10: this is the ACTUAL production start path for the
+	# respond worker in this single-process deployment model —
+	# src/agents/respond/worker.py's own main()/_assert_llm_configured() is
+	# never reached here (that guard only covers a standalone
+	# `python -m src.agents.respond.worker` invocation, which this codebase
+	# does not use). Gated on llm_configured (see the guard call at the top
+	# of this function) — every inbound reply would otherwise silently
+	# classify as NURTURE/ROUTED with no alert, which is the whole reason
+	# the guard exists; the CRITICAL log line above is what makes that loud.
+	if llm_configured:
+		respond_worker = RespondWorker()
+		respond_thread = threading.Thread(
+			target=respond_worker.run_forever,
+			name="respond_worker",
+			daemon=True,
+		)
+		respond_thread.start()
+		logger.info("Started background worker respond_worker")
 
 
 # PR review finding: src.services.events._pending_buffer is process-local,
@@ -200,8 +235,40 @@ async def _periodic_flush_loop(interval_seconds: float = _FLUSH_INTERVAL_SECONDS
 			logger.error("[main] periodic flush_pending() failed", exc_info=True)
 
 
+def _log_disabled_inbound_routes() -> None:
+	"""Group D / D-2: several inbound webhook routes fail closed SILENTLY
+	(a log.error + 403/406/503 per request, no startup signal) when a
+	required secret is unset — the exact go-live trap D-2 named: setting
+	only one of what used to be two separate Mailgun signing-key settings
+	looked fine until the OTHER endpoint quietly rejected every delivery.
+	Log once, loudly, at startup which routes are currently disabled, so a
+	missing secret is caught before traffic arrives rather than after."""
+	from config.settings import get_settings
+
+	settings = get_settings()
+	disabled = []
+	if not settings.mailgun_signing_key:
+		disabled.append(
+			"POST /api/v1/webhooks/inbound-email and "
+			"POST /api/v1/webhooks/mailgun-inbound (MAILGUN_SIGNING_KEY unset "
+			"— both routers share this one setting)"
+		)
+	if not settings.inbound_parse_secret:
+		disabled.append(
+			"POST /api/v1/inbound/reply/{client_id} "
+			"(INBOUND_PARSE_SECRET unset — Reply Triage Agent intake)"
+		)
+	if disabled:
+		logger.error(
+			"[main] %d inbound route(s) disabled at startup for want of a "
+			"secret — every request to them will be rejected until set:\n  - %s",
+			len(disabled), "\n  - ".join(disabled),
+		)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+	_log_disabled_inbound_routes()
 	# Restore Redis halt state from Postgres before accepting any traffic —
 	# src.agents.relay.sync's own docstring: "without this, a Redis flush
 	# would silently clear all active halts until an admin noticed."

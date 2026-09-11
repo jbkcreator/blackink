@@ -1667,6 +1667,7 @@ async def handle_log_meeting_outcome(ack, body, respond, action, client):
 # ── Context card claim (Subtask 2.1.2 — Reply Triage Agent) ─────────────────
 
 from src.agents.respond.context_cards import CARD_EXPIRY as _CONTEXT_CARD_TTL, compute_card_hash
+from src.agents.respond.kb_cards import KB_CARD_EXPIRY as _KB_CARD_TTL, compute_kb_card_hash
 
 
 @app.action("claim_context_card")
@@ -1771,6 +1772,354 @@ async def handle_claim_context_card(ack, body, respond, action, client):
 				}
 			],
 		)
+	await respond(response_type="ephemeral", text=f":white_check_mark: You've claimed this lead. Get in touch fast!")
+
+
+# ── KB Auto-Response — Approve & Send (Subtask 2.1.3) ────────────────────────
+
+@app.action("approve_kb_response")
+async def handle_approve_kb_response(ack, body, respond, action, client):
+	"""Rep clicks 'Approve & Send' on a KB draft card in #sales-replies.
+
+	Verifies card hash + 24-hour expiry, then sends the KB response template
+	via SMTP to the sender, logs outbound_touch_dispatched, and updates the
+	card in place to show the approval.
+
+	Email is NOT sent before this click — no outbound_touch_dispatched event
+	exists for this db_id before Approve is clicked.
+	"""
+	await ack()
+	user_id = body.get("user", {}).get("id", "unknown")
+
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	db_id          = value.get("db_id")
+	card_client_id = value.get("client_id")
+	entry_id       = value.get("entry_id")
+	provided_hash  = value.get("card_hash", "")
+
+	if not db_id or not card_client_id or entry_id is None:
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload — missing required fields.")
+		return
+
+	if not approver_authorized(user_id, client_id=card_client_id):
+		await respond(response_type="ephemeral", text=":no_entry: You are not authorized to approve KB responses for this client.")
+		return
+
+	with get_system_db_context() as session:
+		row = session.execute(
+			text(
+				"SELECT id, client_id, sender_email, subject, body_text, "
+				"       card_posted_at, card_ts, card_channel_id, claimed_at, status "
+				"FROM inbound_messages WHERE id = :id"
+			),
+			{"id": db_id},
+		).mappings().first()
+
+	if row is None:
+		await respond(response_type="ephemeral", text=":warning: Message not found.")
+		return
+
+	if row["status"] not in ("ROUTED",):
+		await respond(response_type="ephemeral", text=f":information_source: This message is already in status `{row['status']}`.")
+		return
+
+	if row["claimed_at"] is not None:
+		await respond(response_type="ephemeral", text=":information_source: This draft was already approved by someone else.")
+		return
+
+	card_posted_at = row["card_posted_at"]
+	if card_posted_at is None:
+		await respond(response_type="ephemeral", text=":warning: Card metadata missing — cannot verify.")
+		return
+	if card_posted_at.tzinfo is None:
+		card_posted_at = card_posted_at.replace(tzinfo=timezone.utc)
+	if datetime.now(timezone.utc) > card_posted_at + _KB_CARD_TTL:
+		await respond(response_type="ephemeral", text=":warning: This card has expired (>24 hours). Draft no longer sendable.")
+		return
+
+	card_posted_at_iso = card_posted_at.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+	expected = compute_kb_card_hash(db_id, card_client_id, entry_id, card_posted_at_iso)
+	if not _hmac.compare_digest(provided_hash, expected):
+		await respond(response_type="ephemeral", text=":warning: This action has expired or was altered.")
+		return
+
+	# Fetch the KB template
+	with get_system_db_context() as session:
+		kb_row = session.execute(
+			text("SELECT topic, approved_response_template FROM knowledge_base_entries WHERE entry_id = :eid AND is_active = TRUE"),
+			{"eid": entry_id},
+		).first()
+
+	if not kb_row:
+		await respond(response_type="ephemeral", text=":warning: KB entry not found or deactivated — cannot send.")
+		return
+
+	topic    = kb_row[0]
+	template = kb_row[1]
+
+	# Mark claimed before sending — guards against a race between two reps.
+	with get_system_db_context() as session:
+		claimed = session.execute(
+			text(
+				"UPDATE inbound_messages "
+				"SET claimed_at = NOW(), claimed_by = :uid "
+				"WHERE id = :id AND claimed_at IS NULL RETURNING id"
+			),
+			{"uid": user_id, "id": db_id},
+		).first()
+		session.commit()
+
+	if claimed is None:
+		await respond(response_type="ephemeral", text=":information_source: Another rep just approved this draft.")
+		return
+
+	# Send the email via SMTP.
+	# _send_kb_reply transitions the row to SENDING inside the advisory-lock
+	# transaction so concurrent approvals see the reserved cap slot immediately.
+	# On uncertain delivery (connection dropped mid-DATA): terminal SENT_UNCONFIRMED —
+	#   the email may already be in the recipient's inbox; never release the claim.
+	# On definite SMTP failure: release the claim and reset to ROUTED so another
+	#   rep can retry.
+	# On success: mark RESPONDED so it counts toward the rolling-24h cap.
+	from src.services.calendar_confirmation import UncertainDeliveryError
+
+	try:
+		used_mailbox_id = _send_kb_reply(
+			client_id=card_client_id,
+			message_id=db_id,
+			to_email=row["sender_email"],
+			subject=f"Re: {row['subject'] or 'Your enquiry'}",
+			body_html=template.replace("\n", "<br>"),
+		)
+	except UncertainDeliveryError:
+		logger.exception("approve_kb_response: SMTP uncertain for db_id=%s — marking SENT_UNCONFIRMED", db_id)
+		with get_system_db_context() as _s:
+			_s.execute(
+				text("UPDATE inbound_messages SET status = 'SENT_UNCONFIRMED' WHERE id = :id"),
+				{"id": db_id},
+			)
+			_s.commit()
+		await respond(
+			response_type="ephemeral",
+			text=":warning: Email status uncertain — connection dropped mid-send. Marked for manual reconciliation. Do not re-send.",
+		)
+		return
+	except Exception as exc:
+		logger.exception("approve_kb_response: SMTP send failed for db_id=%s", db_id)
+		with get_system_db_context() as _s:
+			_s.execute(
+				text(
+					"UPDATE inbound_messages "
+					"SET status = 'ROUTED', claimed_at = NULL, claimed_by = NULL "
+					"WHERE id = :id"
+				),
+				{"id": db_id},
+			)
+			_s.commit()
+		await respond(response_type="ephemeral", text=f":x: Failed to send email: {exc}")
+		return
+
+	with get_system_db_context() as _s:
+		_s.execute(
+			text(
+				"UPDATE inbound_messages "
+				"SET status = 'RESPONDED', responded_at = NOW(), mailbox_id = :mid "
+				"WHERE id = :id"
+			),
+			{"mid": used_mailbox_id, "id": db_id},
+		)
+		_s.commit()
+
+	# Log the outbound event
+	try:
+		from src.services.events import log_event
+		log_event(
+			card_client_id,
+			"outbound_touch_dispatched",
+			entity_type="inbound_message",
+			entity_id=str(db_id),
+			payload={
+				"channel":        "smtp_kb_reply",
+				"kb_entry_id":    entry_id,
+				"kb_topic":       topic,
+				"to_email":       row["sender_email"],
+				"approved_by":    user_id,
+			},
+			actor="kb_approve_handler",
+		)
+	except Exception:
+		logger.exception("approve_kb_response: log_event failed db_id=%s", db_id)
+
+	# Update the Slack card in place.
+	if row["card_ts"] and row["card_channel_id"]:
+		try:
+			await client.chat_update(
+				channel=row["card_channel_id"],
+				ts=row["card_ts"],
+				text=f":white_check_mark: KB reply sent — approved by <@{user_id}>",
+				blocks=[{
+					"type": "section",
+					"text": {"type": "mrkdwn", "text": f":white_check_mark: *KB reply sent* — topic: *{topic}* — approved by <@{user_id}>"},
+				}],
+			)
+		except Exception:
+			logger.warning("approve_kb_response: card update failed db_id=%s", db_id)
+
+	await respond(response_type="ephemeral", text=f":white_check_mark: Reply sent to {row['sender_email']}.")
+
+
+def _send_kb_reply(*, client_id: str, message_id: int, to_email: str, subject: str, body_html: str) -> Optional[int]:
+	"""Send the KB auto-response. Returns the mailbox_id used, or None for env fallback.
+
+	Primary path: client's least-recently-used warmed DB mailbox.
+	Fallback: env-based SMTP credentials (SMTP_HOST / SMTP_PASSWORD / SMTP_USERNAME)
+	when no warmed DB mailbox is provisioned for this client yet.
+
+	Transitions the inbound_messages row to SENDING inside the same advisory-lock
+	transaction as mailbox selection, so concurrent approvals see the reserved cap
+	slot before SMTP returns. The caller owns the RESPONDED / SENT_UNCONFIRMED /
+	ROUTED transition after SMTP completes."""
+	from sqlalchemy import text as _text
+	from src.core.database import get_db_context
+	from src.core.token_crypto import decrypt_token
+	from src.services.email_dispatch import SmtpEmailProvider
+	from src.services.mailbox_dispatcher import get_active_mailbox_for_client, NoMailboxAvailable
+	from config.settings import get_settings
+
+	try:
+		with get_db_context(client_id=client_id) as db:
+			mailbox = get_active_mailbox_for_client(db, client_id)
+			smtp_row = db.execute(
+				_text(
+					"SELECT smtp_host, smtp_port, smtp_username, smtp_password_encrypted "
+					"FROM mailboxes WHERE id = :mid"
+				),
+				{"mid": mailbox.mailbox_id},
+			).fetchone()
+			# Reserve the cap slot atomically inside the advisory-lock transaction.
+			db.execute(
+				_text("UPDATE inbound_messages SET status = 'SENDING' WHERE id = :mid"),
+				{"mid": message_id},
+			)
+
+		if not smtp_row or not smtp_row.smtp_host:
+			raise RuntimeError(f"No SMTP credentials for mailbox_id={mailbox.mailbox_id}")
+
+		provider = SmtpEmailProvider(
+			host=smtp_row.smtp_host,
+			port=smtp_row.smtp_port or 587,
+			username=smtp_row.smtp_username,
+			password=decrypt_token(smtp_row.smtp_password_encrypted),
+			from_address=mailbox.mailbox_address,
+		)
+		from_address = mailbox.mailbox_address
+		used_mailbox_id: Optional[int] = mailbox.mailbox_id
+
+	except NoMailboxAvailable:
+		# Fall back to env-based SMTP when no DB mailbox is provisioned yet.
+		settings = get_settings()
+		if not settings.smtp_host or not settings.smtp_password:
+			raise RuntimeError(
+				f"No mailboxes provisioned for client_id={client_id} and no env SMTP fallback configured."
+			)
+		from_address = settings.smtp_username or ""
+		provider = SmtpEmailProvider(
+			host=settings.smtp_host,
+			port=settings.smtp_port,
+			username=from_address,
+			password=settings.smtp_password.get_secret_value(),
+			from_address=from_address,
+		)
+		used_mailbox_id = None
+		logger.info("_send_kb_reply: using env SMTP fallback for client_id=%s", client_id)
+
+	provider.send_plain(
+		to=to_email,
+		reply_to=from_address,
+		bcc=from_address,
+		subject=subject,
+		html_body=body_html,
+	)
+	return used_mailbox_id
+
+
+# ── KB Auto-Response — Mark Reviewed (Subtask 2.1.3) ─────────────────────────
+
+@app.action("kb_mark_reviewed")
+async def handle_kb_mark_reviewed(ack, body, respond, action, client):
+	"""Rep clicks 'Mark reviewed' on a low-confidence or no-match KB card.
+
+	Sets claimed_at / claimed_by on the row and collapses the card in place.
+	No email is sent — manual reply is expected from the rep.
+	"""
+	await ack()
+	user_id = body.get("user", {}).get("id", "unknown")
+
+	try:
+		value = json.loads(action.get("value", "{}"))
+	except (json.JSONDecodeError, TypeError):
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	db_id          = value.get("db_id")
+	card_client_id = value.get("client_id")
+
+	if not db_id or not card_client_id:
+		await respond(response_type="ephemeral", text=":warning: Malformed button payload.")
+		return
+
+	if not approver_authorized(user_id, client_id=card_client_id):
+		await respond(response_type="ephemeral", text=":no_entry: You are not authorized to perform this action.")
+		return
+
+	with get_system_db_context() as session:
+		row = session.execute(
+			text(
+				"SELECT id, sender_email, card_ts, card_channel_id, claimed_at "
+				"FROM inbound_messages WHERE id = :id"
+			),
+			{"id": db_id},
+		).mappings().first()
+
+	if row is None:
+		await respond(response_type="ephemeral", text=":warning: Message not found.")
+		return
+
+	if row["claimed_at"] is not None:
+		await respond(response_type="ephemeral", text=":information_source: Already marked reviewed.")
+		return
+
+	with get_system_db_context() as session:
+		session.execute(
+			text(
+				"UPDATE inbound_messages "
+				"SET claimed_at = NOW(), claimed_by = :uid "
+				"WHERE id = :id AND claimed_at IS NULL"
+			),
+			{"uid": user_id, "id": db_id},
+		)
+		session.commit()
+
+	if row["card_ts"] and row["card_channel_id"]:
+		try:
+			await client.chat_update(
+				channel=row["card_channel_id"],
+				ts=row["card_ts"],
+				text=f":eyes: Reviewed by <@{user_id}> — manual reply needed",
+				blocks=[{
+					"type": "section",
+					"text": {"type": "mrkdwn", "text": f":eyes: *Reviewed* by <@{user_id}> — reply manually to `{row['sender_email']}`"},
+				}],
+			)
+		except Exception:
+			logger.warning("kb_mark_reviewed: card update failed db_id=%s", db_id)
+
+	await respond(response_type="ephemeral", text=":white_check_mark: Marked as reviewed. Reply manually when ready.")
 
 
 # ── Ink Campaign — Approve / Reject draft card buttons ───────────────────────

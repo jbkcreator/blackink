@@ -136,6 +136,44 @@ def test_classify_fallback_when_no_api_key(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Group D / D-10 — the fallback result must carry a distinguishing flag, or
+# an errored classification is silently indistinguishable from a genuine
+# NURTURE (worker.py's requires_human_review / alert logic depends on it).
+# ---------------------------------------------------------------------------
+
+def test_fallback_carries_distinguishing_meta_flag():
+    from src.agents.respond.classifier import _fallback
+
+    result = _fallback()
+    assert result.intent == Intent.NURTURE
+    assert result.confidence == 0.0
+    assert result.meta.get("path") == "fallback"
+
+
+def test_classify_with_llm_returns_fallback_flag_when_sdk_missing(monkeypatch):
+    import src.agents.respond.classifier as classifier_mod
+
+    monkeypatch.setattr(classifier_mod, "anthropic", None)
+    result = classifier_mod._classify_with_llm("body", "subject", "a@b.com")
+    assert result.intent == Intent.NURTURE
+    assert result.meta.get("path") == "fallback"
+
+
+def test_classify_with_llm_returns_fallback_flag_when_api_key_unset(monkeypatch):
+    import src.agents.respond.classifier as classifier_mod
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(classifier_mod, "anthropic", object())
+    monkeypatch.setattr(
+        classifier_mod, "get_settings",
+        lambda: SimpleNamespace(anthropic_api_key=None),
+    )
+    result = classifier_mod._classify_with_llm("body", "subject", "a@b.com")
+    assert result.intent == Intent.NURTURE
+    assert result.meta.get("path") == "fallback"
+
+
+# ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
 

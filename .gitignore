@@ -11,6 +11,9 @@ secrets/
 /Tasks
 /reports/
 
+# Project docs — local only, never push
+/docs
+
 # Python bytecode
 __pycache__/
 *.py[cod]
@@ -54,4 +57,9 @@ Thumbs.db
 
 # Local scratch files and test data (never committed)
 /scratch/
+/.scratch/
 /data/
+tmp/
+
+# Completion reports — local only, never push
+/reports/

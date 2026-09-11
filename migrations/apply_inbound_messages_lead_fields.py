@@ -80,7 +80,14 @@ DDL = [
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS source_channel VARCHAR(40)",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS send_at TIMESTAMPTZ",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS lead_sla_due_at TIMESTAMPTZ",
-    "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS ack_latency_seconds DOUBLE PRECISION",
+    # ack_latency_seconds is NOT created here — apply_entitlements_billing.py
+    # owns it as a GENERATED STORED column derived from acked_at (its own
+    # comment explains why: Postgres has no "ADD COLUMN IF NOT EXISTS ...
+    # GENERATED" guard). This migration used to also create it as a plain
+    # DOUBLE PRECISION column; that was a second, conflicting definition of
+    # the same column, each guarded by IF NOT EXISTS so whichever migration
+    # ran first silently won — see apply_ack_latency_reconcile.py, which
+    # fixes any environment where this migration ran first.
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS property_address TEXT",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS sender_phone VARCHAR(40)",
     "ALTER TABLE inbound_messages ADD COLUMN IF NOT EXISTS utm JSONB",
