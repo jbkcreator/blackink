@@ -19,10 +19,14 @@ def _sql_text_of_call(call) -> str:
     return str(call[0][0])
 
 
-def _tier3_row(row_id=1, client_id="CL1"):
+def _tier3_row(row_id=1, client_id="CL1", standard_minutes=60):
     return {
         "id": row_id, "client_id": client_id, "intent": "OBJECTION",
         "sender_email": "owner@co.com", "sender_name": "Owner Co",
+        # The tier3 SELECT now returns COALESCE(sla_standard_minutes, default)
+        # so the fresh post-reallocation SLA window uses the client's own
+        # first-response window rather than a hardcoded 60.
+        "standard_minutes": standard_minutes,
     }
 
 
@@ -62,6 +66,25 @@ def test_tier3_with_active_roster_resets_escalation_and_starts_new_sla_window():
     assert params["closer_id"] == "U123"
     assert params["new_sla"] == _AS_OF + timedelta(minutes=60)
     assert params["id"] == 1
+
+
+def test_tier3_new_sla_window_honors_per_client_standard_minutes():
+    # A client with a non-default first-response window (e.g. 20 min) gets
+    # that window as its fresh post-reallocation SLA, not a hardcoded 60.
+    db = MagicMock()
+    row = _tier3_row(standard_minutes=20)
+    db.execute.return_value.mappings.return_value.fetchall.return_value = [row]
+
+    with patch("src.tasks.respond_sla_sweep._pick_backup_closer",
+               return_value={"slack_user_id": "U123", "display_name": "Jordan"}), \
+         patch("src.tasks.respond_sla_sweep.asyncio.run", return_value=None):
+        _run_tier3(db, _AS_OF)
+
+    update_call = next(
+        c for c in db.execute.call_args_list
+        if "escalation_level = 0" in _sql_text_of_call(c)
+    )
+    assert update_call[0][1]["new_sla"] == _AS_OF + timedelta(minutes=20)
 
 
 def test_tier3_with_no_active_roster_falls_back_to_terminal_reallocated():
