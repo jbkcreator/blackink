@@ -20,7 +20,8 @@ last_error, and failure_category; it *is* the audit trail here.
     PYTHONPATH=. python -m src.tasks.assessor_sync --dataset RP_EXEMPTIONS
     PYTHONPATH=. python -m src.tasks.assessor_sync --dry-run             # metadata check only
     PYTHONPATH=. python -m src.tasks.assessor_sync --force               # ignore published_at comparison
-    PYTHONPATH=. python -m src.tasks.assessor_sync --limit 5000          # cap rows, for bounded runs
+    PYTHONPATH=. python -m src.tasks.assessor_sync --limit 5000          # cap rows, for bounded runs (retirement disabled while limited)
+    PYTHONPATH=. python -m src.tasks.assessor_sync --county pinellas_fl --dataset RP_EXEMPTIONS --reset  # reset a FAILED_PERMANENT dataset to PENDING
 """
 from __future__ import annotations
 
@@ -75,6 +76,27 @@ _DATASETS = (
 # block the next sweep forever. Generous relative to the real import time
 # (minutes, not hours) so a slow-but-alive run is never double-claimed.
 _CLAIM_LEASE_HOURS = 2
+
+# Failure categories this repo's own code/schema genuinely can't self-heal
+# from — a human fix (a parser update, a validation-rule change) is needed,
+# so these are allowed to escalate to FAILED_PERMANENT after repeated
+# attempts. NETWORK_TIMEOUT is deliberately excluded: a county site or
+# network being briefly unreachable is expected to clear on its own, and
+# must never permanently disable a dataset that a later, healthy run would
+# import fine — PR review finding: three consecutive daily network blips
+# previously hit the same shared attempt counter as every other failure and
+# permanently killed the dataset, with _claim() offering no automatic way
+# back (`--force` doesn't bypass its `!= 'FAILED_PERMANENT'` check either).
+_NON_RECOVERABLE_FAILURE_CATEGORIES = frozenset({
+	"SITE_STRUCTURE_CHANGED", "VALIDATION_FAILED", "DOWNLOAD_SIZE_EXCEEDED", "INTERNAL_ERROR",
+})
+
+# Caps the 2**attempts backoff growth for a NETWORK_TIMEOUT failure, which
+# (per the above) never escalates to FAILED_PERMANENT and so can keep
+# incrementing `attempts` indefinitely over a genuinely long outage —
+# without this cap the interval would eventually grow to an absurd number
+# of minutes rather than settling at a sane daily-ish retry cadence.
+_MAX_RETRY_BACKOFF_MINUTES = 24 * 60
 
 
 @dataclass
@@ -145,12 +167,15 @@ def _mark(
 	if status == "FAILED":
 		stored = _get_stored_state(session, county_slug, dataset_name) or {"attempts": 0}
 		attempts = stored["attempts"] + 1
-		if attempts >= settings.assessor_sync_max_attempts:
+		# PR review finding: escalating on attempt count alone treated a
+		# transient network blip identically to a genuinely broken parser —
+		# only a non-recoverable category may ever reach FAILED_PERMANENT.
+		if attempts >= settings.assessor_sync_max_attempts and failure_category in _NON_RECOVERABLE_FAILURE_CATEGORIES:
 			final_status = "FAILED_PERMANENT"
 			next_retry_at = None
 		else:
 			final_status = "FAILED"
-			next_retry_at = as_of + timedelta(minutes=2**attempts)
+			next_retry_at = as_of + timedelta(minutes=min(2**attempts, _MAX_RETRY_BACKOFF_MINUTES))
 		session.execute(
 			text(
 				"UPDATE assessor_sync_state SET import_status = :status, attempts = :attempts, "
@@ -275,6 +300,21 @@ def sync_one_dataset(
 			_mark(session, county_slug, dataset_name, status="SKIPPED_UNCHANGED", version=version, as_of=claim_time)
 			return DatasetSyncResult(county_slug, dataset_name, "SKIPPED_UNCHANGED")
 
+		# PR review finding: a --limit'd run's own row-count floor does not
+		# protect the retire step, which has no way to tell "genuinely gone
+		# from the roll" from "outside this run's truncated prefix" — a
+		# limit above 50% of the prior roll still passes both floor checks
+		# while retiring every real parcel outside the limited batch.
+		# Disabling retirement whenever a limit is in effect keeps --limit
+		# useful for its documented purpose (bounded verification against a
+		# real feed) without letting it corrupt the live roll.
+		skip_retire = limit is not None
+		if skip_retire:
+			logger.warning(
+				"assessor_sync: %s/%s running with --limit=%d — parcel retirement is disabled for this run",
+				county_slug, dataset_name, limit,
+			)
+
 		try:
 			if county_slug == "hillsborough_fl":
 				response = open_hillsborough_download(version)
@@ -282,7 +322,7 @@ def sync_one_dataset(
 					rows = _limited(_hillsborough_mapped_rows(response), limit)
 					result = import_row_owning_dataset(
 						session, county_slug=county_slug, dataset_name=dataset_name,
-						mapped_rows=rows, as_of=claim_time, owns_homestead=True,
+						mapped_rows=rows, as_of=claim_time, owns_homestead=True, skip_retire=skip_retire,
 					)
 				finally:
 					response.close()
@@ -293,7 +333,7 @@ def sync_one_dataset(
 					rows = _limited(_pinellas_property_info_mapped_rows(zip_path), limit)
 					result = import_row_owning_dataset(
 						session, county_slug=county_slug, dataset_name=dataset_name,
-						mapped_rows=rows, as_of=claim_time, owns_homestead=False,
+						mapped_rows=rows, as_of=claim_time, owns_homestead=False, skip_retire=skip_retire,
 					)
 				finally:
 					zip_path.unlink(missing_ok=True)
@@ -400,6 +440,30 @@ def run_sweep(
 	return results
 
 
+def reset_dataset(county_slug: str, dataset_name: str, as_of: Optional[datetime] = None) -> bool:
+	"""Controlled, explicit reset path for a FAILED_PERMANENT dataset (PR
+	review finding: escalation had no automatic way back, and no manual way
+	back either short of an operator hand-editing assessor_sync_state).
+	Meant for the case where the underlying issue really has been fixed
+	(e.g. a parser update shipped for a SITE_STRUCTURE_CHANGED failure) —
+	an operator confirms the fix, runs this, then the next sweep tick
+	claims and retries normally. Returns True if a row was actually reset
+	(False if the county_slug/dataset_name pair doesn't exist)."""
+	as_of = as_of or datetime.now(timezone.utc)
+	with get_system_db_context() as session:
+		result = session.execute(
+			text(
+				"UPDATE assessor_sync_state SET import_status = 'PENDING', attempts = 0, "
+				"next_retry_at = NULL, claimed_at = NULL, last_error = NULL, failure_category = NULL, "
+				"updated_at = :as_of "
+				"WHERE county_slug = :county_slug AND dataset_name = :dataset_name"
+			),
+			{"as_of": as_of, "county_slug": county_slug, "dataset_name": dataset_name},
+		)
+		session.commit()
+		return result.rowcount > 0
+
+
 def _main() -> int:
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("--county", choices=["hillsborough_fl", "pinellas_fl"], default=None)
@@ -407,9 +471,25 @@ def _main() -> int:
 	parser.add_argument("--dry-run", action="store_true")
 	parser.add_argument("--force", action="store_true")
 	parser.add_argument("--limit", type=int, default=None)
+	parser.add_argument(
+		"--reset", action="store_true",
+		help="Reset a FAILED_PERMANENT dataset back to PENDING (retryable) instead of running a sync. "
+		     "Requires --county AND --dataset naming exactly one dataset — never resets all three at once.",
+	)
 	args = parser.parse_args()
 
 	logging.basicConfig(level=logging.INFO)
+
+	if args.reset:
+		if not args.county or not args.dataset:
+			parser.error("--reset requires both --county and --dataset (naming exactly the dataset to reset)")
+		did_reset = reset_dataset(args.county, args.dataset)
+		if not did_reset:
+			print(f"{args.county}/{args.dataset}: no such dataset — nothing reset")
+			return 1
+		print(f"{args.county}/{args.dataset}: reset to PENDING")
+		return 0
+
 	results = run_sweep(county=args.county, dataset=args.dataset, force=args.force, limit=args.limit, dry_run=args.dry_run)
 	for r in results:
 		print(f"{r.county_slug}/{r.dataset_name}: {r.status}")

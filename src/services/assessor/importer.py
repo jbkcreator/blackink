@@ -167,6 +167,7 @@ def import_row_owning_dataset(
 	as_of: datetime,
 	owns_homestead: bool,
 	min_row_count: int = _ABSOLUTE_ROW_FLOOR,
+	skip_retire: bool = False,
 ) -> ImportResult:
 	"""Imports Hillsborough's single file, or Pinellas's RP_PROPERTY_INFO.
 	`owns_homestead=True` only for Hillsborough (see module docstring).
@@ -174,7 +175,16 @@ def import_row_owning_dataset(
 	(--limit'd) runs pass a smaller value; production callers should leave
 	it at the default. Caller owns the transaction: on any exception,
 	nothing here has committed and the caller's rollback leaves the
-	previous roll intact."""
+	previous roll intact.
+
+	`skip_retire=True` (set by assessor_sync.py whenever `--limit` is in
+	effect) disables the retire step below entirely. PR review finding: the
+	retire step has no way to tell "this parcel is genuinely gone from the
+	county's roll" from "this parcel just wasn't in this run's truncated
+	prefix" — a `--limit`'d run's own row-count floor (10 absolute, 50%
+	relative to the last successful import) does not protect against this,
+	since a limit above 50% of the prior roll still passes both checks
+	while retiring every real parcel outside the limited batch."""
 	columns = _ROW_OWNING_COLUMNS + (_HILLSBOROUGH_EXTRA_COLUMNS if owns_homestead else ())
 	temp_table = "tmp_assessor_row_owning_staging"
 	session.execute(text(f"DROP TABLE IF EXISTS {temp_table}"))
@@ -243,6 +253,9 @@ def import_row_owning_dataset(
 		{"county_slug": county_slug, "dataset_name": dataset_name, "as_of": as_of},
 	)
 	rows_upserted = result.rowcount
+
+	if skip_retire:
+		return ImportResult(rows_staged=staged_count, rows_upserted=rows_upserted, rows_retired=0)
 
 	retire_result = session.execute(
 		text(

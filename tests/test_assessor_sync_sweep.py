@@ -10,7 +10,7 @@ import pytest
 from sqlalchemy import text
 
 from src.core.database import get_owner_db_context
-from src.tasks.assessor_sync import _claim, _mark
+from src.tasks.assessor_sync import _claim, _mark, reset_dataset
 
 _TEST_DATASET = "SWEEPTEST_DATASET"
 
@@ -59,6 +59,84 @@ def test_mark_escalates_to_failed_permanent_after_max_attempts_and_returns_it(db
 	assert persisted.import_status == "FAILED_PERMANENT"
 	assert persisted.attempts == 3
 	assert persisted.next_retry_at is None  # a permanent failure is never retried
+
+
+def test_network_timeout_never_escalates_to_failed_permanent(db):
+	"""PR review finding: every failure category used to share one attempt
+	counter, so three consecutive daily network blips (nothing wrong with
+	our code, expected to clear on its own) permanently killed a dataset
+	exactly like a genuine schema/parser break would — with no automatic
+	way back, since _claim() unconditionally excludes FAILED_PERMANENT and
+	--force doesn't bypass that check. Proves NETWORK_TIMEOUT alone can
+	never reach FAILED_PERMANENT, past the point where a non-recoverable
+	category already would have (5 consecutive failures, well past the
+	default 3-attempt threshold)."""
+	as_of = datetime.now(timezone.utc)
+	for _ in range(5):
+		returned = _mark(db, "pinellas_fl", _TEST_DATASET, status="FAILED", error="timed out", failure_category="NETWORK_TIMEOUT", as_of=as_of)
+		db.commit()
+		assert returned != "FAILED_PERMANENT", "a NETWORK_TIMEOUT failure escalated to FAILED_PERMANENT"
+	persisted = db.execute(
+		text("SELECT import_status, attempts FROM assessor_sync_state WHERE dataset_name = :d"), {"d": _TEST_DATASET}
+	).fetchone()
+	assert persisted.import_status == "FAILED"
+	assert persisted.attempts == 5
+
+
+def test_network_timeout_stays_reclaimable_once_its_backoff_elapses(db):
+	"""Companion to the escalation test above: a dataset that never
+	escalates is only useful if it's actually still claimable once its
+	(capped) backoff window passes — proving the fix restores real
+	automatic recovery, not just a status string that never becomes
+	permanent."""
+	as_of = datetime.now(timezone.utc)
+	for _ in range(4):
+		_mark(db, "pinellas_fl", _TEST_DATASET, status="FAILED", error="timed out", failure_category="NETWORK_TIMEOUT", as_of=as_of)
+		db.commit()
+	# Immediately after the 4th failure, still within backoff — not claimable.
+	assert _claim(db, "pinellas_fl", _TEST_DATASET, as_of + timedelta(minutes=1)) is False
+	# Well past even the capped 24h backoff — claimable again.
+	assert _claim(db, "pinellas_fl", _TEST_DATASET, as_of + timedelta(hours=25)) is True
+
+
+def test_reset_dataset_clears_failed_permanent_and_restores_claimability(db):
+	"""The controlled reset path (PR review finding: no way back existed
+	for a genuinely non-recoverable failure once fixed) — an operator
+	confirms the underlying issue is resolved, resets explicitly, and the
+	dataset becomes claimable again on the next sweep tick."""
+	db.execute(
+		text(
+			"UPDATE assessor_sync_state SET import_status = 'FAILED_PERMANENT', attempts = 3, "
+			"next_retry_at = NULL, failure_category = 'SITE_STRUCTURE_CHANGED', last_error = 'boom' "
+			"WHERE dataset_name = :d"
+		),
+		{"d": _TEST_DATASET},
+	)
+	db.commit()
+
+	did_reset = reset_dataset("pinellas_fl", _TEST_DATASET)
+	assert did_reset is True
+
+	row = db.execute(
+		text(
+			"SELECT import_status, attempts, next_retry_at, failure_category, last_error, claimed_at "
+			"FROM assessor_sync_state WHERE dataset_name = :d"
+		),
+		{"d": _TEST_DATASET},
+	).fetchone()
+	assert row.import_status == "PENDING"
+	assert row.attempts == 0
+	assert row.next_retry_at is None
+	assert row.failure_category is None
+	assert row.last_error is None
+	assert row.claimed_at is None
+
+	claim_time = datetime.now(timezone.utc)
+	assert _claim(db, "pinellas_fl", _TEST_DATASET, claim_time) is True
+
+
+def test_reset_dataset_returns_false_for_an_unknown_pair():
+	assert reset_dataset("pinellas_fl", "NO_SUCH_DATASET_AT_ALL") is False
 
 
 def test_mark_success_resets_attempts_and_clears_failure_state(db):

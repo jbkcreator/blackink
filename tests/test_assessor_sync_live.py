@@ -131,6 +131,74 @@ def test_retire_on_disappearance_then_reappearance_clears_retired_at(db):
 	assert cleared is None
 
 
+def test_skip_retire_never_retires_parcels_outside_the_limited_batch(db):
+	"""PR review finding: --limit truncates the mapped-row iterator before
+	it reaches the importer, but the retire step used to run unconditionally
+	regardless — every real parcel outside the limited prefix looked
+	identical to one that genuinely vanished from the county's roll and got
+	soft-retired. assessor_sync.py now passes skip_retire=True whenever
+	--limit is in effect; this proves that flag actually disables the
+	retire step rather than merely narrowing it."""
+	folio_kept = f"{_PREFIX}KEPT"
+	folio_outside_batch_1 = f"{_PREFIX}OUTSIDE1"
+	folio_outside_batch_2 = f"{_PREFIX}OUTSIDE2"
+	as_of1 = datetime.now(timezone.utc)
+	import_row_owning_dataset(
+		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
+		mapped_rows=iter([_hc_row(folio_kept), _hc_row(folio_outside_batch_1), _hc_row(folio_outside_batch_2)]),
+		as_of=as_of1, owns_homestead=True, min_row_count=1,
+	)
+	db.commit()
+
+	# Simulates a --limit'd run: only one of the three prior parcels is in
+	# this run's staged batch. Without the fix, the other two would retire.
+	as_of2 = as_of1 + timedelta(seconds=1)
+	import_row_owning_dataset(
+		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
+		mapped_rows=iter([_hc_row(folio_kept)]), as_of=as_of2, owns_homestead=True, min_row_count=1,
+		skip_retire=True,
+	)
+	db.commit()
+
+	rows = db.execute(
+		text(
+			"SELECT assessor_parcel_id, retired_at IS NOT NULL AS retired FROM assessor_parcels "
+			"WHERE assessor_parcel_id = ANY(:ids)"
+		),
+		{"ids": [folio_kept, folio_outside_batch_1, folio_outside_batch_2]},
+	).fetchall()
+	retired_by_id = {r.assessor_parcel_id: r.retired for r in rows}
+	assert retired_by_id[folio_outside_batch_1] is False, "a parcel outside the limited batch was wrongly retired"
+	assert retired_by_id[folio_outside_batch_2] is False, "a parcel outside the limited batch was wrongly retired"
+	assert retired_by_id[folio_kept] is False
+
+
+def test_unbounded_run_still_retires_vanished_parcels_skip_retire_defaults_false(db):
+	"""Regression guard for the fix above: skip_retire must default to
+	False, so a normal (unbounded, no --limit) run's real retirement
+	behavior is completely unchanged."""
+	folio_stays = f"{_PREFIX}NOLIMITSTAYS"
+	folio_vanishes = f"{_PREFIX}NOLIMITVANISHES"
+	as_of1 = datetime.now(timezone.utc)
+	import_row_owning_dataset(
+		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
+		mapped_rows=iter([_hc_row(folio_stays), _hc_row(folio_vanishes)]),
+		as_of=as_of1, owns_homestead=True, min_row_count=1,
+	)
+	db.commit()
+	as_of2 = as_of1 + timedelta(seconds=1)
+	import_row_owning_dataset(
+		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
+		mapped_rows=iter([_hc_row(folio_stays)]), as_of=as_of2, owns_homestead=True, min_row_count=1,
+	)
+	db.commit()
+	retired = db.execute(
+		text("SELECT retired_at IS NOT NULL FROM assessor_parcels WHERE assessor_parcel_id = :p"),
+		{"p": folio_vanishes},
+	).scalar()
+	assert retired is True, "a normal unbounded run must still retire a genuinely vanished parcel"
+
+
 def test_retired_parcel_is_excluded_from_the_active_lookup_index_predicate(db):
 	"""The partial index's WHERE clause (retired_at IS NULL) is what keeps
 	a retired parcel from ever being a Win-Back match — assert the
