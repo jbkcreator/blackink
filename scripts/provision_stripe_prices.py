@@ -6,8 +6,8 @@ explicit --confirm-catalog flag, which asserts the catalog is final.
 
     PYTHONPATH=. python scripts/provision_stripe_prices.py --confirm-catalog
 
-Idempotent: skips any SKU that already has a stripe_price_id, and creates
-Stripe objects under deterministic idempotency keys, so a re-run is safe.
+Idempotent: skips any component that already has a durable Stripe ID, and
+creates objects under deterministic idempotency keys, so a re-run is safe.
 """
 import argparse
 import sys
@@ -36,9 +36,10 @@ def main() -> int:
 	if not created:
 		print("provision_stripe_prices: no SKUs needed a new Stripe Price (all provisioned or FREE).")
 		return 0
-	for offer_code, price_id in created.items():
-		print(f"  {offer_code} -> {price_id}")
-	print(f"provision_stripe_prices: created {len(created)} Stripe Price object(s).")
+	for offer_code, components in created.items():
+		for component, price_id in components.items():
+			print(f"  {offer_code} ({component}) -> {price_id}")
+	print(f"provision_stripe_prices: created {sum(len(v) for v in created.values())} Stripe Price object(s).")
 	return 0
 
 

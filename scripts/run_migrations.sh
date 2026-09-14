@@ -93,6 +93,7 @@ MIGRATIONS=(
   apply_inbound_messages_sla
   apply_respond_routing_gaps
   apply_entitlements_billing
+  apply_stripe_price_provisioning
   apply_client_billing_account
   apply_ghost_shopper_reactivation
   apply_ghost_shopper_replies

@@ -1,32 +1,8 @@
-"""Provision real Stripe Price objects for the entitlement SKUs.
-
-Today every SKU in `entitlement_offers` has `stripe_price_id` NULL, so every
-charge is a one-off Stripe Invoice rather than a real Price/Subscription
-object. Populating `stripe_price_id` is blocked on the client confirming the
-final SKU/pricing catalog (Source of Truth open items O-02/O-03 — the
-12-product Stripe list and the $99-any-door vs $75-dead-book relationship are
-unresolved). This module is the wiring that runs *once that catalog is
-confirmed*: it creates a Stripe Product + Price for each SKU from the price
-already recorded on its `entitlement_offers` row and writes the resulting
-`stripe_price_id` back, idempotently.
-
-Fail-closed by design: `sync_offer_prices()` refuses to do anything unless
-the caller passes `catalog_confirmed=True`, because creating live Price
-objects from an unconfirmed catalog would bake in prices the client has not
-signed off on — exactly the guessing this repo forbids. It never overwrites a
-SKU that already has a `stripe_price_id`, and it creates Prices under a
-per-offer deterministic idempotency key so a re-run can't produce duplicate
-Stripe objects.
-
-Deliberately NOT part of settlement/gateway.py's StripeGateway ABC: that
-interface is scoped to the six money-moving calls charge.py is allowed to
-make. Creating a Price is catalog setup, not a charge, so it uses the shared
-Stripe client (payment_auth._stripe_client) directly.
-"""
+"""Provision durable Stripe Products and component Prices for entitlement SKUs."""
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import text
 
@@ -34,27 +10,32 @@ from src.core.database import get_system_db_context
 
 logger = logging.getLogger(__name__)
 
-# entitlement_offers.billing_model -> whether the Stripe Price recurs monthly.
-# METERED_EVENT (per-sit) and SUBSCRIPTION_MONTHLY recur; one-off packs and
-# FREE do not. FREE SKUs (price_cents = 0, e.g. appt_first) get no Price at
-# all — Stripe rejects a $0 recurring price and there is nothing to bill.
-_RECURRING_MODELS = {"SUBSCRIPTION_MONTHLY", "METERED_EVENT"}
-
 
 class CatalogNotConfirmedError(RuntimeError):
-	"""Raised when sync_offer_prices() is called without catalog_confirmed."""
+	"""Raised when sync_offer_prices() is called without catalog confirmation."""
 
 
-def sync_offer_prices(*, catalog_confirmed: bool = False) -> dict[str, str]:
-	"""Create a Stripe Price for every enabled SKU that lacks one and store
-	its id on entitlement_offers.stripe_price_id.
+def _components_for_offer(offer: dict[str, Any]) -> dict[str, int]:
+	model = offer["billing_model"]
+	base_cents = int(offer["price_cents"] or 0)
+	per_sit_cents = int(offer["per_sit_cents"] or 0)
+	if model == "FREE":
+		return {}
+	if model == "METERED_EVENT":
+		amount = per_sit_cents or base_cents
+		return {"metered": amount} if amount > 0 else {}
+	components = {"base": base_cents} if base_cents > 0 else {}
+	if per_sit_cents > 0:
+		components["metered"] = per_sit_cents
+	return components
 
-	Returns a mapping of offer_code -> newly-created stripe_price_id (only the
-	rows this run created). A SKU that already has a stripe_price_id, or is
-	FREE / zero-priced, is skipped.
 
-	Raises CatalogNotConfirmedError unless catalog_confirmed=True — the
-	operator asserting the client has signed off on O-02/O-03.
+def sync_offer_prices(*, catalog_confirmed: bool = False) -> dict[str, dict[str, str]]:
+	"""Create and persist each offer's base and/or metered Stripe Price.
+
+	Each product and price is committed immediately after creation, so a later
+	failure cannot roll back completed offers or the product reference needed to
+	resume the failed offer.
 	"""
 	if not catalog_confirmed:
 		raise CatalogNotConfirmedError(
@@ -66,61 +47,81 @@ def sync_offer_prices(*, catalog_confirmed: bool = False) -> dict[str, str]:
 	from src.services.payment_auth import _stripe_client
 
 	client = _stripe_client()
-	created: dict[str, str] = {}
-
+	created: dict[str, dict[str, str]] = {}
 	with get_system_db_context() as db:
 		rows = db.execute(
 			text(
 				"SELECT offer_code, display_name, price_cents, per_sit_cents, "
-				"       billing_model, stripe_price_id "
-				"FROM entitlement_offers "
-				"WHERE is_enabled = TRUE "
-				"ORDER BY offer_code"
+				"       billing_model, stripe_product_id, stripe_base_price_id, "
+				"       stripe_metered_price_id, stripe_price_id "
+				"FROM entitlement_offers WHERE is_enabled = TRUE ORDER BY offer_code"
 			)
 		).mappings().fetchall()
 
 		for row in rows:
-			if row["stripe_price_id"]:
-				continue  # already provisioned — never create a duplicate
-			price_id = _create_price_for_offer(client, dict(row))
-			if price_id is None:
-				continue  # FREE / zero-priced SKU — nothing to bill
-			db.execute(
-				text(
-					"UPDATE entitlement_offers SET stripe_price_id = :pid, updated_at = NOW() "
-					"WHERE offer_code = :code AND stripe_price_id IS NULL"
-				),
-				{"pid": price_id, "code": row["offer_code"]},
-			)
-			created[row["offer_code"]] = price_id
-			logger.info("stripe_prices: created price %s for offer %s", price_id, row["offer_code"])
-		db.commit()
+			offer = dict(row)
+			components = _components_for_offer(offer)
+			if not components:
+				continue
+			product_id = offer.get("stripe_product_id")
+			if not product_id:
+				product_id = _create_product(client, offer)
+				_persist_id(db, "stripe_product_id", product_id, offer["offer_code"])
+			for component, amount_cents in components.items():
+				column = f"stripe_{component}_price_id"
+				price_id = offer.get(column)
+				# Legacy IDs may seed a base price, but never satisfy a metered offer.
+				if not price_id and component == "base" and offer.get("stripe_price_id"):
+					price_id = offer["stripe_price_id"]
+					_persist_id(db, column, price_id, offer["offer_code"])
+				if price_id:
+					continue
+				price_id = _create_price(client, offer, product_id, component, amount_cents)
+				_persist_id(db, column, price_id, offer["offer_code"])
+				created.setdefault(offer["offer_code"], {})[component] = price_id
+				logger.info("stripe_prices: created %s price %s for offer %s", component, price_id, offer["offer_code"])
 
 	return created
 
 
-def _create_price_for_offer(client, offer: dict) -> Optional[str]:
-	"""Create one Stripe Price (and its Product) for a SKU. Returns the Price
-	id, or None for a SKU with nothing to bill (FREE / zero cents)."""
-	amount_cents = int(offer["price_cents"] or 0)
-	if offer["billing_model"] == "FREE" or amount_cents <= 0:
-		return None
-
-	# Deterministic idempotency key per offer, no timestamp — a re-run
-	# reuses it rather than creating a second Product/Price.
-	idem = f"entitlement-price|{offer['offer_code']}"
-
-	product = client.products.create(
-		params={"name": offer["display_name"], "metadata": {"offer_code": offer["offer_code"]}},
-		options={"idempotency_key": f"{idem}|product"},
+def _persist_id(db: Any, column: str, value: str, offer_code: str) -> None:
+	db.execute(
+		text(
+			f"UPDATE entitlement_offers SET {column} = :value, updated_at = NOW() "
+			"WHERE offer_code = :code AND " + column + " IS NULL"
+		),
+		{"value": value, "code": offer_code},
 	)
-	price_params = {
-		"product": product.id,
-		"currency": "usd",
-		"unit_amount": amount_cents,
-		"metadata": {"offer_code": offer["offer_code"]},
+	db.commit()
+
+
+def _create_product(client: Any, offer: dict[str, Any]) -> str:
+	return client.products.create(
+		params={"name": offer["display_name"], "metadata": {"offer_code": offer["offer_code"]}},
+		options={"idempotency_key": f"entitlement-price|{offer['offer_code']}|product"},
+	).id
+
+
+def _create_price(client: Any, offer: dict[str, Any], product_id: str, component: str, amount_cents: int) -> str:
+	params: dict[str, Any] = {
+		"product": product_id, "currency": "usd", "unit_amount": amount_cents,
+		"metadata": {"offer_code": offer["offer_code"], "component": component},
 	}
-	if offer["billing_model"] in _RECURRING_MODELS:
-		price_params["recurring"] = {"interval": "month"}
-	price = client.prices.create(params=price_params, options={"idempotency_key": f"{idem}|price"})
-	return price.id
+	if component == "metered":
+		params["recurring"] = {"interval": "month", "usage_type": "metered"}
+	elif offer["billing_model"] == "SUBSCRIPTION_MONTHLY":
+		params["recurring"] = {"interval": "month", "usage_type": "licensed"}
+	return client.prices.create(
+		params=params,
+		options={"idempotency_key": f"entitlement-price|{offer['offer_code']}|{component}|price"},
+	).id
+
+
+def _create_price_for_offer(client: Any, offer: dict[str, Any]) -> Optional[str]:
+	"""Compatibility seam for callers that imported the old helper."""
+	components = _components_for_offer(offer)
+	if not components:
+		return None
+	component, amount_cents = next(iter(components.items()))
+	product_id = _create_product(client, offer)
+	return _create_price(client, offer, product_id, component, amount_cents)
