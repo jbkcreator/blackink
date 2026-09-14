@@ -5,6 +5,7 @@ import SandboxDashboardPage from './pages/SandboxDashboardPage.jsx';
 import PipelineMetricsPage from './pages/PipelineMetricsPage.jsx';
 import MeetingOutcomesPage from './pages/MeetingOutcomesPage.jsx';
 import OVSLandingPage from './pages/OVSLandingPage.jsx';
+import PaymentAuthPage from './pages/PaymentAuthPage.jsx';
 import { auth } from './api/client.js';
 
 function RequireAuth() {
@@ -17,6 +18,7 @@ export default function App() {
       {/* Public */}
       <Route path="/login" element={<LoginPage />} />
       <Route path="/audit" element={<OVSLandingPage />} />
+      <Route path="/payment-auth" element={<PaymentAuthPage />} />
 
       {/* Internal dashboard — requires JWT */}
       <Route element={<RequireAuth />}>
