@@ -7,6 +7,7 @@ EventLogger (Task 1)."""
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Optional
 
@@ -15,6 +16,8 @@ from sqlalchemy import text
 from src.core.database import get_db_context
 from src.services.events import log_event
 from src.services.meeting_attendance_proof import get_attendance_provider
+
+logger = logging.getLogger(__name__)
 
 _VALID_ATTENDANCE = {"Held", "No-Show", "Rescheduled"}
 
@@ -47,7 +50,14 @@ def record_outcome(
                 meeting_occurred_at=meeting_occurred_at,
             )
         except Exception:
-            proof = None  # proof capture is best-effort; never blocks the outcome write
+            # Best-effort: proof capture never blocks the outcome write. Logged
+            # (not silent) so a real conference provider failing is visible
+            # rather than looking identical to "no conference record".
+            logger.warning(
+                "meeting_outcomes: attendance-proof fetch failed for client=%s contact=%s — recording outcome without proof",
+                client_id, contact_id, exc_info=True,
+            )
+            proof = None
 
     with get_db_context(client_id=client_id) as session:
         session.execute(
