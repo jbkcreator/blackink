@@ -74,6 +74,7 @@ PYTHONPATH=. python migrations/apply_knowledge_base.py  # Subtask 2.1.3 — KB A
 PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
 PYTHONPATH=. python migrations/apply_stripe_price_provisioning.py  # durable Stripe Product/base/metered Price references; after apply_entitlements_billing.py
 PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
+PYTHONPATH=. python migrations/apply_appointment_attendance_proof.py  # Week-2 audit fix — appointments.proof_ref/attended_duration_seconds fail-closed guard against over-billing on is_billable alone; extends the billing_blocked_reason CHECK constraint, so MUST run after apply_client_billing_account.py (that column doesn't exist before it), before RLS
 PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py  # re-adds ghost_submitted_at + ghost_work_order_id to contacts (Ghost Shopper reactivated); before RLS
 PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py       # audit log for IMAP listener inbound replies + timeouts; not tenant-bearing, no RLS
 PYTHONPATH=. python migrations/apply_ghost_form_submissions.py      # node-level idempotency for fill_and_submit (prevents double form POST on retry); not tenant-bearing, no RLS

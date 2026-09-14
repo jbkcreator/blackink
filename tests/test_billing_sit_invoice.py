@@ -15,6 +15,12 @@ class _Row:
 	def __init__(self, **kw):
 		kw.setdefault("stripe_invoice_id", None)
 		kw.setdefault("sit_invoice_finalized_at", None)
+		# Every existing test in this file predates the attendance-proof
+		# gate and exercises unrelated behavior (Stripe retry/reconciliation
+		# paths) — default proof_ref to a truthy placeholder so those tests
+		# keep reaching the code they actually test. Tests for the gate
+		# itself pass proof_ref=None explicitly.
+		kw.setdefault("proof_ref", "prf_default_for_pre_existing_tests")
 		self.__dict__.update(kw)
 
 
@@ -59,6 +65,10 @@ class _FakeSession:
 			self.updates.append(("block", params))
 			self._appointment_row.billing_blocked_reason = "NO_STRIPE_CUSTOMER"
 			return None
+		if "UPDATE appointments SET billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF'" in sql:
+			self.updates.append(("block_no_proof", params))
+			self._appointment_row.billing_blocked_reason = "MISSING_ATTENDANCE_PROOF"
+			return None
 		if "UPDATE appointments SET stripe_invoice_id" in sql:
 			self.updates.append(("set_invoice_id", params))
 			self._appointment_row.stripe_invoice_id = params["invoice_id"]
@@ -82,6 +92,43 @@ class _FakeSession:
 				self.savepoint_depth -= 1
 
 		return _cm()
+
+
+def test_blocked_when_appointment_has_no_proof_ref():
+	"""Week-2 implementation audit (2026-09-14) fail-closed guard: an
+	ATTENDED, is_billable appointment with no attendance-duration evidence
+	must be blocked BEFORE any Stripe call, not invoiced on is_billable
+	alone. Checked ahead of the stripe_customer_id gate — a row with
+	neither should report the attendance-proof reason first, since that is
+	the more fundamental "should this be billed at all" question."""
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None,
+		stripe_customer_id="cus_1", proof_ref=None,
+	)
+	session = _FakeSession(row)
+	gw = _FakeGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "MISSING_ATTENDANCE_PROOF"
+	assert session.updates[0] == ("block_no_proof", {"client_id": "acme_pm", "appointment_id": "appt-1"})
+	assert gw.calls == []
+
+
+def test_proof_ref_present_reaches_stripe_customer_check_normally(monkeypatch):
+	"""The gate must not block a row that DOES have proof_ref — confirms
+	the guard is additive, not a regression on the normal (still
+	client-blocked-on-Stripe-identity) path."""
+	row = _Row(is_billable=True, billed_offer_code=None, billed_amount_cents=None, stripe_customer_id=None, proof_ref="prf_real")
+	session = _FakeSession(row)
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=_FakeGateway(),
+	)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "NO_STRIPE_CUSTOMER"
 
 
 def test_blocked_when_client_has_no_stripe_customer_id():
