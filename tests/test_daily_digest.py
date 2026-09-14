@@ -109,6 +109,13 @@ def test_metrics_sql_open_click_reply_rate_wired_to_real_events_with_nullif_guar
     assert "event_type = 'email_clicked'" in _METRICS_SQL
     assert "event_type = 'email_replied'" in _METRICS_SQL
     # Divide-by-zero guard on the dispatched denominator, for all three rates.
-    assert _METRICS_SQL.count("NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched'") >= 3
+    assert _METRICS_SQL.count("NULLIF((SELECT COUNT(*) FROM dispatch_cohort), 0)") == 3
     for col in ("open_rate_pct", "click_rate_pct", "reply_rate_pct"):
         assert f"AS {col}" in _METRICS_SQL
+
+
+def test_metrics_sql_uses_dispatch_time_cohort_for_engagement_events():
+    assert "dispatch_cohort" in _METRICS_SQL
+    assert "JOIN dispatch_cohort" in _METRICS_SQL
+    assert "d.dispatch_id = e.payload->>'dispatch_id'" in _METRICS_SQL
+    assert "d.created_at" not in _METRICS_SQL

@@ -23,6 +23,7 @@ from sqlalchemy import text
 from src.core.database import get_system_db_context
 from src.core.demo_clients import DEMO_CLIENT_IDS
 from src.services.events import flush_pending
+from src.services.metrics_query import METRICS_SQL
 from src.services.slack.post import post_notice
 
 logger = logging.getLogger(__name__)
@@ -78,37 +79,7 @@ _WINDOW = timedelta(hours=24)
 # emails / 20 appointments that were entirely sandbox noise, zero real
 # activity. Hardcoded literal, matching the same string already hardcoded
 # in apply_sandbox_dashboard_view.py's WHERE clause.
-_METRICS_SQL = """
-    SELECT
-        COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
-        COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
-        COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        -- Engagement rates over the cold-email denominator (dispatched with
-        -- channel='email'). Producers now exist: email_opened/email_clicked
-        -- (src/api/email_tracking_router.py, pixel + click redirect) and
-        -- email_replied (src/services/inbound_ingest.py, Tier-1 message-id
-        -- attributed reply only) — all deduped per dispatch_id
-        -- (events.DISPATCH_DEDUPED_EVENT_TYPES + the partial unique index),
-        -- so each COUNT is unique-per-send. NULLIF makes the rate NULL (→
-        -- "n/a" via fmt()) when nothing was dispatched in the window, rather
-        -- than a misleading 0%; once sends exist, an untracked open reads a
-        -- true 0.0%.
-        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_opened')
-              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS open_rate_pct,
-        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_clicked')
-              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS click_rate_pct,
-        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_replied')
-              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS reply_rate_pct,
-        COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
-    FROM events
-    WHERE created_at >= NOW() - :window
-      AND client_id <> ALL(:demo_client_ids)
-"""
-# No numeric-cast regex guards are needed here (unlike the old
-# avg_response_latency_sec/video_completion_rate_pct columns) — every
-# expression above is either a plain COUNT or a division of two COUNTs,
-# neither of which can fail on a malformed payload value the way a
-# `(payload->>'x')::numeric` cast on an arbitrary string could.
+_METRICS_SQL = METRICS_SQL
 
 
 def _query_metrics() -> dict:

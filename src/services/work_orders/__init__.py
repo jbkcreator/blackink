@@ -31,6 +31,7 @@ from typing import Optional
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from src.core.database import get_db_context, get_system_db_context
 from src.services.slack import payload_hash as _hash
@@ -131,6 +132,7 @@ def enqueue(
 	opportunity_id: Optional[str] = None,
 	confidence_score: Optional[Decimal] = None,
 	due_at: Optional[datetime] = None,
+	session: Optional[Session] = None,
 ) -> WorkOrder:
 	"""Write a new QUEUED row. If (client_id, idempotency_key) already
 	exists, returns the existing row instead of raising or duplicating —
@@ -149,6 +151,57 @@ def enqueue(
 			config_fingerprint=config_fingerprint,
 		)
 	)  # type: ignore[arg-type]
+	if session is not None:
+		try:
+			with session.begin_nested():
+				session.execute(
+					text(
+						f"""
+						INSERT INTO agent_work_orders
+							(action_id, client_id, entity_type, entity_id, opportunity_id,
+							 agent_id, action_class, autonomy_band, risk_class,
+							 confidence_score, recipient, payload, config_fingerprint,
+							 payload_hash, hash_version, idempotency_key, due_at)
+						VALUES
+							(:action_id, :client_id, :entity_type, :entity_id, :opportunity_id,
+							 :agent_id, :action_class, :autonomy_band, :risk_class,
+							 :confidence_score, :recipient, :payload, :config_fingerprint,
+							 :payload_hash, :hash_version, :idempotency_key, :due_at)
+						"""
+					),
+					{
+						"action_id": action_id, "client_id": client_id,
+						"entity_type": entity_type, "entity_id": entity_id,
+						"opportunity_id": opportunity_id, "agent_id": agent_id,
+						"action_class": action_class, "autonomy_band": autonomy_band,
+						"risk_class": risk_class, "confidence_score": confidence_score,
+						"recipient": recipient, "payload": json.dumps(payload),
+						"config_fingerprint": json.dumps(config_fingerprint),
+						"payload_hash": digest, "hash_version": _hash.HASH_VERSION,
+						"idempotency_key": idempotency_key, "due_at": due_at,
+					},
+				)
+		except IntegrityError:
+			row = session.execute(
+				text(
+					"SELECT " + _COLUMNS_SQL + " FROM agent_work_orders "
+					"WHERE client_id = :client_id AND idempotency_key = :idempotency_key"
+				),
+				{"client_id": client_id, "idempotency_key": idempotency_key},
+			).mappings().first()
+			if row is not None:
+				return _row_to_order(dict(row))
+			raise
+
+		row = session.execute(
+			text(
+				"SELECT " + _COLUMNS_SQL + " FROM agent_work_orders "
+				"WHERE action_id = :action_id AND client_id = :client_id"
+			),
+			{"action_id": action_id, "client_id": client_id},
+		).mappings().first()
+		assert row is not None
+		return _row_to_order(dict(row))
 
 	try:
 		with get_db_context(client_id=client_id) as session:

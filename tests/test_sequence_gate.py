@@ -211,3 +211,54 @@ def test_enroll_contact_skips_touch2_dial(monkeypatch):
     assert steps == [1, 3, 4, 5]
     assert "DIAL_TASK" not in classes
     assert "LINKEDIN_TASK" in classes
+
+
+def test_enroll_contact_rolls_back_run_and_touches_as_one_savepoint(monkeypatch):
+    """A failed touch insert must not strand the ACTIVE sequence run."""
+    import src.services.sequence_enrollment as se
+    import src.services.work_orders as wo
+    import src.services.campaign_readiness_gate as crg
+
+    monkeypatch.setattr(se, "may_enroll", lambda contact_id: True)
+    monkeypatch.setattr(crg, "evaluate_full_readiness", lambda *args, **kwargs: None)
+
+    class Savepoint:
+        def __init__(self):
+            self.exc_type = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            self.exc_type = exc_type
+            return False
+
+    savepoints = []
+
+    class Session:
+        def begin_nested(self):
+            savepoint = Savepoint()
+            savepoints.append(savepoint)
+            return savepoint
+
+        def execute(self, *args, **kwargs):
+            return SimpleNamespace()
+
+    session = Session()
+    calls = []
+
+    def enqueue(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 3:
+            raise RuntimeError("third touch insert failed")
+        return SimpleNamespace(action_id=f"a-{len(calls)}")
+
+    monkeypatch.setattr(wo, "enqueue", enqueue)
+
+    with pytest.raises(RuntimeError, match="third touch insert failed"):
+        se.enroll_contact(session, "acme", 7, "p@x.com")
+
+    assert len(savepoints) == 2
+    assert savepoints[0].exc_type is RuntimeError
+    assert savepoints[1].exc_type is None
+    assert all(call["session"] is session for call in calls)

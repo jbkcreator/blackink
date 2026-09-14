@@ -16,31 +16,13 @@ from sqlalchemy import text
 from src.api.deps import require_admin_jwt
 from src.core.database import get_system_db_context
 from src.core.demo_clients import DEMO_CLIENT_IDS
+from src.services.metrics_query import METRICS_SQL
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"], dependencies=[Depends(require_admin_jwt)])
 
 _WINDOW = timedelta(hours=24)
 
-_METRICS_SQL = """
-    SELECT
-        COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
-        COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
-        COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        -- Engagement rates over the cold-email denominator — producers exist
-        -- (email_tracking_router.py, inbound_ingest.py), deduped per
-        -- dispatch_id. NULLIF → "n/a" when nothing dispatched. See
-        -- src/tasks/daily_digest.py's identical block for the full rationale.
-        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_opened')
-              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS open_rate_pct,
-        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_clicked')
-              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS click_rate_pct,
-        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_replied')
-              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS reply_rate_pct,
-        COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
-    FROM events
-    WHERE created_at >= NOW() - :window
-      AND client_id <> ALL(:demo_client_ids)
-"""
+_METRICS_SQL = METRICS_SQL
 
 
 @router.get("/digest")

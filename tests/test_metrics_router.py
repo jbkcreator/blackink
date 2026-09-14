@@ -27,7 +27,13 @@ def test_metrics_sql_open_click_reply_rate_wired_to_real_events_with_nullif_guar
     assert "event_type = 'email_opened'" in _METRICS_SQL
     assert "event_type = 'email_clicked'" in _METRICS_SQL
     assert "event_type = 'email_replied'" in _METRICS_SQL
-    assert _METRICS_SQL.count("NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched'") >= 3
+    assert _METRICS_SQL.count("NULLIF((SELECT COUNT(*) FROM dispatch_cohort), 0)") == 3
+
+
+def test_metrics_router_reuses_dispatch_cohort_query():
+    from src.tasks.daily_digest import _METRICS_SQL as digest_sql
+
+    assert _METRICS_SQL == digest_sql
 
 
 def test_metrics_sql_excludes_the_demo_sandbox_client():
