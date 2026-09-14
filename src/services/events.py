@@ -55,6 +55,12 @@ REQUIRED_PAYLOAD_FIELDS: dict[str, frozenset] = {
 	"meeting_outcome_recorded": frozenset(
 		{"attendance_status", "pm_software", "door_count_est", "objections", "next_action"}
 	),
+	# Subtask 2.2.1 — Fee-Stack One-Pager. Success counterpart to the
+	# already-registered fee_stack_generation_failed: emitted by
+	# src/agents/ink/nodes.py::node_fee_stack once the PDF is compiled and
+	# stored, so a generated one-pager is provable in the ledger rather than
+	# only its failures being visible.
+	"fee_stack_pdf_generated": frozenset({"company_id", "fee_stack_url"}),
 	# Subtask 1.2.1 — Zero-Deposit Card Auth & ACH Mandate Capture.
 	"payment_auth_completed": frozenset({"stripe_customer_id", "offer_code"}),
 	"payment_auth_failed": frozenset({"error_code", "error_message", "offer_code"}),

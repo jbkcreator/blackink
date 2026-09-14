@@ -41,6 +41,13 @@
 # into canonical owner_entities via rapidfuzz clustering.
 0 2 * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m src.tasks.hunter_nightly_sweep >> /root/blackink/logs/hunter_nightly_sweep.log 2>&1
 
+# ── Cold-sequence enrollment sweep (all active clients) ──────────────────
+# Every 15 min. Enrolls eligible promoted prospects (allocated, email
+# VERIFIED, not opted out, no active run) into the 5-touch cold sequence —
+# the production trigger that feeds the approval/dispatch chain below.
+# Per-client, RLS-scoped; see scripts/cron_enrollment_sweep_all_clients.py.
+*/15 * * * * cd /root/blackink && PYTHONPATH=/root/blackink /root/blackink/venv/bin/python3 -m scripts.cron_enrollment_sweep_all_clients >> /root/blackink/logs/enrollment_sweep.log 2>&1
+
 # ── Cold-sequence approval-card sweep ────────────────────────────────────
 # Every 5 min. Posts Slack approval cards for due QUEUED email-touch orders
 # in agent_work_orders — a card-less due row is never surfaced to a human.

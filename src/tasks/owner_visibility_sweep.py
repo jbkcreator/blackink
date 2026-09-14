@@ -22,6 +22,7 @@ import sys
 from datetime import datetime, timezone
 
 from src.core.database import get_system_db_context
+from src.services.events import log_event
 from src.services.owner_visibility.county_rank import calculate_county_ranks
 from src.services.owner_visibility.score_calculator import calculate_score
 from src.services.owner_visibility.signals.website import WebsiteSignalProvider
@@ -230,39 +231,41 @@ def _update_county_ranks(month_key: str) -> None:
                     },
                 )
 
-            # Log owner_score_generated event per firm that has an owning client.
-            # Unallocated prospects (owning_client_id IS NULL) are skipped — there
-            # is no client to log under. Event payload carries score_total,
-            # county_slug, data_coverage_pct, county_rank, and the top-3 peer
-            # comparisons so the daily digest and alert jobs can read them without
-            # re-joining owner_visibility_scores.
+            # Log owner_visibility_score_calculated event per firm that has an
+            # owning client. Unallocated prospects (owning_client_id IS NULL)
+            # are skipped — there is no client to log under. Written through
+            # log_event() (sharing this sweep's own system-role session) rather
+            # than a raw INSERT so the required-field contract is validated at
+            # write time — the earlier raw INSERT emitted 'owner_score_generated',
+            # a name no consumer read (daily_digest.py / metrics_router.py /
+            # the REQUIRED_PAYLOAD_FIELDS registry all key on
+            # 'owner_visibility_score_calculated'), and because it bypassed
+            # log_event() nothing caught the drift. Payload carries score_total,
+            # county_slug, data_coverage_pct, county_rank (required), plus the
+            # percentile / publication flag / top-3 peers so the daily digest
+            # and alert jobs can read them without re-joining
+            # owner_visibility_scores.
             for row in ranked:
                 client_id = row.get("owning_client_id")
                 if not client_id:
                     continue
-                event_payload = json.dumps({
-                    "score_total":       row["score_total"],
-                    "county_slug":       county_slug,
-                    "data_coverage_pct": row["data_coverage_pct"],
-                    "county_rank":       row["county_rank"],
-                    "county_percentile": row["county_percentile"],
-                    "is_published":      row.get("is_published", False),
-                    "peer_comparisons":  row["peer_comparisons"][:3],
-                    "month_key":         month_key,
-                })
-                db.execute(
-                    text(
-                        "INSERT INTO events "
-                        "  (client_id, event_type, entity_type, entity_id, payload, actor) "
-                        "VALUES "
-                        "  (:client_id, 'owner_score_generated', "
-                        "   'company', :company_id, :payload ::jsonb, 'owner_visibility_sweep')"
-                    ),
-                    {
-                        "client_id":  client_id,
-                        "company_id": row["company_id"],
-                        "payload":    event_payload,
+                log_event(
+                    client_id,
+                    "owner_visibility_score_calculated",
+                    entity_type="company",
+                    entity_id=row["company_id"],
+                    payload={
+                        "score_total":       row["score_total"],
+                        "county_slug":       county_slug,
+                        "data_coverage_pct": row["data_coverage_pct"],
+                        "county_rank":       row["county_rank"],
+                        "county_percentile": row["county_percentile"],
+                        "is_published":      row.get("is_published", False),
+                        "peer_comparisons":  row["peer_comparisons"][:3],
+                        "month_key":         month_key,
                     },
+                    actor="owner_visibility_sweep",
+                    session=db,
                 )
 
             logger.info(

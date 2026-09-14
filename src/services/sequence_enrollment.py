@@ -100,84 +100,60 @@ def enroll_contact(
         logger.info("enroll_contact: contact_id=%s already in active sequence", contact_id)
         return None
 
-    # Stamp compliance_eligibility before creating the run so
-    # _check_deterministic_columns has a real value to read at dispatch time.
-    # evaluate_full_readiness also writes dnc_clean/dnc_checked_at if a live
-    # provider is wired and the contact hasn't been through the monthly batch.
-    # Imported here (not at module level) to avoid a circular import — this
-    # module is imported by campaign_readiness_gate indirectly via compliance_gate.
-    from src.services.campaign_readiness_gate import evaluate_full_readiness
-    evaluate_full_readiness(session, contact_id, client_id)
-
     now = enrolled_at or datetime.now(timezone.utc)
-
-    # may_enroll runs on a separate (system) connection, so between that read
-    # and this INSERT a second client can enroll the same contact. The partial
-    # unique index uq_sequence_runs_one_active is the real backstop — catch its
-    # violation and return None rather than crashing the loser of the race.
     run_id = str(uuid.uuid4())
-    try:
-        with session.begin_nested():
-            session.execute(
-                text(
-                    "INSERT INTO sequence_runs (run_id, client_id, contact_id, status, enrolled_at) "
-                    "VALUES (:run_id, :client_id, :contact_id, 'ACTIVE', :now)"
-                ),
-                {"run_id": run_id, "client_id": client_id, "contact_id": contact_id, "now": now},
-            )
-    except IntegrityError:
-        logger.info(
-            "enroll_contact: contact_id=%s enrolled concurrently by another client — losing the race",
-            contact_id,
-        )
-        return None
 
-    for touch_step, day_offset in _TOUCH_DAY_OFFSETS.items():
-        # Touch 2 (dial) is NOT enqueued here — it is posted event-driven the
-        # instant Touch 1 is approved (60s call-while-hot SLA), keyed
-        # seq:{run_id}:touch:2 by _post_dial_task_after_touch1_approval. See
-        # docs/adr/0001-non-email-touch-posting-model.md. Enqueuing it upfront
-        # would create an orphan the sweep never posts.
-        if touch_step == 2:
-            continue
-        due_at = now + timedelta(days=day_offset)
-        is_email = touch_step in _EMAIL_TOUCH_STEPS
-        # Touch 2 is `continue`d above (event-driven dial post, ADR 0001), so
-        # only email vs LinkedIn is decided here.
-        action_class = (
-            "DISPATCH_EMAIL_TOUCH" if is_email
-            else "LINKEDIN_TASK"
-        )
-        # config_fingerprint["channel"] selects the EXECUTION dispatcher (see
-        # work_orders/dispatchers.py DISPATCHERS). Email touches run the real
-        # send path ("setter"); phone/LinkedIn are human-performed and run the
-        # "manual" dispatcher that only records completion (finding #4) — so an
-        # approved DIAL_TASK is never fed to the email sender.
-        channel = "setter" if is_email else "manual"
-        payload = {"run_id": run_id, "touch_step": touch_step}
-        # Email touches must carry approved subject/body/template_version — the
-        # dispatcher is fail-closed on missing content (returns NO_CONTENT).
-        # Persist the approved copy now so the touch is deliverable end to end.
-        if is_email:
-            subject, body, template_version = render_touch(
-                touch_step, first_name=first_name, company_name=company_name
+    # Keep the run and every touch order in one savepoint. A partial sequence
+    # must never become ACTIVE and disappear from future enrollment sweeps.
+    from src.services.campaign_readiness_gate import evaluate_full_readiness
+    with session.begin_nested():
+        try:
+            with session.begin_nested():
+                session.execute(
+                    text(
+                        "INSERT INTO sequence_runs (run_id, client_id, contact_id, status, enrolled_at) "
+                        "VALUES (:run_id, :client_id, :contact_id, 'ACTIVE', :now)"
+                    ),
+                    {"run_id": run_id, "client_id": client_id, "contact_id": contact_id, "now": now},
+                )
+        except IntegrityError:
+            logger.info(
+                "enroll_contact: contact_id=%s enrolled concurrently by another client — losing the race",
+                contact_id,
             )
-            payload.update(subject=subject, body=body, template_version=template_version)
-        idempotency_key = f"seq:{run_id}:touch:{touch_step}"
-        wo.enqueue(
-            client_id=client_id,
-            entity_type="contact",
-            entity_id=str(contact_id),
-            agent_id="cold_outbound_sequencer",
-            action_class=action_class,
-            autonomy_band=resolve_band(client_id, action_class, touch_step=touch_step if is_email else 0),
-            risk_class="LOW",
-            recipient=contact_email,
-            payload=payload,
-            config_fingerprint={"channel": channel, "run_id": run_id, "touch_step": touch_step},
-            idempotency_key=idempotency_key,
-            due_at=due_at,
-        )
+            return None
+
+        evaluate_full_readiness(session, contact_id, client_id)
+
+        for touch_step, day_offset in _TOUCH_DAY_OFFSETS.items():
+            if touch_step == 2:
+                continue
+            due_at = now + timedelta(days=day_offset)
+            is_email = touch_step in _EMAIL_TOUCH_STEPS
+            action_class = "DISPATCH_EMAIL_TOUCH" if is_email else "LINKEDIN_TASK"
+            channel = "setter" if is_email else "manual"
+            payload = {"run_id": run_id, "touch_step": touch_step}
+            if is_email:
+                subject, body, template_version = render_touch(
+                    touch_step, first_name=first_name, company_name=company_name
+                )
+                payload.update(subject=subject, body=body, template_version=template_version)
+            idempotency_key = f"seq:{run_id}:touch:{touch_step}"
+            wo.enqueue(
+                client_id=client_id,
+                entity_type="contact",
+                entity_id=str(contact_id),
+                agent_id="cold_outbound_sequencer",
+                action_class=action_class,
+                autonomy_band=resolve_band(client_id, action_class, touch_step=touch_step if is_email else 0),
+                risk_class="LOW",
+                recipient=contact_email,
+                payload=payload,
+                config_fingerprint={"channel": channel, "run_id": run_id, "touch_step": touch_step},
+                idempotency_key=idempotency_key,
+                due_at=due_at,
+                session=session,
+            )
 
     logger.info(
         "enroll_contact: enrolled contact_id=%s client_id=%s run_id=%s",

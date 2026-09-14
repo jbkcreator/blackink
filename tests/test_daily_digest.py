@@ -96,18 +96,26 @@ def test_metrics_sql_county_rank_reports_uses_county_slug_not_county():
     assert "payload->>'county'" not in _METRICS_SQL.replace("payload->>'county_slug'", "")
 
 
-def test_metrics_sql_open_click_reply_rate_are_null_not_a_fabricated_zero():
-    """Group D / D-4: email_opened/email_clicked/email_replied have no
-    producer anywhere in this codebase (S-8 is not built). A real division
-    here would compute a mathematically correct but misleading 0% —
-    "confirmed zero engagement" rather than "not tracked". These three
-    columns must be a literal NULL (which build_digest_text's fmt() renders
-    as "n/a"), and the query must not FILTER on the unwritten event names as
-    an event_type — once S-8 lands, restore the real per-event computation
-    here. (The names may still appear in an explanatory SQL comment.)"""
-    assert "NULL::numeric AS open_rate_pct" in _METRICS_SQL
-    assert "NULL::numeric AS click_rate_pct" in _METRICS_SQL
-    assert "NULL::numeric AS reply_rate_pct" in _METRICS_SQL
-    assert "event_type = 'email_opened'" not in _METRICS_SQL
-    assert "event_type = 'email_clicked'" not in _METRICS_SQL
-    assert "event_type = 'email_replied'" not in _METRICS_SQL
+def test_metrics_sql_open_click_reply_rate_wired_to_real_events_with_nullif_guard():
+    """S-8 producers now exist (email_tracking_router.py writes email_opened/
+    email_clicked; inbound_ingest.py writes email_replied, all deduped per
+    dispatch_id), so the three engagement rates are computed as real
+    divisions over the cold-email denominator rather than a literal NULL.
+    NULLIF(..., 0) keeps the rate NULL (→ "n/a" via fmt()) when nothing was
+    dispatched in the window, so an empty window never reads a misleading 0%;
+    once sends exist, an untracked open reads a true 0.0%."""
+    assert "NULL::numeric AS open_rate_pct" not in _METRICS_SQL
+    assert "event_type = 'email_opened'" in _METRICS_SQL
+    assert "event_type = 'email_clicked'" in _METRICS_SQL
+    assert "event_type = 'email_replied'" in _METRICS_SQL
+    # Divide-by-zero guard on the dispatched denominator, for all three rates.
+    assert _METRICS_SQL.count("NULLIF((SELECT COUNT(*) FROM dispatch_cohort), 0)") == 3
+    for col in ("open_rate_pct", "click_rate_pct", "reply_rate_pct"):
+        assert f"AS {col}" in _METRICS_SQL
+
+
+def test_metrics_sql_uses_dispatch_time_cohort_for_engagement_events():
+    assert "dispatch_cohort" in _METRICS_SQL
+    assert "JOIN dispatch_cohort" in _METRICS_SQL
+    assert "d.dispatch_id = e.payload->>'dispatch_id'" in _METRICS_SQL
+    assert "d.created_at" not in _METRICS_SQL

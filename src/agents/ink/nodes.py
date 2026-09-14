@@ -16,6 +16,7 @@ from typing import Any
 from langgraph.types import interrupt
 
 from src.agents.ink.state import GlobalState, InkStage
+from src.services.events import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +267,13 @@ def node_fee_stack(state: GlobalState) -> dict:
         logger.info(
             "ink.nodes: fee_stack complete — company_id=%s size=%d url=%s",
             state["company_id"], len(pdf_bytes), fee_stack_url,
+        )
+        log_event(
+            client_id=state["client_id"],
+            event_type="fee_stack_pdf_generated",
+            entity_type="work_order",
+            entity_id=state["work_order_id"],
+            payload={"company_id": state["company_id"], "fee_stack_url": fee_stack_url},
         )
         return {"fee_stack_url": fee_stack_url}
 

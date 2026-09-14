@@ -96,6 +96,54 @@ class TestRunSweep:
         assert count == 0
 
 
+# ── event emission (regression: name must match the consumer/registry) ────────
+
+class TestScoreEventEmission:
+    """The sweep emits the OVS score event via log_event() under the canonical
+    name 'owner_visibility_score_calculated' — the exact string the event
+    registry, daily_digest.py and metrics_router.py all read. A prior version
+    emitted 'owner_score_generated' via a raw INSERT that bypassed log_event()
+    validation, so the digest's scores_generated / county_rank_reports_delivered
+    read 0 permanently. This guards against that drift returning."""
+
+    def test_emits_canonical_event_name_via_log_event(self):
+        ranked = [{
+            "score_id": 1,
+            "company_id": "abc123",
+            "company_name": "Test PM LLC",
+            "score_total": 42,
+            "data_coverage_pct": 60,
+            "county_rank": 1,
+            "county_percentile": 100,
+            "is_published": True,
+            "peer_comparisons": [],
+            "owning_client_id": "client-1",
+        }]
+
+        fake_db = MagicMock()
+        fake_db.__enter__ = MagicMock(return_value=fake_db)
+        fake_db.__exit__ = MagicMock(return_value=False)
+        # First fetchall → county_slugs; second → raw_rows (unused, ranking is patched).
+        fake_db.execute.return_value.fetchall.side_effect = [[("hillsborough_fl",)], []]
+
+        with patch("src.tasks.owner_visibility_sweep.get_system_db_context", return_value=fake_db), \
+             patch("src.tasks.owner_visibility_sweep.calculate_county_ranks", return_value=ranked), \
+             patch("src.tasks.owner_visibility_sweep.log_event") as mock_log_event:
+
+            from src.tasks.owner_visibility_sweep import _update_county_ranks
+            _update_county_ranks("2026-09")
+
+        assert mock_log_event.call_count == 1
+        args, kwargs = mock_log_event.call_args
+        assert args[1] == "owner_visibility_score_calculated"
+        assert args[0] == "client-1"
+        assert kwargs["session"] is fake_db
+        # Required-field contract for this event (events.REQUIRED_PAYLOAD_FIELDS).
+        for field in ("score_total", "county_slug", "data_coverage_pct", "county_rank"):
+            assert field in kwargs["payload"]
+        assert kwargs["payload"]["county_slug"] == "hillsborough_fl"
+
+
 # ── score_one_company (Subtask 3.2.3 extraction) ──────────────────────────────
 
 class TestScoreOneCompany:

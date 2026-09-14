@@ -23,6 +23,7 @@ from sqlalchemy import text
 from src.core.database import get_system_db_context
 from src.core.demo_clients import DEMO_CLIENT_IDS
 from src.services.events import flush_pending
+from src.services.metrics_query import METRICS_SQL
 from src.services.slack.post import post_notice
 
 logger = logging.getLogger(__name__)
@@ -78,30 +79,7 @@ _WINDOW = timedelta(hours=24)
 # emails / 20 appointments that were entirely sandbox noise, zero real
 # activity. Hardcoded literal, matching the same string already hardcoded
 # in apply_sandbox_dashboard_view.py's WHERE clause.
-_METRICS_SQL = """
-    SELECT
-        COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
-        COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
-        COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        -- Group D / D-4: email_opened/email_clicked/email_replied have no
-        -- producer anywhere in this codebase (S-8, open/click/reply
-        -- tracking, is not built). A real division here would compute a
-        -- mathematically correct but misleading 0% — "confirmed zero
-        -- engagement" rather than "not tracked". NULL renders as "n/a" via
-        -- fmt() below. Replace with the real division once S-8 lands.
-        NULL::numeric AS open_rate_pct,
-        NULL::numeric AS click_rate_pct,
-        NULL::numeric AS reply_rate_pct,
-        COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
-    FROM events
-    WHERE created_at >= NOW() - :window
-      AND client_id <> ALL(:demo_client_ids)
-"""
-# No numeric-cast regex guards are needed here (unlike the old
-# avg_response_latency_sec/video_completion_rate_pct columns) — every
-# expression above is either a plain COUNT or a division of two COUNTs,
-# neither of which can fail on a malformed payload value the way a
-# `(payload->>'x')::numeric` cast on an arbitrary string could.
+_METRICS_SQL = METRICS_SQL
 
 
 def _query_metrics() -> dict:
