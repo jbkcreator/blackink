@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 
 from config.settings import get_settings
 from src.core.database import get_system_db_context
-from src.services.address_normalize import normalize_address
+from src.services.address_normalize import build_address_match_key, normalize_address, split_street_city_state_zip
 from src.services.email_suppression import _normalize_phone
 from src.services.events import log_event
 
@@ -125,8 +125,10 @@ class AssessorProvider(ABC):
 	@abstractmethod
 	def check_still_owns(self, county_slug: str, address: str, owner_name: str) -> Optional[bool]:
 		"""True (name matches roll), False (name mismatch — confirmed sold),
-		or None (no parcel found for this address/county — unknown, not a
-		sale)."""
+		or None — no parcel found for this address/county (unknown, not a
+		sale), OR `address` didn't parse as "STREET, CITY, ST[ ZIP]" (see
+		StagingTableAssessorProvider — matching requires city+zip, not just
+		street, to avoid a same-street-name-different-city collision)."""
 
 
 class StagingTableAssessorProvider(AssessorProvider):
@@ -141,13 +143,29 @@ class StagingTableAssessorProvider(AssessorProvider):
 	off the current roll) must never answer an ownership question with a
 	stale owner name, and an ineligible parcel (government/commercial/
 	vacant/etc — see mapping.py's per-county allowlist) was never a
-	Win-Back target to begin with."""
+	Win-Back target to begin with.
+
+	`address` must be "STREET, CITY, ST[ ZIP]" (parsed via
+	split_street_city_state_zip) — matching on street alone was a real bug
+	found against production data: the same street name recurs across
+	different cities/zips within one county, so a street-only key can
+	silently collide between two unrelated parcels. `address` in any other
+	format never reaches the database at all and returns None immediately —
+	never a guessed street-only match, matching this repo's own "never
+	guess" posture elsewhere (compliance_gate's ABSTAIN, the OVS engine's
+	MISSING_DATA). This does mean a client CSV address with no city
+	(a bare street) can no longer match at all; that's an accepted
+	trade-off for eliminating the collision risk, not an oversight."""
 
 	def __init__(self, session: Session):
 		self._session = session
 
 	def check_still_owns(self, county_slug: str, address: str, owner_name: str) -> Optional[bool]:
-		normalized = normalize_address(address)
+		split = split_street_city_state_zip(address)
+		if split is None:
+			return None
+		street, city, _state, zip_code = split
+		normalized = build_address_match_key(street, city, zip_code)
 		row = self._session.execute(
 			text(
 				"SELECT owner_name_on_roll FROM assessor_parcels "

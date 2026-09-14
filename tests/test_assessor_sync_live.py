@@ -289,10 +289,14 @@ def test_row_count_floor_rejects_a_batch_far_smaller_than_the_last_success(db):
 def test_check_still_owns_returns_real_answers_not_always_none(db):
 	"""The actual point of the whole feature: Win-Back's assessor lookup
 	must return a real True/False/None, not the pre-sync unconditional
-	None."""
+	None. Client address must be "STREET, CITY, ST ZIP" — matching found a
+	real bug against production data: street-only matching collides
+	whenever the same street name recurs in different cities/zips within
+	one county, so the match key (and the client-side address this test
+	passes in) now includes city+zip, not just the street line."""
 	folio = f"{_PREFIX}WINBACK"
 	as_of = datetime.now(timezone.utc)
-	row = _hc_row(folio, OWNER="JOHN SMITH", SITE_ADDR="42 REAL ADDRESS LN")
+	row = _hc_row(folio, OWNER="JOHN SMITH", SITE_ADDR="42 REAL ADDRESS LN", SITE_CITY="TAMPA", SITE_ZIP="33607")
 	import_row_owning_dataset(
 		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
 		mapped_rows=iter([row]), as_of=as_of, owns_homestead=True, min_row_count=1,
@@ -300,9 +304,39 @@ def test_check_still_owns_returns_real_answers_not_always_none(db):
 	db.commit()
 
 	provider = StagingTableAssessorProvider(db)
-	assert provider.check_still_owns("hillsborough_fl", "42 Real Address Ln", "John Smith") is True
-	assert provider.check_still_owns("hillsborough_fl", "42 Real Address Ln", "Completely Different Person") is False
-	assert provider.check_still_owns("hillsborough_fl", "99 Nonexistent Rd", "John Smith") is None
+	assert provider.check_still_owns("hillsborough_fl", "42 Real Address Ln, Tampa, FL 33607", "John Smith") is True
+	assert provider.check_still_owns("hillsborough_fl", "42 Real Address Ln, Tampa, FL 33607", "Completely Different Person") is False
+	assert provider.check_still_owns("hillsborough_fl", "99 Nonexistent Rd, Tampa, FL 33607", "John Smith") is None
+
+
+def test_check_still_owns_requires_city_zip_never_matches_on_street_alone(db):
+	"""PR review follow-up: matching on street alone let two different
+	parcels that happen to share a street name in different cities collide
+	silently. Confirms (1) an address with no city at all can no longer
+	match — a client-CSV format this repo can't safely parse rather than a
+	guessed street-only match — and (2) the same street name in a
+	DIFFERENT city genuinely does not match the wrong parcel."""
+	as_of = datetime.now(timezone.utc)
+	folio_tampa = f"{_PREFIX}COLLISIONTAMPA"
+	folio_brandon = f"{_PREFIX}COLLISIONBRANDON"
+	import_row_owning_dataset(
+		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
+		mapped_rows=iter([
+			_hc_row(folio_tampa, OWNER="TAMPA OWNER", SITE_ADDR="10 MAIN ST", SITE_CITY="TAMPA", SITE_ZIP="33602"),
+			_hc_row(folio_brandon, OWNER="BRANDON OWNER", SITE_ADDR="10 MAIN ST", SITE_CITY="BRANDON", SITE_ZIP="33511"),
+		]),
+		as_of=as_of, owns_homestead=True, min_row_count=1,
+	)
+	db.commit()
+
+	provider = StagingTableAssessorProvider(db)
+	# A bare street with no city/state/zip can't build a safe match key.
+	assert provider.check_still_owns("hillsborough_fl", "10 Main St", "Tampa Owner") is None
+	# Each city's real owner matches only its own parcel.
+	assert provider.check_still_owns("hillsborough_fl", "10 Main St, Tampa, FL 33602", "Tampa Owner") is True
+	assert provider.check_still_owns("hillsborough_fl", "10 Main St, Brandon, FL 33511", "Brandon Owner") is True
+	# Tampa's owner name against Brandon's parcel must not match either.
+	assert provider.check_still_owns("hillsborough_fl", "10 Main St, Brandon, FL 33511", "Tampa Owner") is False
 
 
 def test_check_still_owns_never_matches_an_ineligible_parcel(db):
@@ -310,14 +344,14 @@ def test_check_still_owns_never_matches_an_ineligible_parcel(db):
 	provider's query filters on is_blackink_eligible, not just address."""
 	folio = f"{_PREFIX}GOVWINBACK"
 	as_of = datetime.now(timezone.utc)
-	row = _hc_row(folio, DOR_C="8600", OWNER="HILLSBOROUGH COUNTY", SITE_ADDR="1 GOV PLAZA")
+	row = _hc_row(folio, DOR_C="8600", OWNER="HILLSBOROUGH COUNTY", SITE_ADDR="1 GOV PLAZA", SITE_CITY="TAMPA", SITE_ZIP="33602")
 	import_row_owning_dataset(
 		db, county_slug="hillsborough_fl", dataset_name="PARCEL_SPREADSHEET",
 		mapped_rows=iter([row]), as_of=as_of, owns_homestead=True, min_row_count=1,
 	)
 	db.commit()
 	provider = StagingTableAssessorProvider(db)
-	assert provider.check_still_owns("hillsborough_fl", "1 Gov Plaza", "Hillsborough County") is None
+	assert provider.check_still_owns("hillsborough_fl", "1 Gov Plaza, Tampa, FL 33602", "Hillsborough County") is None
 
 
 if __name__ == "__main__":

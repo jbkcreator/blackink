@@ -25,7 +25,6 @@ for the full design rationale.
 from __future__ import annotations
 
 import logging
-import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -34,6 +33,7 @@ from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from src.services.address_normalize import split_street_city_state_zip
 from src.services.email_suppression import _normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -153,43 +153,28 @@ class StubOwnerEnrichmentProvider(OwnerEnrichmentProvider):
         }
 
 
-# "..., CITY, ST[ ZIP]" trailing pattern — the one comma-separated convention
-# this parses; anything else (no commas, city/state space-separated, a bare
-# street with no city at all) is left unparsed. See _split_address's own
-# docstring for why an unmatched address is excluded from submission rather
-# than guessed.
-_ADDRESS_CITY_STATE_RE = re.compile(
-    r"^(?P<street>.+?),\s*(?P<city>[^,]+?),\s*(?P<state>[A-Za-z]{2})\b\s*(?P<zip>\d{5}(?:-\d{4})?)?\s*$"
-)
-
-
 def _split_address(raw_address: str) -> Optional[tuple[str, str, str]]:
     """Best-effort split of a freeform property_address_raw string into
     (street, city, state) for Tracerfy's batch API, which requires city as
     its own field (winback_rows only ever stores one freeform address
     string — see the plan doc's §5.1b discussion of this gap).
 
-    ponytail: this is a single regex over one convention
-    ("STREET, CITY, ST ZIP"), not a general US-address parser. The
-    ForcedAction-System sibling repo has a battle-tested one
-    (src/utils/address_normalize.py, built on the `usaddress` library) for
-    exactly this problem — reach for that (and add `usaddress` as a
-    dependency) if real client CSVs turn out to use a format this regex
-    doesn't cover. Returns None (never a guess) when the format doesn't
-    match; the caller excludes that row from this sweep's Tracerfy
+    Delegates to the shared "STREET, CITY, ST[ ZIP]" parser in
+    address_normalize.py (moved there 2026-09-14 so Win-Back's own
+    assessor-matching key can reuse the identical parsing rule — a second,
+    slightly-different regex here would risk this function and that one
+    disagreeing on what counts as parseable). Drops the zip component this
+    module never used. Returns None (never a guess) when the format
+    doesn't match; the caller excludes that row from this sweep's Tracerfy
     submission entirely rather than risk paying for a wrong city.
 
-    state is read from the parsed string, not hardcoded to "FL" — the
-    county scope is Florida-only today, but the address string is the more
-    direct source when it parses, and doing so costs nothing extra."""
-    m = _ADDRESS_CITY_STATE_RE.match((raw_address or "").strip())
-    if not m:
+    ponytail: still just one regex over one convention, not a general US-
+    address parser — see split_street_city_state_zip's own docstring for
+    the upgrade path if real client CSVs need more formats."""
+    split = split_street_city_state_zip(raw_address)
+    if split is None:
         return None
-    street = m.group("street").strip()
-    city = m.group("city").strip()
-    state = m.group("state").strip().upper()
-    if not street or not city or len(state) != 2:
-        return None
+    street, city, state, _zip = split
     return street, city, state
 
 

@@ -14,6 +14,7 @@ from src.services.assessor.mapping import (
 	map_pinellas_property_info_row,
 	normalize_state,
 )
+from src.services.address_normalize import build_address_match_key
 
 
 # ── State normalization ──────────────────────────────────────────────────
@@ -99,6 +100,67 @@ def test_map_pinellas_property_info_row_never_sets_homestead_columns():
 	mapped = map_pinellas_property_info_row(row)
 	assert "homestead_status" not in mapped
 	assert "exemption_excluded" not in mapped
+
+
+# ── Address match key — includes city+zip, not just street (PR review
+# follow-up: same street name can recur in different cities within one
+# county, so a street-only key would silently collide). Uses each county's
+# real PARCEL/site fields — never the owner's mailing address, which is a
+# genuinely different address that can be anywhere. ─────────────────────
+
+
+def test_map_hillsborough_row_address_match_key_includes_city_and_zip():
+	row = {
+		"FOLIO": "1", "DOR_C": "0100", "OWNER": "X",
+		"SITE_ADDR": "10 Main St", "SITE_CITY": "Tampa", "SITE_ZIP": "33602",
+	}
+	mapped = map_hillsborough_row(row)
+	assert mapped["parcel_address_raw"] == "10 Main St"  # display field stays street-only
+	assert mapped["parcel_city"] == "Tampa"
+	assert mapped["parcel_zip"] == "33602"
+	assert mapped["parcel_address_normalized"] == build_address_match_key("10 Main St", "Tampa", "33602")
+
+
+def test_map_hillsborough_row_same_street_different_city_yields_different_match_keys():
+	row_tampa = {"FOLIO": "1", "DOR_C": "0100", "OWNER": "X", "SITE_ADDR": "10 Main St", "SITE_CITY": "Tampa", "SITE_ZIP": "33602"}
+	row_brandon = {"FOLIO": "2", "DOR_C": "0100", "OWNER": "X", "SITE_ADDR": "10 Main St", "SITE_CITY": "Brandon", "SITE_ZIP": "33511"}
+	assert map_hillsborough_row(row_tampa)["parcel_address_normalized"] != map_hillsborough_row(row_brandon)["parcel_address_normalized"]
+
+
+def test_map_hillsborough_row_never_uses_owner_mailing_address_for_the_match_key():
+	"""The owner's mailing address (ADDR_1/CITY/STATE/ZIP) can be anywhere
+	— a different state entirely — and must never leak into the parcel's
+	own match key."""
+	row = {
+		"FOLIO": "1", "DOR_C": "0100", "OWNER": "X", "SITE_ADDR": "10 Main St", "SITE_CITY": "Tampa", "SITE_ZIP": "33602",
+		"ADDR_1": "999 Owner Mailing Rd", "CITY": "Somewhere Else", "STATE": "NY", "ZIP": "10001",
+	}
+	mapped = map_hillsborough_row(row)
+	assert "OWNER MAILING" not in mapped["parcel_address_normalized"]
+	assert "SOMEWHERE ELSE" not in mapped["parcel_address_normalized"]
+
+
+def test_map_pinellas_row_address_match_key_splits_the_combined_citystatezip_field():
+	"""SITE_CITYZIP is Pinellas's real combined field (confirmed against
+	production data — e.g. "PALM HARBOR, FL 34683"), not a separate city
+	and zip column like Hillsborough has."""
+	row = {
+		"STRAP": "1", "PROPERTY_USE": "0110", "OWNER1": "X",
+		"SITE_ADDRESS": "10 Main St", "SITE_CITYZIP": "Palm Harbor, FL 34683",
+	}
+	mapped = map_pinellas_property_info_row(row)
+	assert mapped["parcel_city"] == "Palm Harbor"
+	assert mapped["parcel_zip"] == "34683"
+	assert mapped["parcel_address_normalized"] == build_address_match_key("10 Main St", "Palm Harbor", "34683")
+
+
+def test_map_pinellas_row_unparseable_citystatezip_falls_back_to_raw_string_not_blank():
+	"""An unrecognized SITE_CITYZIP format still contributes to the match
+	key (better than nothing) rather than silently going blank."""
+	row = {"STRAP": "1", "PROPERTY_USE": "0110", "OWNER1": "X", "SITE_ADDRESS": "10 Main St", "SITE_CITYZIP": "not a real format"}
+	mapped = map_pinellas_property_info_row(row)
+	assert mapped["parcel_city"] == "not a real format"
+	assert mapped["parcel_zip"] is None
 
 
 # ── Pinellas field mapping ──────────────────────────────────────────────

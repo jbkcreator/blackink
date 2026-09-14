@@ -16,7 +16,7 @@ import json
 import re
 from typing import Optional, TypedDict, Union
 
-from src.services.address_normalize import normalize_address
+from src.services.address_normalize import build_address_match_key, split_city_state_zip
 
 
 # ============================================================================
@@ -373,14 +373,22 @@ def map_hillsborough_row(raw: dict) -> CanonicalParcel:
 	state = normalize_state(raw.get("STATE"))
 	homestead_status, homestead_raw_value = derive_hillsborough_homestead(property_class, _to_int(raw.get("BASE")))
 	address_raw = str(raw.get("SITE_ADDR") or "").strip()
+	site_city = raw.get("SITE_CITY")
+	site_zip = raw.get("SITE_ZIP")
 	return CanonicalParcel(
 		assessor_parcel_id=str(raw.get("FOLIO") or "").strip(),
 		strap=(str(raw.get("STRAP")).strip() or None) if raw.get("STRAP") else None,
 		parcel_address_raw=address_raw,
-		parcel_address_normalized=normalize_address(address_raw),
+		# Includes city+zip, not just street — SITE_ADDR/SITE_CITY/SITE_ZIP
+		# are the parcel's own physical location fields, never the OWNER'S
+		# mailing address (ADDR_1/CITY/STATE/ZIP below, a genuinely
+		# different address that can be anywhere). Street-only matching
+		# collides whenever the same street name recurs in different
+		# Hillsborough cities/zips — real, not hypothetical.
+		parcel_address_normalized=build_address_match_key(address_raw, site_city, site_zip),
 		raw_payload=_raw_payload_json(raw),
-		parcel_city=raw.get("SITE_CITY"),
-		parcel_zip=raw.get("SITE_ZIP"),
+		parcel_city=site_city,
+		parcel_zip=site_zip,
 		owner_name_on_roll=owner_name,
 		owner_name_secondary=raw.get("DBA"),
 		owner_mailing_address_1=raw.get("ADDR_1"),
@@ -429,14 +437,30 @@ def map_pinellas_property_info_row(raw: dict) -> CanonicalParcel:
 	mailing_address_1 = raw.get("MAILING_ADDRESS_1")
 	mailing_address_2 = raw.get("MAILING_ADDRESS_2")
 	address_raw = str(raw.get("SITE_ADDRESS") or "").strip()
+	# SITE_ADDRESS/SITE_CITYZIP are the parcel's own physical location
+	# (confirmed against real production data, e.g. SITE_CITYZIP =
+	# "PALM HARBOR, FL 34683") — never MAILING_ADDRESS_1/MAILING_CITY
+	# below, which is the OWNER'S mailing address and can be anywhere.
+	# split_city_state_zip parses the combined field into real city/zip
+	# columns instead of dumping the raw "CITY, ST ZIP" string into
+	# parcel_city unparsed; an unparseable value falls back to the raw
+	# string rather than silently going blank, since it still contributes
+	# real matching signal even unsplit.
+	site_cityzip = raw.get("SITE_CITYZIP")
+	parsed_cityzip = split_city_state_zip(site_cityzip)
+	parcel_city = parsed_cityzip[0] if parsed_cityzip else site_cityzip
+	parcel_zip = parsed_cityzip[2] if parsed_cityzip else None
 	return CanonicalParcel(
 		assessor_parcel_id=str(raw.get("STRAP") or "").strip(),
 		strap=str(raw.get("STRAP") or "").strip() or None,
 		parcel_address_raw=address_raw,
-		parcel_address_normalized=normalize_address(address_raw),
+		# Street-only matching collides whenever the same street name
+		# recurs in different Pinellas cities/zips — see the module docstring
+		# in address_normalize.py for the full rationale.
+		parcel_address_normalized=build_address_match_key(address_raw, parcel_city, parcel_zip),
 		raw_payload=_raw_payload_json(raw),
-		parcel_city=raw.get("SITE_CITYZIP"),
-		parcel_zip=None,  # SITE_CITYZIP is combined; no separate zip field in this file
+		parcel_city=parcel_city,
+		parcel_zip=parcel_zip,
 		owner_name_on_roll=owner_name,
 		owner_name_secondary=raw.get("OWNER2"),
 		owner_mailing_address_1=mailing_address_1,

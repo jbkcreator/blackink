@@ -312,6 +312,31 @@ is_blackink_eligible` — this is what makes Win-Back's ownership check return
 real `True`/`False`/`None` answers instead of the pre-sync unconditional
 `None`.
 
+**The match key is street+city+zip, not street alone** (fixed 2026-09-14,
+found by inspecting real production data): the same street name genuinely
+recurs across different cities within one county (e.g. two unrelated "Main
+St" parcels), so a street-only `parcel_address_normalized` could silently
+collide between them. `src/services/address_normalize.py`'s
+`build_address_match_key()` is the one formula both sides must build
+identically — `mapping.py` (the writer) uses each county's real
+parcel/site address fields (`SITE_ADDR`/`SITE_CITY`/`SITE_ZIP` for
+Hillsborough; `SITE_ADDRESS`/`SITE_CITYZIP` — a combined field, parsed via
+`split_city_state_zip` — for Pinellas), **never** the owner's mailing
+address columns (`ADDR_1`/`CITY`/`STATE`/`ZIP`, `MAILING_ADDRESS_1`/
+`MAILING_CITY`), which is a genuinely different address that can be
+anywhere. `check_still_owns()` (the reader) parses the client's freeform
+CSV address via `split_street_city_state_zip` (the "STREET, CITY, ST[ ZIP]"
+convention already established in `owner_enrichment.py`'s `_split_address`,
+which now delegates to this same shared parser) and returns `None`
+immediately — never a guessed street-only match — for any address that
+doesn't parse into at least a street and a city. This is a real, accepted
+trade-off: a client CSV address with no city can no longer match at all,
+in exchange for eliminating the collision risk. Rows imported before this
+fix keep their old street-only `parcel_address_normalized` until the next
+daily sync tick re-upserts them (no backfill migration needed — the daily
+`ON CONFLICT DO UPDATE` naturally recomputes every column, including this
+one, on its next run).
+
 ### Compliance gate vs. quarantine gate — two different lifecycle stages
 - `src/services/quarantine_gate.py` — is a freshly-ingested row eligible
   for **promotion**? (`pending/cleared/quarantined/rejected`)
