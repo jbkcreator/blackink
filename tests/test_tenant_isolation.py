@@ -188,47 +188,49 @@ def test_only_blackink_app_can_execute_non_poach_function():
 		assert allowed is True, "blackink_app should retain EXECUTE — the app is the only caller"
 
 
-def test_akrash_ingest_can_insert_but_not_select_raw_assessor_parcels():
-	"""PR review finding (Subtask 3.1.1): an earlier version of
-	apply_raw_assessor_parcels.py granted akrash_ingest access directly in
-	the table-creation migration — a grant that apply_akrash_grant.py's own
-	REVOKE ALL (run LAST, per CLAUDE.md's documented order) silently wiped
-	with no error raised anywhere, since by the time it runs there is
-	nothing "unexpected" left to warn about. The fix moved the grant into
-	apply_akrash_grant.py itself, alongside the two pre-existing staging
-	tables' grants. Checked via has_table_privilege() rather than a live
-	connection as akrash_ingest, same reasoning as
-	test_only_blackink_app_can_execute_non_poach_function above (pg_hba/
-	firewall restrictions may legitimately block that role from reaching
-	the DB from outside its ingest path)."""
+def test_akrash_ingest_has_no_access_to_assessor_parcels():
+	"""S-24 rebuild: raw_assessor_parcels (renamed assessor_parcels by
+	apply_assessor_sync.py) was never actually Akrash's to write — that
+	assumption traced to nothing in the client's build spec, and the
+	table sat empty because of it. apply_akrash_grant.py no longer grants
+	akrash_ingest anything on this table at all; the real source is now
+	src/tasks/assessor_sync.py's own daily scrape, run under
+	blackink_system. blackink_system holds SELECT/INSERT/UPDATE but not
+	DELETE (a parcel is soft-retired via retired_at, never row-deleted at
+	runtime — see apply_assessor_sync.py's grant list). Checked via
+	has_table_privilege() rather than a live connection as akrash_ingest,
+	same reasoning as test_only_blackink_app_can_execute_non_poach_function
+	above (pg_hba/firewall restrictions may legitimately block that role
+	from reaching the DB from outside its ingest path)."""
 	db = Database()
 	with db.session_scope() as session:
-		can_insert = session.execute(
-			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'INSERT')")
-		).scalar()
-		assert can_insert is True, "akrash_ingest must be able to INSERT into raw_assessor_parcels"
+		for privilege in ("INSERT", "SELECT", "UPDATE", "DELETE"):
+			has_it = session.execute(
+				text("SELECT has_table_privilege('akrash_ingest', 'assessor_parcels', :priv)"),
+				{"priv": privilege},
+			).scalar()
+			assert has_it is False, f"akrash_ingest must NOT be able to {privilege} assessor_parcels"
 
-		can_select = session.execute(
-			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'SELECT')")
-		).scalar()
-		assert can_select is False, "akrash_ingest must NOT be able to SELECT raw_assessor_parcels"
-
-		can_update = session.execute(
-			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'UPDATE')")
-		).scalar()
-		assert can_update is False, "akrash_ingest must NOT be able to UPDATE raw_assessor_parcels"
-
-		can_delete = session.execute(
-			text("SELECT has_table_privilege('akrash_ingest', 'raw_assessor_parcels', 'DELETE')")
-		).scalar()
-		assert can_delete is False, "akrash_ingest must NOT be able to DELETE raw_assessor_parcels"
-
-		# blackink_system is the one that reads this table back (the
-		# assessor lookup in winback_ingest.py runs BYPASSRLS).
+		# blackink_system is the daily sync's own write path (BYPASSRLS).
 		system_can_select = session.execute(
-			text("SELECT has_table_privilege('blackink_system', 'raw_assessor_parcels', 'SELECT')")
+			text("SELECT has_table_privilege('blackink_system', 'assessor_parcels', 'SELECT')")
 		).scalar()
-		assert system_can_select is True, "blackink_system should retain SELECT on raw_assessor_parcels"
+		assert system_can_select is True, "blackink_system should have SELECT on assessor_parcels"
+
+		system_can_insert = session.execute(
+			text("SELECT has_table_privilege('blackink_system', 'assessor_parcels', 'INSERT')")
+		).scalar()
+		assert system_can_insert is True, "blackink_system should have INSERT on assessor_parcels"
+
+		system_can_update = session.execute(
+			text("SELECT has_table_privilege('blackink_system', 'assessor_parcels', 'UPDATE')")
+		).scalar()
+		assert system_can_update is True, "blackink_system should have UPDATE on assessor_parcels"
+
+		system_can_delete = session.execute(
+			text("SELECT has_table_privilege('blackink_system', 'assessor_parcels', 'DELETE')")
+		).scalar()
+		assert system_can_delete is False, "blackink_system must NOT be able to DELETE assessor_parcels — parcels are soft-retired"
 
 
 def test_non_poach_function_discloses_no_identity(canary_tenants):
