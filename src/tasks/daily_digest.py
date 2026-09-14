@@ -21,6 +21,7 @@ from typing import Optional
 from sqlalchemy import text
 
 from src.core.database import get_system_db_context
+from src.core.demo_clients import DEMO_CLIENT_IDS
 from src.services.events import flush_pending
 from src.services.slack.post import post_notice
 
@@ -94,7 +95,7 @@ _METRICS_SQL = """
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
-      AND client_id != 'DEMO_FRIDAY_SANDBOX'
+      AND client_id <> ALL(:demo_client_ids)
 """
 # No numeric-cast regex guards are needed here (unlike the old
 # avg_response_latency_sec/video_completion_rate_pct columns) — every
@@ -110,7 +111,10 @@ def _query_metrics() -> dict:
     digests are wanted later, that is a different function posting to a
     different channel, not a parameter on this one."""
     with get_system_db_context() as session:
-        row = session.execute(text(_METRICS_SQL), {"window": _WINDOW}).mappings().first()
+        row = session.execute(
+            text(_METRICS_SQL),
+            {"window": _WINDOW, "demo_client_ids": list(DEMO_CLIENT_IDS)},
+        ).mappings().first()
     return dict(row) if row else {}
 
 

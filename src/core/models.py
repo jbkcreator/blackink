@@ -93,6 +93,10 @@ class Client(Base):
 	# suspended client's send ability must stop in seconds, not up to the
 	# cache TTL later.
 	suspended_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+	# Subtask 3.2.5 Stage 6 (S-21): the Google Sheet the per-client Client Wins
+	# Dashboard export writes into (Looker Studio Sheets connector). NULL until an
+	# operator provisions/shares a Sheet — see migrations/apply_clients_wins_sheet.py.
+	wins_sheet_id: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
 	created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 	updated_at: Mapped[datetime] = mapped_column(
 		DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from src.api.deps import require_admin_jwt
 from src.core.database import get_system_db_context
+from src.core.demo_clients import DEMO_CLIENT_IDS
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"], dependencies=[Depends(require_admin_jwt)])
 
@@ -33,7 +34,7 @@ _METRICS_SQL = """
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
-      AND client_id <> 'DEMO_FRIDAY_SANDBOX'
+      AND client_id <> ALL(:demo_client_ids)
 """
 
 
@@ -41,7 +42,10 @@ _METRICS_SQL = """
 def get_digest():
     try:
         with get_system_db_context() as session:
-            row = session.execute(text(_METRICS_SQL), {"window": _WINDOW}).mappings().first()
+            row = session.execute(
+                text(_METRICS_SQL),
+                {"window": _WINDOW, "demo_client_ids": list(DEMO_CLIENT_IDS)},
+            ).mappings().first()
         return dict(row) if row else {}
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc

@@ -63,3 +63,7 @@ tmp/
 
 # Completion reports — local only, never push
 /reports/
+
+# Google service-account key (Sheets export) — never commit
+gsheets-sa.json
+*-sa.json
