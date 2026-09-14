@@ -449,6 +449,7 @@ def map_pinellas_property_info_row(raw: dict) -> CanonicalParcel:
 	site_cityzip = raw.get("SITE_CITYZIP")
 	parsed_cityzip = split_city_state_zip(site_cityzip)
 	parcel_city = parsed_cityzip[0] if parsed_cityzip else site_cityzip
+	parcel_state = parsed_cityzip[1] if parsed_cityzip else None
 	parcel_zip = parsed_cityzip[2] if parsed_cityzip else None
 	return CanonicalParcel(
 		assessor_parcel_id=str(raw.get("STRAP") or "").strip(),
@@ -457,7 +458,7 @@ def map_pinellas_property_info_row(raw: dict) -> CanonicalParcel:
 		# Street-only matching collides whenever the same street name
 		# recurs in different Pinellas cities/zips — see the module docstring
 		# in address_normalize.py for the full rationale.
-		parcel_address_normalized=build_address_match_key(address_raw, parcel_city, parcel_zip),
+		parcel_address_normalized=build_address_match_key(address_raw, parcel_city, parcel_zip, parcel_state),
 		raw_payload=_raw_payload_json(raw),
 		parcel_city=parcel_city,
 		parcel_zip=parcel_zip,

@@ -164,8 +164,8 @@ class StagingTableAssessorProvider(AssessorProvider):
 		split = split_street_city_state_zip(address)
 		if split is None:
 			return None
-		street, city, _state, zip_code = split
-		normalized = build_address_match_key(street, city, zip_code)
+		street, city, state, zip_code = split
+		normalized = build_address_match_key(street, city, zip_code, state)
 		row = self._session.execute(
 			text(
 				"SELECT owner_name_on_roll FROM assessor_parcels "

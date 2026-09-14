@@ -44,8 +44,16 @@ def test_split_city_state_zip_unrecognized_format_returns_none():
 	assert split_city_state_zip("not a real format") is None
 
 
-def test_build_address_match_key_concatenates_street_city_zip():
-	assert build_address_match_key("10 Main St", "Tampa", "33602") == normalize_address("10 Main St Tampa 33602")
+def test_build_address_match_key_concatenates_street_city_state_zip():
+	assert build_address_match_key("10 Main St", "Tampa", "33602") == normalize_address("10 Main St Tampa FL 33602")
+
+
+def test_build_address_match_key_state_defaults_to_fl_when_omitted():
+	assert build_address_match_key("10 Main St", "Tampa", "33602") == build_address_match_key("10 Main St", "Tampa", "33602", "FL")
+
+
+def test_build_address_match_key_accepts_an_explicit_state():
+	assert build_address_match_key("10 Main St", "Tampa", "33602", "GA") == normalize_address("10 Main St Tampa GA 33602")
 
 
 def test_build_address_match_key_same_street_different_city_differs():
@@ -64,8 +72,8 @@ def test_build_address_match_key_truncates_zip_plus_4_to_match_a_plain_5digit_zi
 
 
 def test_build_address_match_key_handles_missing_city_or_zip_without_raising():
-	assert build_address_match_key("10 Main St", None, None) == normalize_address("10 Main St")
-	assert build_address_match_key("10 Main St", "", "") == normalize_address("10 Main St")
+	assert build_address_match_key("10 Main St", None, None) == normalize_address("10 Main St FL")
+	assert build_address_match_key("10 Main St", "", "") == normalize_address("10 Main St FL")
 
 
 if __name__ == "__main__":

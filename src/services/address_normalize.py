@@ -24,11 +24,11 @@ fields — SITE_ADDR/SITE_CITY/SITE_ZIP for Hillsborough,
 SITE_ADDRESS/SITE_CITYZIP for Pinellas — never the OWNER'S mailing address,
 which can be anywhere and has nothing to do with where the parcel is) and
 winback_ingest.py (the reader, parsing the client's own freeform CSV
-address string). State is deliberately excluded from the key itself: every
-county this platform covers is Florida-only, so it adds no discriminating
-power over city+zip alone, and keeping the formula to street+city+zip
-avoids a state-abbreviation-casing mismatch becoming a stray fourth source
-of divergence between the two sides.
+address string). State adds no discriminating power over city+zip alone
+today — every county this platform covers is Florida-only, and a valid
+ZIP code already implies its state — but is included anyway (2026-09-14)
+as cheap, harmless future-proofing against this platform ever covering
+more than one state, where it would start to matter.
 """
 import re
 
@@ -102,13 +102,18 @@ def split_city_state_zip(raw):
 	return city, state, zip_code
 
 
-def build_address_match_key(street, city, zip_code) -> str:
+def build_address_match_key(street, city, zip_code, state=None) -> str:
 	"""The single match-key formula the assessor sync (writer) and Win-Back
-	ingest (reader) must build identically. Concatenates street+city+zip
-	(zip truncated to its first 5 digits, so a zip+4 on one side never
-	mismatches a plain 5-digit zip on the other) and runs the result
+	ingest (reader) must build identically. Concatenates street+city+zip+
+	state (zip truncated to its first 5 digits, so a zip+4 on one side
+	never mismatches a plain 5-digit zip on the other) and runs the result
 	through normalize_address — divergence here would silently make every
 	lookup miss or, worse, collide across two different streets that
-	happen to share a name, exactly the bug this module exists to close."""
+	happen to share a name, exactly the bug this module exists to close.
+	`state` is optional and defaults to "FL": every county this platform
+	covers is Florida-only today, so a caller that doesn't have a real
+	per-record state value (e.g. Hillsborough's source file has none) can
+	rely on that default rather than passing a hardcoded literal itself."""
 	zip5 = (str(zip_code)[:5] if zip_code else "")
-	return normalize_address(f"{street or ''} {city or ''} {zip5}")
+	state_value = state or "FL"
+	return normalize_address(f"{street or ''} {city or ''} {state_value} {zip5}")
