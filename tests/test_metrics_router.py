@@ -18,13 +18,16 @@ def test_metrics_sql_county_rank_reports_uses_county_slug_not_county():
     assert "payload->>'county'" not in _METRICS_SQL.replace("payload->>'county_slug'", "")
 
 
-def test_metrics_sql_open_click_reply_rate_are_null_not_a_fabricated_zero():
-    assert "NULL::numeric AS open_rate_pct" in _METRICS_SQL
-    assert "NULL::numeric AS click_rate_pct" in _METRICS_SQL
-    assert "NULL::numeric AS reply_rate_pct" in _METRICS_SQL
-    assert "email_opened" not in _METRICS_SQL
-    assert "email_clicked" not in _METRICS_SQL
-    assert "email_replied" not in _METRICS_SQL
+def test_metrics_sql_open_click_reply_rate_wired_to_real_events_with_nullif_guard():
+    """S-8 producers now exist, so the engagement rates are real divisions over
+    the cold-email denominator (not literal NULL), guarded by NULLIF so an empty
+    window reads "n/a" rather than a misleading 0%. Mirrors the identical query
+    in src/tasks/daily_digest.py."""
+    assert "NULL::numeric AS open_rate_pct" not in _METRICS_SQL
+    assert "event_type = 'email_opened'" in _METRICS_SQL
+    assert "event_type = 'email_clicked'" in _METRICS_SQL
+    assert "event_type = 'email_replied'" in _METRICS_SQL
+    assert _METRICS_SQL.count("NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched'") >= 3
 
 
 def test_metrics_sql_excludes_the_demo_sandbox_client():

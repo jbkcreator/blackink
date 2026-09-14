@@ -26,11 +26,16 @@ _METRICS_SQL = """
         COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
         COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
         COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        -- Group D / D-4: no producer for these event types yet (S-8) — see
-        -- src/tasks/daily_digest.py's identical comment.
-        NULL::numeric AS open_rate_pct,
-        NULL::numeric AS click_rate_pct,
-        NULL::numeric AS reply_rate_pct,
+        -- Engagement rates over the cold-email denominator — producers exist
+        -- (email_tracking_router.py, inbound_ingest.py), deduped per
+        -- dispatch_id. NULLIF → "n/a" when nothing dispatched. See
+        -- src/tasks/daily_digest.py's identical block for the full rationale.
+        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_opened')
+              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS open_rate_pct,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_clicked')
+              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS click_rate_pct,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_replied')
+              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS reply_rate_pct,
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window

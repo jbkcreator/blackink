@@ -83,15 +83,22 @@ _METRICS_SQL = """
         COUNT(*) FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS scores_generated,
         COUNT(DISTINCT payload->>'county_slug') FILTER (WHERE event_type = 'owner_visibility_score_calculated') AS county_rank_reports_delivered,
         COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email') AS cold_emails_dispatched,
-        -- Group D / D-4: email_opened/email_clicked/email_replied have no
-        -- producer anywhere in this codebase (S-8, open/click/reply
-        -- tracking, is not built). A real division here would compute a
-        -- mathematically correct but misleading 0% — "confirmed zero
-        -- engagement" rather than "not tracked". NULL renders as "n/a" via
-        -- fmt() below. Replace with the real division once S-8 lands.
-        NULL::numeric AS open_rate_pct,
-        NULL::numeric AS click_rate_pct,
-        NULL::numeric AS reply_rate_pct,
+        -- Engagement rates over the cold-email denominator (dispatched with
+        -- channel='email'). Producers now exist: email_opened/email_clicked
+        -- (src/api/email_tracking_router.py, pixel + click redirect) and
+        -- email_replied (src/services/inbound_ingest.py, Tier-1 message-id
+        -- attributed reply only) — all deduped per dispatch_id
+        -- (events.DISPATCH_DEDUPED_EVENT_TYPES + the partial unique index),
+        -- so each COUNT is unique-per-send. NULLIF makes the rate NULL (→
+        -- "n/a" via fmt()) when nothing was dispatched in the window, rather
+        -- than a misleading 0%; once sends exist, an untracked open reads a
+        -- true 0.0%.
+        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_opened')
+              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS open_rate_pct,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_clicked')
+              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS click_rate_pct,
+        ROUND(100.0 * COUNT(*) FILTER (WHERE event_type = 'email_replied')
+              / NULLIF(COUNT(*) FILTER (WHERE event_type = 'outbound_touch_dispatched' AND payload->>'channel' = 'email'), 0), 1) AS reply_rate_pct,
         COUNT(*) FILTER (WHERE event_type = 'meeting_booked') AS appointments_booked
     FROM events
     WHERE created_at >= NOW() - :window
