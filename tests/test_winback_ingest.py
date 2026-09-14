@@ -187,19 +187,29 @@ class _FakeSession:
 def test_assessor_still_owns_true_on_name_match():
 	session = _FakeSession(("Jane Doe",))
 	provider = StagingTableAssessorProvider(session)
-	assert provider.check_still_owns("hillsborough_fl", "123 Main St", "Jane Doe") is True
+	assert provider.check_still_owns("hillsborough_fl", "123 Main St, Tampa, FL 33602", "Jane Doe") is True
 
 
 def test_assessor_still_owns_false_on_name_mismatch():
 	session = _FakeSession(("Totally Different Person",))
 	provider = StagingTableAssessorProvider(session)
-	assert provider.check_still_owns("hillsborough_fl", "123 Main St", "Jane Doe") is False
+	assert provider.check_still_owns("hillsborough_fl", "123 Main St, Tampa, FL 33602", "Jane Doe") is False
+
+
+def test_assessor_still_owns_none_when_address_has_no_city():
+	"""PR review follow-up: matching now requires city+zip, not just
+	street, to avoid a same-street-name-different-city collision found
+	against real production data. A bare street with no city can't build
+	a safe match key and must never reach the database at all."""
+	session = _FakeSession(("Jane Doe",))  # would match if the query ever ran
+	provider = StagingTableAssessorProvider(session)
+	assert provider.check_still_owns("hillsborough_fl", "123 Main St", "Jane Doe") is None
 
 
 def test_assessor_still_owns_none_when_parcel_not_found():
 	session = _FakeSession(None)
 	provider = StagingTableAssessorProvider(session)
-	assert provider.check_still_owns("hillsborough_fl", "999 Nowhere Rd", "Jane Doe") is None
+	assert provider.check_still_owns("hillsborough_fl", "999 Nowhere Rd, Tampa, FL 33602", "Jane Doe") is None
 
 
 def test_assessor_tolerates_minor_name_variation():
@@ -208,7 +218,7 @@ def test_assessor_tolerates_minor_name_variation():
 	# for a fuzzy, not exact, match).
 	session = _FakeSession(("Jane A Doe",))
 	provider = StagingTableAssessorProvider(session)
-	assert provider.check_still_owns("hillsborough_fl", "123 Main St", "Jane Doe") is True
+	assert provider.check_still_owns("hillsborough_fl", "123 Main St, Tampa, FL 33602", "Jane Doe") is True
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +292,7 @@ class _ScriptedSession:
 def _row(**overrides):
 	base = dict(
 		owner_name="Jane Doe",
-		property_address="123 Main St",
+		property_address="123 Main St, Tampa, FL 33602",
 		county_input="hillsborough_fl",
 		phone="8135550100",
 		email="jane@example.com",
