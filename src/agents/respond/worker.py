@@ -56,6 +56,7 @@ from src.agents.respond.kb_cards import post_kb_card
 from src.agents.respond.kb_matcher import match_kb
 from src.core.database import Database
 from src.services.events import log_event
+from src.services.sla_config import ClientSlaWindows, resolve_sla_windows
 
 logger = logging.getLogger(__name__)
 
@@ -109,11 +110,15 @@ def _mark_processing(db: Any, db_id: int) -> None:
     )
 
 
-def _compute_sla(intent: Intent, received_at: datetime) -> datetime:
+def _compute_sla(intent: Intent, received_at: datetime, windows: ClientSlaWindows) -> datetime:
     if received_at.tzinfo is None:
         received_at = received_at.replace(tzinfo=timezone.utc)
-    delta = timedelta(minutes=15) if intent in (Intent.HOT_LEAD, Intent.WHALE_OWNER) else timedelta(minutes=60)
-    return received_at + delta
+    minutes = (
+        windows.hot_lead_minutes
+        if intent in (Intent.HOT_LEAD, Intent.WHALE_OWNER)
+        else windows.standard_minutes
+    )
+    return received_at + timedelta(minutes=minutes)
 
 
 def _write_result(
@@ -235,7 +240,8 @@ def _route(
         received_at_dt = datetime.now(timezone.utc)
 
     final_status = _INTENT_TO_STATUS.get(result.intent, _DEFAULT_ROUTED_STATUS)
-    sla_due_at   = _compute_sla(result.intent, received_at_dt) if final_status == _DEFAULT_ROUTED_STATUS else None
+    sla_windows  = resolve_sla_windows(db, client_id)
+    sla_due_at   = _compute_sla(result.intent, received_at_dt, sla_windows) if final_status == _DEFAULT_ROUTED_STATUS else None
 
     # Group D / D-10: a classifier error (LLM/SDK/API-key failure) returns
     # NURTURE with meta={"path": "fallback"} — the ONLY signal distinguishing

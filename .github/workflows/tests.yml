@@ -81,6 +81,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_area_code_timezones.py
           PYTHONPATH=. python migrations/apply_clients.py
           PYTHONPATH=. python migrations/apply_clients_stl_fields.py
+          PYTHONPATH=. python migrations/apply_client_sla_windows.py
           PYTHONPATH=. python migrations/apply_clients_wins_sheet.py
           PYTHONPATH=. python migrations/apply_relay_halts.py
           PYTHONPATH=. python migrations/apply_vera_health_runs.py
@@ -100,6 +101,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_mailbox_smtp_credentials.py
           PYTHONPATH=. python migrations/apply_agent_work_orders.py
           PYTHONPATH=. python migrations/apply_meeting_outcomes.py
+          PYTHONPATH=. python migrations/apply_meeting_attendance_proof.py
           PYTHONPATH=. python migrations/apply_contacts_prospect_objections.py
           PYTHONPATH=. python migrations/apply_sequence_runs.py
           PYTHONPATH=. python migrations/apply_sequence_touch_dispatches.py
@@ -126,6 +128,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_respond_routing_gaps.py
           PYTHONPATH=. python migrations/apply_knowledge_base.py
           PYTHONPATH=. python migrations/apply_entitlements_billing.py
+          PYTHONPATH=. python migrations/apply_stripe_price_provisioning.py
           PYTHONPATH=. python migrations/apply_client_billing_account.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py

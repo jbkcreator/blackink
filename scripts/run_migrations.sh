@@ -47,6 +47,7 @@ MIGRATIONS=(
   apply_area_code_timezones
   apply_clients
   apply_clients_stl_fields
+  apply_client_sla_windows
   apply_clients_wins_sheet
   apply_relay_halts
   apply_vera_health_runs
@@ -65,6 +66,7 @@ MIGRATIONS=(
   apply_mailbox_last_used
   apply_agent_work_orders
   apply_meeting_outcomes
+  apply_meeting_attendance_proof
   apply_contacts_prospect_objections
   apply_sequence_runs
   apply_sequence_touch_dispatches
@@ -91,6 +93,7 @@ MIGRATIONS=(
   apply_inbound_messages_sla
   apply_respond_routing_gaps
   apply_entitlements_billing
+  apply_stripe_price_provisioning
   apply_client_billing_account
   apply_ghost_shopper_reactivation
   apply_ghost_shopper_replies
