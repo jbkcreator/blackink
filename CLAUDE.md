@@ -74,6 +74,7 @@ PYTHONPATH=. python migrations/apply_knowledge_base.py  # Subtask 2.1.3 — KB A
 PYTHONPATH=. python migrations/apply_entitlements_billing.py  # Subtask 1.2.3 — entitlement_offers/client_entitlements/billing_credits/subscription_overrides + inbound_messages ack columns + clients.founding
 PYTHONPATH=. python migrations/apply_stripe_price_provisioning.py  # durable Stripe Product/base/metered Price references; after apply_entitlements_billing.py
 PYTHONPATH=. python migrations/apply_client_billing_account.py  # PR #37 review fix — clients.stripe_customer_id + appointments.billing_blocked_reason (needed for the sit-invoice sweep; after apply_entitlements_billing.py, before RLS)
+PYTHONPATH=. python migrations/apply_appointment_attendance_proof.py  # Week-2 audit fix — appointments.proof_ref/attended_duration_seconds fail-closed guard against over-billing on is_billable alone; extends the billing_blocked_reason CHECK constraint, so MUST run after apply_client_billing_account.py (that column doesn't exist before it), before RLS
 PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py  # re-adds ghost_submitted_at + ghost_work_order_id to contacts (Ghost Shopper reactivated); before RLS
 PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py       # audit log for IMAP listener inbound replies + timeouts; not tenant-bearing, no RLS
 PYTHONPATH=. python migrations/apply_ghost_form_submissions.py      # node-level idempotency for fill_and_submit (prevents double form POST on retry); not tenant-bearing, no RLS
@@ -1354,6 +1355,71 @@ Founding accounts are provisioned via the new
 future onboarding flow cannot silently default a real founding client to
 `False`; `tests/test_billing_structural.py` asserts both the missing default
 and that no other production code path INSERTs into `clients`.
+
+### Week-2 implementation-audit gap status (2026-09-14)
+
+Four gaps the Week-2 audit flagged, cross-checked against actual code
+(not just prior docstrings/PR descriptions) — status stated plainly,
+including the one still genuinely open:
+
+1. **Stripe Elements onboarding modal (Subtask 1.2.1) — FIXED, on the
+   `frontend` branch (not yet in `main`).** Backend (SetupIntent creation,
+   $1 hold, encrypted storage, server-side verification) was already
+   complete and tested. PR #57 (merged into `frontend`, not `main`) adds
+   the real page: `src/pages/PaymentAuthPage.jsx`, reached via the
+   existing one-time signed `onboarding_token` URL param, embeds Stripe.js
+   Elements for both the card field and the two-step ACH bank-account
+   flow (`collectBankAccountForSetup` → `confirmUsBankAccountSetup`)
+   against the already-built `/setup-intents`/`/confirm` endpoints — no
+   backend changes needed or made. `GET /api/v1/onboarding/payment-auth/
+   test-harness` remains only the dev-only fallback. **Still open:**
+   merging `frontend` into `main` (and wiring a real onboarding-token
+   minting flow in place of `scripts/dev_mint_payment_auth_token.py`,
+   which this page is built to be adopted by, not replaced by).
+2. **GHL / mandatory no-approval arming (Task 4.2.2) — RESOLVED.**
+   `src/services/stl_cadence.py`'s module docstring documents the
+   confirmed resolution: the Sept-3 client comment (Source of Truth Part
+   10.2) supersedes the older task-doc's no-approval/GHL wording. The
+   existing Slack-approval gate and the absence of a GHL outbound client
+   are therefore correct, client-sourced behavior, not an unresolved
+   deviation — no code change needed or made.
+3. **`proof_ref` attendance evidence (Subtask 1.1.1 / 1.2.2, O-10) —
+   PARTIALLY FIXED.** The over-billing risk is closed: `appointments.
+   proof_ref`/`attended_duration_seconds`
+   (`migrations/apply_appointment_attendance_proof.py`) and
+   `charge_sit_for_appointment()`'s fail-closed `MISSING_ATTENDANCE_PROOF`
+   block mean the sit-invoice sweep can no longer bill an `ATTENDED`
+   appointment with zero attendance evidence. **Review fix**: a non-null
+   `proof_ref` alone was not sufficient — the gate now also requires
+   `attended_duration_seconds >= 720` (the Source of Truth's 12-minute,
+   both-party attendance floor), so a bare event-id-style reference with no
+   verified duration still blocks. A row that already has a
+   `stripe_invoice_id` (opened by a prior sweep run, e.g. before this
+   duration requirement existed) bypasses the gate on retry rather than
+   being stranded — nothing can populate `proof_ref`/duration after the
+   fact for a row already that far along, so re-gating it there would
+   leave the Stripe invoice permanently unreconciled. Separately,
+   `meeting_outcomes` gained its own attendance-proof columns and a
+   provider seam (`src/services/meeting_attendance_proof.py`) for the
+   future Week-4 4-rule gate. **Still open**: both providers are stubs —
+   `StubMeetingAttendanceProvider.fetch_proof()` always returns `None` —
+   so no real conference-duration capture mechanism (calendar-bridge
+   timestamp / transcript webhook / Zoom or Meet duration API / manual
+   attestation) is wired anywhere yet. That vendor/mechanism decision is
+   still needed before either `proof_ref` column is ever actually
+   populated.
+4. **Per-client SLA windows (Subtask 2.1.2 / Task 4.2.1) — FIXED.**
+   `src/services/sla_config.py::resolve_sla_windows()` reads nullable
+   `clients.sla_hot_lead_minutes`/`sla_standard_minutes`/`sla_tier2_minutes`/
+   `sla_tier3_minutes`/`speed_to_lead_sla_minutes`
+   (`migrations/apply_client_sla_windows.py`), falling back to the
+   platform default in `config/settings.py` only when a client has no
+   override. Wired into all three call sites that used to hardcode the
+   window: `src/agents/respond/worker.py`'s `_compute_sla()`,
+   `src/services/inbound_lead_orchestrator.py`'s `_compute_sla_due()`, and
+   `src/tasks/respond_sla_sweep.py`'s tier2/tier3 SQL (same
+   COALESCE-with-default rule, applied in SQL rather than Python so the
+   sweep and the two per-message call sites can never disagree).
 
 ## Naming & Code Quality
 

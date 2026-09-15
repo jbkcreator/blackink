@@ -15,6 +15,13 @@ class _Row:
 	def __init__(self, **kw):
 		kw.setdefault("stripe_invoice_id", None)
 		kw.setdefault("sit_invoice_finalized_at", None)
+		# Every existing test in this file predates the attendance-proof
+		# gate and exercises unrelated behavior (Stripe retry/reconciliation
+		# paths) — default proof_ref/attended_duration_seconds to values that
+		# clear the gate so those tests keep reaching the code they actually
+		# test. Tests for the gate itself pass these explicitly.
+		kw.setdefault("proof_ref", "prf_default_for_pre_existing_tests")
+		kw.setdefault("attended_duration_seconds", 900)
 		self.__dict__.update(kw)
 
 
@@ -59,6 +66,10 @@ class _FakeSession:
 			self.updates.append(("block", params))
 			self._appointment_row.billing_blocked_reason = "NO_STRIPE_CUSTOMER"
 			return None
+		if "UPDATE appointments SET billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF'" in sql:
+			self.updates.append(("block_no_proof", params))
+			self._appointment_row.billing_blocked_reason = "MISSING_ATTENDANCE_PROOF"
+			return None
 		if "UPDATE appointments SET stripe_invoice_id" in sql:
 			self.updates.append(("set_invoice_id", params))
 			self._appointment_row.stripe_invoice_id = params["invoice_id"]
@@ -82,6 +93,145 @@ class _FakeSession:
 				self.savepoint_depth -= 1
 
 		return _cm()
+
+
+def test_blocked_when_appointment_has_no_proof_ref():
+	"""Week-2 implementation audit (2026-09-14) fail-closed guard: an
+	ATTENDED, is_billable appointment with no attendance-duration evidence
+	must be blocked BEFORE any Stripe call, not invoiced on is_billable
+	alone. Checked ahead of the stripe_customer_id gate — a row with
+	neither should report the attendance-proof reason first, since that is
+	the more fundamental "should this be billed at all" question."""
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None,
+		stripe_customer_id="cus_1", proof_ref=None,
+	)
+	session = _FakeSession(row)
+	gw = _FakeGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "MISSING_ATTENDANCE_PROOF"
+	assert session.updates[0] == ("block_no_proof", {"client_id": "acme_pm", "appointment_id": "appt-1"})
+	assert gw.calls == []
+
+
+def test_proof_ref_present_reaches_stripe_customer_check_normally(monkeypatch):
+	"""The gate must not block a row that DOES have proof_ref AND a
+	verified >=720s attendance duration — confirms the guard is additive,
+	not a regression on the normal (still client-blocked-on-Stripe-identity)
+	path."""
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None, stripe_customer_id=None,
+		proof_ref="prf_real", attended_duration_seconds=720,
+	)
+	session = _FakeSession(row)
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=_FakeGateway(),
+	)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "NO_STRIPE_CUSTOMER"
+
+
+def test_blocked_when_proof_ref_present_but_duration_missing():
+	"""A non-null proof_ref alone must not authorize a charge — the row must
+	also carry a verified attended_duration_seconds. A proof mechanism that
+	only records that a proof event happened (e.g. a bare event id) without a
+	duration must not pass."""
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None,
+		stripe_customer_id="cus_1", proof_ref="prf_real", attended_duration_seconds=None,
+	)
+	session = _FakeSession(row)
+	gw = _FakeGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "MISSING_ATTENDANCE_PROOF"
+	assert gw.calls == []
+
+
+@pytest.mark.parametrize("duration_seconds", [0, 719])
+def test_blocked_when_attended_duration_is_under_the_twelve_minute_bar(duration_seconds):
+	"""Source of Truth Rule 2: both parties must have attended at least 12
+	minutes (720 seconds). 0 seconds (no real evidence of attendance length)
+	and 719 seconds (one second short) must both still block."""
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None,
+		stripe_customer_id="cus_1", proof_ref="prf_real", attended_duration_seconds=duration_seconds,
+	)
+	session = _FakeSession(row)
+	gw = _FakeGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "MISSING_ATTENDANCE_PROOF"
+	assert gw.calls == []
+
+
+def test_invoiced_at_exactly_the_twelve_minute_bar(monkeypatch):
+	"""720 seconds (exactly 12 minutes) is the accepted minimum, not the
+	rejected boundary — a two-party meeting that lasted exactly the
+	contractual floor must still bill."""
+	monkeypatch.setattr(
+		"src.services.billing.sit_invoice.resolve_sit_charge",
+		lambda *a, **kw: type("C", (), {"offer_code": "appt_standard", "amount_cents": 9900, "first_sit": False})(),
+	)
+	monkeypatch.setattr(
+		"src.services.billing.sit_invoice.apply_pending_credits_to_invoice",
+		lambda *a, **kw: 0,
+	)
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None,
+		stripe_customer_id="cus_1", proof_ref="prf_real", attended_duration_seconds=720,
+	)
+	session = _FakeSession(row)
+	gw = _FakeGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+	assert outcome.status == "INVOICED"
+
+
+def test_stranded_pre_existing_invoice_reconciles_without_attendance_proof(monkeypatch):
+	"""Week-2 audit review finding #2: an appointment whose stripe_invoice_id
+	was already created by a prior sweep run (before this attendance-proof
+	gate existed, or before it required a duration) must not be stranded
+	BLOCKED forever just because proof_ref/attended_duration_seconds is
+	still unset — nothing can ever write those columns after the fact for a
+	row already this far along. charge_sit_for_appointment() is the only
+	writer of stripe_invoice_id, so its presence must bypass the gate and
+	finish the reconciliation instead."""
+	monkeypatch.setattr(
+		"src.services.billing.sit_invoice.resolve_sit_charge",
+		lambda *a, **kw: type("C", (), {"offer_code": "appt_standard", "amount_cents": 9900, "first_sit": False})(),
+	)
+	monkeypatch.setattr(
+		"src.services.billing.sit_invoice.apply_pending_credits_to_invoice",
+		lambda *a, **kw: 0,
+	)
+	row = _Row(
+		is_billable=True, billed_offer_code=None, billed_amount_cents=None,
+		stripe_customer_id="cus_1", stripe_invoice_id="in_pre_existing",
+		proof_ref=None, attended_duration_seconds=None,
+	)
+	session = _FakeSession(row)
+	gw = _FakeGateway()
+	outcome = charge_sit_for_appointment(
+		session, client_id="acme_pm", appointment_id="appt-1",
+		as_of=datetime(2026, 9, 1, tzinfo=timezone.utc), gateway=gw,
+	)
+	assert outcome.status == "INVOICED"
+	assert outcome.stripe_invoice_id == "in_pre_existing"
+	assert [name for name, _ in gw.calls] == ["add_invoice_item", "finalize_invoice"]
 
 
 def test_blocked_when_client_has_no_stripe_customer_id():

@@ -16,6 +16,22 @@ Key design decisions (grilled 2026-09-08; see SPEC-4.2.2.md):
   - At-most-once: stl_cadence_dispatches (UNIQUE message_id, touch_step).
   - Post-send failure guard: same PostSendError discipline as
     speed_to_lead_sweep.py — a write failure after SMTP must NOT re-send.
+
+CONFIRMED RESOLUTION (Week-2 implementation audit, 2026-09-14): the
+original 4.2.2 task-doc text ("No human approval required for cadence
+touches", "GHL sequence ID read from a config row") reads as a direct
+contradiction of what's built here. It is not one — source priority
+settles it. The Source of Truth's dated Sept-3 client comment (Part 10.2)
+governs: "Start with human approval for every send... A template class
+may earn the tighter five-minute promise after 50 clean approvals...
+Do not inherit the older sub-60-second, five-minute/24x7, or day-one
+autonomous wording." That comment post-dates and explicitly supersedes
+the task-doc's no-approval/GHL wording. This module's human-approval gate
+and its lack of a GHL client are therefore the CORRECT, client-sourced
+behavior, not an unresolved deviation — no GHL integration is planned,
+and the approval gate is not to be removed. Do not re-open this as a gap
+without a newer, dated client statement that names this cadence
+specifically.
 """
 
 from __future__ import annotations

@@ -95,6 +95,7 @@ MIGRATIONS=(
   apply_entitlements_billing
   apply_stripe_price_provisioning
   apply_client_billing_account
+  apply_appointment_attendance_proof
   apply_ghost_shopper_reactivation
   apply_ghost_shopper_replies
   apply_ghost_form_submissions

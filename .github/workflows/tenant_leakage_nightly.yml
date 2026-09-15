@@ -104,6 +104,7 @@ jobs:
           PYTHONPATH=. python migrations/apply_entitlements_billing.py
           PYTHONPATH=. python migrations/apply_stripe_price_provisioning.py
           PYTHONPATH=. python migrations/apply_client_billing_account.py
+          PYTHONPATH=. python migrations/apply_appointment_attendance_proof.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_reactivation.py
           PYTHONPATH=. python migrations/apply_ghost_shopper_replies.py
           PYTHONPATH=. python migrations/apply_ghost_form_submissions.py
