@@ -29,6 +29,7 @@ from src.agents.respond.context_cards import (
 )
 from src.agents.respond.intents import Intent
 from src.agents.respond.worker import _compute_sla
+from src.services.sla_config import ClientSlaWindows
 
 
 # ── Card hash ─────────────────────────────────────────────────────────────────
@@ -62,10 +63,20 @@ def test_card_hash_changes_with_posted_at():
 
 _BASE = datetime(2026, 9, 7, 10, 0, 0, tzinfo=timezone.utc)
 
+# Platform-default windows (matches config/settings.py defaults) — the values
+# every client with no clients.sla_* override resolves to.
+_DEFAULT_WINDOWS = ClientSlaWindows(
+    hot_lead_minutes=15,
+    standard_minutes=60,
+    tier2_minutes=60,
+    tier3_minutes=240,
+    speed_to_lead_minutes=30,
+)
+
 
 @pytest.mark.parametrize("intent", [Intent.HOT_LEAD, Intent.WHALE_OWNER])
 def test_sla_is_15_min_for_hot_and_whale(intent):
-    sla = _compute_sla(intent, _BASE)
+    sla = _compute_sla(intent, _BASE, _DEFAULT_WINDOWS)
     assert sla == _BASE + timedelta(minutes=15)
 
 
@@ -74,14 +85,23 @@ def test_sla_is_15_min_for_hot_and_whale(intent):
     Intent.PARTNER, Intent.NURTURE,
 ])
 def test_sla_is_60_min_for_other_routed_intents(intent):
-    sla = _compute_sla(intent, _BASE)
+    sla = _compute_sla(intent, _BASE, _DEFAULT_WINDOWS)
     assert sla == _BASE + timedelta(minutes=60)
 
 
 def test_sla_handles_naive_datetime():
     naive = datetime(2026, 9, 7, 10, 0, 0)
-    sla = _compute_sla(Intent.HOT_LEAD, naive)
+    sla = _compute_sla(Intent.HOT_LEAD, naive, _DEFAULT_WINDOWS)
     assert sla == datetime(2026, 9, 7, 10, 15, 0, tzinfo=timezone.utc)
+
+
+def test_sla_honors_per_client_override():
+    tight = ClientSlaWindows(
+        hot_lead_minutes=5, standard_minutes=20,
+        tier2_minutes=20, tier3_minutes=90, speed_to_lead_minutes=10,
+    )
+    assert _compute_sla(Intent.HOT_LEAD, _BASE, tight) == _BASE + timedelta(minutes=5)
+    assert _compute_sla(Intent.OBJECTION, _BASE, tight) == _BASE + timedelta(minutes=20)
 
 
 # ── CONTEXT_CARD_INTENTS ──────────────────────────────────────────────────────

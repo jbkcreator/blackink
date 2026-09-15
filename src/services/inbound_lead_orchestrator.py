@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session
 from src.core.database import get_db_context
 from src.services.events import log_event
 from src.services.business_hours import compute_send_at
+from src.services.sla_config import ClientSlaWindows, resolve_sla_windows
 
 
 def _run_coro(coro):
@@ -123,7 +124,7 @@ def _run(session: Session, lead: InboundLead) -> PipelineResult:
     # ── 3. Write inbound_messages + event ─────────────────────────────────
     now_utc = datetime.now(timezone.utc)
     send_at = compute_send_at(now_utc)
-    sla_due_at = _compute_sla_due(now_utc)
+    sla_due_at = _compute_sla_due(now_utc, resolve_sla_windows(session, lead.client_id))
 
     message_id = _write_message(
         session, lead,
@@ -244,9 +245,9 @@ def _write_message(
     return str(new_id)
 
 
-def _compute_sla_due(received_at: datetime) -> datetime:
+def _compute_sla_due(received_at: datetime, windows: ClientSlaWindows) -> datetime:
     from datetime import timedelta
-    return received_at + timedelta(minutes=30)
+    return received_at + timedelta(minutes=windows.speed_to_lead_minutes)
 
 
 def _post_closer_alert(session: Session, lead: InboundLead, message_id: str, received_at: datetime) -> None:

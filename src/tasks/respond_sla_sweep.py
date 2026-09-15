@@ -33,6 +33,7 @@ from typing import Optional
 
 from sqlalchemy import text
 
+from config.settings import get_settings
 from src.core.database import get_system_db_context
 from src.services.slack.post import post_notice
 
@@ -155,18 +156,26 @@ def _run_tier2(db, as_of: datetime) -> int:
     reallocated_at (when set) gives the reallocated lead a genuine 60
     minutes before tier2 re-fires, mirroring how a never-reallocated lead's
     tier2 is timed from its own received_at."""
+    # The tier-2 window is per-client: clients.sla_tier2_minutes when set,
+    # else the platform default (settings.respond_sla_tier2_minutes) — the
+    # same override-or-default rule src/services/sla_config.py applies for the
+    # first-response window, resolved here in SQL so one query still spans
+    # every tenant.
+    default_tier2 = get_settings().respond_sla_tier2_minutes
     rows = db.execute(
         text(
-            "SELECT id, client_id, intent, sender_email, sender_name "
-            "FROM inbound_messages "
-            "WHERE status = 'ROUTED' "
-            "  AND claimed_at IS NULL "
-            "  AND escalation_level = 1 "
-            "  AND COALESCE(reallocated_at, received_at) < :now - INTERVAL '60 minutes' "
-            "ORDER BY received_at "
+            "SELECT m.id, m.client_id, m.intent, m.sender_email, m.sender_name "
+            "FROM inbound_messages m "
+            "JOIN clients c ON c.client_id = m.client_id "
+            "WHERE m.status = 'ROUTED' "
+            "  AND m.claimed_at IS NULL "
+            "  AND m.escalation_level = 1 "
+            "  AND COALESCE(m.reallocated_at, m.received_at) "
+            "      < :now - (COALESCE(c.sla_tier2_minutes, :default_tier2) * INTERVAL '1 minute') "
+            "ORDER BY m.received_at "
             "LIMIT 50"
         ),
-        {"now": as_of},
+        {"now": as_of, "default_tier2": default_tier2},
     ).mappings().fetchall()
 
     fired = 0
@@ -197,18 +206,28 @@ def _run_tier3(db, as_of: datetime) -> int:
     lead to reallocate to a NEW closer every ~60-120 seconds instead of
     every 240 minutes. Anchoring to reallocated_at gives each successive
     backup closer a genuine 240-minute window before the next handoff."""
+    # Per-client tier-3 window (clients.sla_tier3_minutes, else the platform
+    # default) resolved in SQL, same rule as tier-2. sla_standard_minutes is
+    # selected too so the fresh post-reallocation window below uses the
+    # client's own first-response window, not a hardcoded 60.
+    settings = get_settings()
+    default_tier3 = settings.respond_sla_tier3_minutes
+    default_standard = settings.respond_sla_standard_minutes
     rows = db.execute(
         text(
-            "SELECT id, client_id, intent, sender_email, sender_name "
-            "FROM inbound_messages "
-            "WHERE status = 'ROUTED' "
-            "  AND claimed_at IS NULL "
-            "  AND escalation_level = 2 "
-            "  AND COALESCE(reallocated_at, received_at) < :now - INTERVAL '240 minutes' "
-            "ORDER BY received_at "
+            "SELECT m.id, m.client_id, m.intent, m.sender_email, m.sender_name, "
+            "       COALESCE(c.sla_standard_minutes, :default_standard) AS standard_minutes "
+            "FROM inbound_messages m "
+            "JOIN clients c ON c.client_id = m.client_id "
+            "WHERE m.status = 'ROUTED' "
+            "  AND m.claimed_at IS NULL "
+            "  AND m.escalation_level = 2 "
+            "  AND COALESCE(m.reallocated_at, m.received_at) "
+            "      < :now - (COALESCE(c.sla_tier3_minutes, :default_tier3) * INTERVAL '1 minute') "
+            "ORDER BY m.received_at "
             "LIMIT 50"
         ),
-        {"now": as_of},
+        {"now": as_of, "default_tier3": default_tier3, "default_standard": default_standard},
     ).mappings().fetchall()
 
     fired = 0
@@ -233,7 +252,7 @@ def _run_tier3(db, as_of: datetime) -> int:
                 {
                     "closer_id": closer["slack_user_id"],
                     "now": as_of,
-                    "new_sla": as_of + timedelta(minutes=60),
+                    "new_sla": as_of + timedelta(minutes=int(row["standard_minutes"])),
                     "id": row["id"],
                 },
             )

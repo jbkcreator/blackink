@@ -98,6 +98,18 @@ class AppSettings(BaseSettings):
 	# from the permanent non-poach lock above — see plan doc §Key decision 2).
 	county_allocation_reassess_days: int = Field(default=30, env="COUNTY_ALLOCATION_REASSESS_DAYS")
 
+	# ── Reply-triage & Speed-to-Lead SLA windows (platform defaults) ─────────
+	# Fallback values used whenever a client row leaves the matching
+	# clients.sla_* / speed_to_lead_sla_minutes column NULL. A per-client
+	# override on clients takes precedence; these preserve the historical
+	# hardcoded behaviour (15/60 first-response, 60 tier-2, 240 tier-3,
+	# 30 Speed-to-Lead) for any client that has no override configured.
+	respond_sla_hot_lead_minutes: int = Field(default=15, ge=1, env="RESPOND_SLA_HOT_LEAD_MINUTES")
+	respond_sla_standard_minutes: int = Field(default=60, ge=1, env="RESPOND_SLA_STANDARD_MINUTES")
+	respond_sla_tier2_minutes: int = Field(default=60, ge=1, env="RESPOND_SLA_TIER2_MINUTES")
+	respond_sla_tier3_minutes: int = Field(default=240, ge=1, env="RESPOND_SLA_TIER3_MINUTES")
+	speed_to_lead_sla_minutes: int = Field(default=30, ge=1, env="SPEED_TO_LEAD_SLA_MINUTES")
+
 	# ── Instantly (deliverability) ───────────────────────────────────────────
 	instantly_api_key: Optional[SecretStr] = Field(default=None, env="INSTANTLY_API_KEY")
 	instantly_base_url: str = Field(default="https://api.instantly.ai", env="INSTANTLY_BASE_URL")
