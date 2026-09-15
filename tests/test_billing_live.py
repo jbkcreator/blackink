@@ -33,25 +33,27 @@ from tests.fixtures.vera_health import healthy_vera_run  # noqa: F401
 
 def _insert_appointment(session, *, client_id, company_id, contact_id, opportunity_id,
 						 state="BOOKED", scheduled_for=None, c24=None, c3=None,
-						 proof_ref="test-proof-ref"):
-	"""proof_ref defaults to a placeholder (Week-2 implementation audit,
-	2026-09-14, attendance-proof fail-closed guard) — every test in this
-	file predates that guard and tests other behavior (Stripe reclaim/race/
-	idempotency paths), so a real value here keeps them reaching
-	charge_sit_for_appointment's Stripe-side logic unchanged. A test for
-	the guard itself passes proof_ref=None explicitly."""
+						 proof_ref="test-proof-ref", attended_duration_seconds=900):
+	"""proof_ref/attended_duration_seconds default to placeholders that clear
+	the attendance-proof gate (Week-2 implementation audit, 2026-09-14) —
+	every test in this file predates that guard and tests other behavior
+	(Stripe reclaim/race/idempotency paths), so real values here keep them
+	reaching charge_sit_for_appointment's Stripe-side logic unchanged. A test
+	for the guard itself passes these explicitly."""
 	return session.execute(
 		text(
 			"INSERT INTO appointments "
 			"(client_id, company_id, opportunity_id, contact_id, state, scheduled_for, "
-			" confirmed_24h_timestamp, confirmed_3h_timestamp, owner_brief_url, proof_ref) "
+			" confirmed_24h_timestamp, confirmed_3h_timestamp, owner_brief_url, proof_ref, "
+			" attended_duration_seconds) "
 			"VALUES (:client_id, :company_id, :opp, :contact_id, CAST(:state AS appointment_state_enum), "
-			" COALESCE(:scheduled_for, NOW()), :c24, :c3, 'https://brief.example/x', :proof_ref) "
+			" COALESCE(:scheduled_for, NOW()), :c24, :c3, 'https://brief.example/x', :proof_ref, "
+			" :attended_duration_seconds) "
 			"RETURNING appointment_id, is_billable"
 		),
 		{"client_id": client_id, "company_id": company_id, "opp": opportunity_id,
 		 "contact_id": contact_id, "state": state, "scheduled_for": scheduled_for, "c24": c24, "c3": c3,
-		 "proof_ref": proof_ref},
+		 "proof_ref": proof_ref, "attended_duration_seconds": attended_duration_seconds},
 	).one()
 
 
@@ -755,7 +757,7 @@ def test_missing_attendance_proof_blocks_the_sweep_and_reclaims_once_set(billing
 		appt = _insert_appointment(
 			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
 			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=now_iso, c3=now_iso,
-			proof_ref=None,
+			proof_ref=None, attended_duration_seconds=None,
 		)
 	appointment_id = str(appt.appointment_id)
 
@@ -779,8 +781,13 @@ def test_missing_attendance_proof_blocks_the_sweep_and_reclaims_once_set(billing
 	assert blocked_row.billed_offer_code is None, "must not have billed anything while blocked"
 
 	with get_owner_db_context() as s:
-		s.execute(text("UPDATE appointments SET proof_ref = 'prf_test_captured' WHERE client_id = :c AND appointment_id = :a"),
-				  {"c": client_id, "a": appointment_id})
+		s.execute(
+			text(
+				"UPDATE appointments SET proof_ref = 'prf_test_captured', attended_duration_seconds = 900 "
+				"WHERE client_id = :c AND appointment_id = :a"
+			),
+			{"c": client_id, "a": appointment_id},
+		)
 
 	with get_system_db_context() as session:
 		rows = session.execute(
@@ -790,13 +797,15 @@ def test_missing_attendance_proof_blocks_the_sweep_and_reclaims_once_set(billing
 				"WHERE a.state = 'ATTENDED' AND a.is_billable AND a.billed_offer_code IS NULL "
 				"  AND (a.billing_blocked_reason IS NULL "
 				"       OR (a.billing_blocked_reason = 'NO_STRIPE_CUSTOMER' AND c.stripe_customer_id IS NOT NULL) "
-				"       OR (a.billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' AND a.proof_ref IS NOT NULL)) "
+				"       OR (a.billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' AND a.stripe_invoice_id IS NOT NULL) "
+				"       OR (a.billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' AND a.proof_ref IS NOT NULL "
+				"           AND a.attended_duration_seconds >= 720)) "
 				"  AND a.appointment_id = :aid "
 				"ORDER BY a.scheduled_for LIMIT 100 FOR UPDATE OF a SKIP LOCKED"
 			),
 			{"aid": appointment_id},
 		).all()
-		assert any(str(r.appointment_id) == appointment_id for r in rows), "must be reclaimable now that proof_ref is set"
+		assert any(str(r.appointment_id) == appointment_id for r in rows), "must be reclaimable now that proof_ref/duration are set"
 		outcome2 = charge_sit_for_appointment(session, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
 
 	assert outcome2.status == "INVOICED"
@@ -807,6 +816,75 @@ def test_missing_attendance_proof_blocks_the_sweep_and_reclaims_once_set(billing
 		).one()
 	assert final_row.billing_blocked_reason is None, "the stale MISSING_ATTENDANCE_PROOF reason must be cleared on success"
 	assert final_row.billed_offer_code is not None
+
+
+def test_short_attendance_duration_blocks_even_with_a_real_proof_ref(billing_tenant, canary_tenants, healthy_vera_run):
+	"""Review finding: a non-null proof_ref alone must not authorize a
+	charge. An appointment with a real proof_ref but an attended_duration_
+	seconds under the 720-second (12-minute) contractual floor must stay
+	BLOCKED, never invoiced."""
+	client_id = billing_tenant["client_id"]
+	company_id = billing_tenant["company_id"]
+	contact_id = billing_tenant["contact_id"]
+	as_of = datetime.now(timezone.utc)
+	now_iso = as_of.isoformat()
+
+	with get_system_db_context() as s:
+		create_client_entitlement(s, client_id=client_id, offer_code="owner_growth")
+		appt = _insert_appointment(
+			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=now_iso, c3=now_iso,
+			proof_ref="prf_one_party_only", attended_duration_seconds=300,
+		)
+	appointment_id = str(appt.appointment_id)
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_short' WHERE client_id = :c"), {"c": client_id})
+
+	gw = _FakeSitGateway()
+	with get_system_db_context() as s:
+		outcome = charge_sit_for_appointment(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+	assert outcome.status == "BLOCKED"
+	assert outcome.reason == "MISSING_ATTENDANCE_PROOF"
+	assert gw.calls == [], "no Stripe call may happen for an under-threshold attendance duration"
+
+
+def test_stranded_pre_existing_invoice_reconciles_live(billing_tenant, canary_tenants, healthy_vera_run):
+	"""Review finding #2: an appointment that already has a stripe_invoice_id
+	(simulating one opened by a sweep run before the attendance-proof
+	duration requirement existed) must reconcile and finalize even though
+	proof_ref/attended_duration_seconds are still unset — nothing can write
+	those columns after the fact for a row this far along, so gating on
+	them here would strand the invoice forever."""
+	client_id = billing_tenant["client_id"]
+	company_id = billing_tenant["company_id"]
+	contact_id = billing_tenant["contact_id"]
+	as_of = datetime.now(timezone.utc)
+	now_iso = as_of.isoformat()
+
+	with get_system_db_context() as s:
+		create_client_entitlement(s, client_id=client_id, offer_code="owner_growth")
+		appt = _insert_appointment(
+			s, client_id=client_id, company_id=company_id, contact_id=contact_id,
+			opportunity_id=str(uuid.uuid4()), state="ATTENDED", c24=now_iso, c3=now_iso,
+			proof_ref=None, attended_duration_seconds=None,
+		)
+	appointment_id = str(appt.appointment_id)
+
+	with get_owner_db_context() as s:
+		s.execute(text("UPDATE clients SET stripe_customer_id = 'cus_test_stranded' WHERE client_id = :c"), {"c": client_id})
+		s.execute(
+			text("UPDATE appointments SET stripe_invoice_id = 'in_pre_existing_stranded' WHERE client_id = :c AND appointment_id = :a"),
+			{"c": client_id, "a": appointment_id},
+		)
+
+	gw = _FakeSitGateway()
+	with get_system_db_context() as s:
+		outcome = charge_sit_for_appointment(s, client_id=client_id, appointment_id=appointment_id, as_of=as_of, gateway=gw)
+
+	assert outcome.status == "INVOICED"
+	assert outcome.stripe_invoice_id == "in_pre_existing_stranded"
+	assert "create_invoice" not in gw.calls, "must reuse the pre-existing invoice, never open a second one"
 
 
 def test_no_stripe_customer_reclaim_is_race_safe(attended_billable_appointment):

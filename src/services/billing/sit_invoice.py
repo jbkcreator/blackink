@@ -95,6 +95,12 @@ from src.services.settlement.gateway import LiveStripeGateway, StripeGateway
 
 logger = logging.getLogger(__name__)
 
+# Source of Truth 4-rule gate, Rule 2: both parties must have attended at
+# least 12 minutes. A non-null proof_ref alone says a proof mechanism ran,
+# not that the meeting cleared this bar — attended_duration_seconds is the
+# actual evidence and must be checked alongside it.
+MIN_ATTENDED_DURATION_SECONDS = 720
+
 
 @dataclass(frozen=True)
 class SitInvoiceOutcome:
@@ -114,7 +120,7 @@ def charge_sit_for_appointment(
     row = session.execute(
         text(
             "SELECT a.is_billable, a.billed_offer_code, a.billed_amount_cents, a.stripe_invoice_id, "
-            "       a.sit_invoice_finalized_at, a.proof_ref, c.stripe_customer_id "
+            "       a.sit_invoice_finalized_at, a.proof_ref, a.attended_duration_seconds, c.stripe_customer_id "
             "FROM appointments a JOIN clients c ON c.client_id = a.client_id "
             "WHERE a.client_id = :client_id AND a.appointment_id = :appointment_id"
         ),
@@ -122,35 +128,6 @@ def charge_sit_for_appointment(
     ).first()
     if row is None:
         raise ValueError(f"no such appointment {appointment_id!r} for client {client_id!r}")
-
-    if not row.proof_ref:
-        session.execute(
-            text(
-                "UPDATE appointments SET billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' "
-                "WHERE client_id = :client_id AND appointment_id = :appointment_id"
-            ),
-            {"client_id": client_id, "appointment_id": appointment_id},
-        )
-        logger.warning(
-            "billing.sit_invoice: appointment=%s (client=%s) has no proof_ref — BLOCKED, "
-            "not invoiced on is_billable alone",
-            appointment_id, client_id,
-        )
-        return SitInvoiceOutcome(status="BLOCKED", reason="MISSING_ATTENDANCE_PROOF")
-
-    if not row.stripe_customer_id:
-        session.execute(
-            text(
-                "UPDATE appointments SET billing_blocked_reason = 'NO_STRIPE_CUSTOMER' "
-                "WHERE client_id = :client_id AND appointment_id = :appointment_id"
-            ),
-            {"client_id": client_id, "appointment_id": appointment_id},
-        )
-        logger.warning(
-            "billing.sit_invoice: client=%s has no stripe_customer_id — appointment=%s BLOCKED",
-            client_id, appointment_id,
-        )
-        return SitInvoiceOutcome(status="BLOCKED", reason="NO_STRIPE_CUSTOMER")
 
     if row.billed_offer_code is not None and row.sit_invoice_finalized_at is not None:
         # Already billed AND the Stripe invoice was actually finalized — a
@@ -162,6 +139,51 @@ def charge_sit_for_appointment(
         # billed but NOT yet finalized falls through below to resume/finish
         # it, exactly like a brand-new row.
         return SitInvoiceOutcome(status="ALREADY_INVOICED")
+
+    # A row that already has a stripe_invoice_id is one this function itself
+    # created on a prior call (this is the ONLY place that ever sets that
+    # column) — it must be reconciled/finished, not newly gated. Applying the
+    # attendance-proof check here too would strand any invoice opened before
+    # this guard existed (Week-2 audit review finding #2): it would sit
+    # BLOCKED/MISSING_ATTENDANCE_PROOF forever, since no writer ever
+    # populates proof_ref on an appointment already past this point.
+    has_existing_invoice = bool(row.stripe_invoice_id)
+
+    if not has_existing_invoice:
+        attended_long_enough = (
+            row.attended_duration_seconds is not None
+            and row.attended_duration_seconds >= MIN_ATTENDED_DURATION_SECONDS
+        )
+        if not row.proof_ref or not attended_long_enough:
+            session.execute(
+                text(
+                    "UPDATE appointments SET billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' "
+                    "WHERE client_id = :client_id AND appointment_id = :appointment_id"
+                ),
+                {"client_id": client_id, "appointment_id": appointment_id},
+            )
+            logger.warning(
+                "billing.sit_invoice: appointment=%s (client=%s) lacks verified attendance "
+                "(proof_ref=%r attended_duration_seconds=%r, need >= %d) — BLOCKED, "
+                "not invoiced on is_billable alone",
+                appointment_id, client_id, row.proof_ref, row.attended_duration_seconds,
+                MIN_ATTENDED_DURATION_SECONDS,
+            )
+            return SitInvoiceOutcome(status="BLOCKED", reason="MISSING_ATTENDANCE_PROOF")
+
+        if not row.stripe_customer_id:
+            session.execute(
+                text(
+                    "UPDATE appointments SET billing_blocked_reason = 'NO_STRIPE_CUSTOMER' "
+                    "WHERE client_id = :client_id AND appointment_id = :appointment_id"
+                ),
+                {"client_id": client_id, "appointment_id": appointment_id},
+            )
+            logger.warning(
+                "billing.sit_invoice: client=%s has no stripe_customer_id — appointment=%s BLOCKED",
+                client_id, appointment_id,
+            )
+            return SitInvoiceOutcome(status="BLOCKED", reason="NO_STRIPE_CUSTOMER")
 
     charge = resolve_sit_charge(session, client_id=client_id, appointment_id=appointment_id, as_of=as_of)
 

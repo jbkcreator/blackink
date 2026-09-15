@@ -170,11 +170,18 @@ def run_sit_invoice_sweep(limit: int = 100, *, claim_time: datetime | None = Non
 	    docstring for the full reasoning on both.
 	  - Week-2 implementation audit (2026-09-14): a row BLOCKED/
 	    MISSING_ATTENDANCE_PROOF is reclaimable once appointments.proof_ref
-	    is later populated (whenever a real capture mechanism starts
-	    writing it — none does yet, so this branch matches zero rows in
-	    production today, same as the column itself). Mirrors the
-	    NO_STRIPE_CUSTOMER reclaim shape exactly — one existing reclaim
-	    pattern, not a second one invented for this reason.
+	    is later populated with a verified attendance duration >= 720
+	    seconds (whenever a real capture mechanism starts writing it — none
+	    does yet, so this branch matches zero rows in production today,
+	    same as the column itself). Mirrors the NO_STRIPE_CUSTOMER reclaim
+	    shape exactly — one existing reclaim pattern, not a second one
+	    invented for this reason. Also reclaims a row BLOCKED/
+	    MISSING_ATTENDANCE_PROOF that ALREADY carries a stripe_invoice_id —
+	    review finding: charge_sit_for_appointment() never re-gates a row it
+	    already opened a Stripe invoice for (that column is only ever set by
+	    this same function), so a pre-existing incomplete invoice must stay
+	    reclaimable regardless of proof_ref, or it strands forever with no
+	    writer able to satisfy the gate after the fact.
 	Any OTHER (future) block reason stays excluded until its own condition
 	is added here, same fail-closed posture as today."""
 	if _halt_if_unhealthy("run_sit_invoice_sweep"):
@@ -189,7 +196,9 @@ def run_sit_invoice_sweep(limit: int = 100, *, claim_time: datetime | None = Non
 				"WHERE a.state = 'ATTENDED' AND a.is_billable AND a.sit_invoice_finalized_at IS NULL "
 				"  AND (a.billing_blocked_reason IS NULL "
 				"       OR (a.billing_blocked_reason = 'NO_STRIPE_CUSTOMER' AND c.stripe_customer_id IS NOT NULL) "
-				"       OR (a.billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' AND a.proof_ref IS NOT NULL)) "
+				"       OR (a.billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' AND a.stripe_invoice_id IS NOT NULL) "
+				"       OR (a.billing_blocked_reason = 'MISSING_ATTENDANCE_PROOF' AND a.proof_ref IS NOT NULL "
+				"           AND a.attended_duration_seconds >= 720)) "
 				"ORDER BY a.scheduled_for LIMIT :limit FOR UPDATE OF a SKIP LOCKED"
 			),
 			{"limit": limit},
